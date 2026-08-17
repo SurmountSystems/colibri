@@ -1746,6 +1746,7 @@ static void serve_loop(Model *m, Tok *T){
     }
 }
 
+#ifndef KIMI_NO_MAIN
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
@@ -1936,3 +1937,187 @@ int main(int argc, char **argv){
           rt_save(g_k3_usage,0); }                   /* same bytes as every other engine */
     return 0;
 }
+#endif /* !KIMI_NO_MAIN */
+
+#ifdef KIMI_NO_MAIN
+/* ---- Public embed API (libkimi_k3.a) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiKimiEngine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+};
+
+static void coli_kimi_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+static uint64_t coli_kimi_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+int coli_kimi_engine_open(ColiKimiEngine **engine, const ColiKimiOpenOptions *options,
+                          char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_kimi_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_kimi_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_kimi_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiKimiEngine *e = (ColiKimiEngine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_kimi_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    coli_omp_tune_threads("kimi_k3");
+    model_init(&e->m, e->model_dir, options->n_layers > 0 ? options->n_layers : 0);
+    /* Kimi embed has no GLM-style expert LRU clamp. Native Start still
+     * refuses when the host preflight floor cannot fit (COLI_RAM_OVERCOMMIT=1
+     * overrides). Do not exit(2) from this embed path. */
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+void coli_kimi_engine_destroy(ColiKimiEngine *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+void coli_kimi_engine_size(const ColiKimiEngine *engine, ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "kimi");
+    snprintf(out->engine_id, sizeof(out->engine_id), "kimi_k3");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+int coli_kimi_generate(ColiKimiEngine *engine, const char *prompt, size_t prompt_len,
+                       const ColiKimiGenerateOptions *options, ColiTokenFn on_token,
+                       void *user_data, char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_kimi_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_kimi_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    const char *snap = engine->model_dir;
+    float temp = getenv("COLI_TEMP") ? (float)atof(getenv("COLI_TEMP")) : 0.f;
+    int ids[65536], np = 0;
+    Tok T;
+    char tp[2048];
+    snprintf(tp, sizeof(tp), "%s/tokenizer.json", snap);
+    FILE *tf = fopen(tp, "rb");
+    if (!tf) {
+        coli_kimi_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    fclose(tf);
+    tok_load(&T, tp);
+    if (m->c.bos >= 0) ids[np++] = m->c.bos;
+    np += tok_encode(&T, prompt, (int)prompt_len, ids + np, 65536 - np);
+    if (np < 1) {
+        coli_kimi_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    int max_t = np + ngen;
+    kv_alloc(m, max_t);
+    int chunk = 32;
+    float *lo = NULL;
+    for (int i = 0; i < np; i += chunk) {
+        int Cc = np - i < chunk ? np - i : chunk;
+        if (lo) free(lo);
+        lo = step_chunk(m, ids + i, i, Cc);
+    }
+    if (!m->has_head || !lo) {
+        if (lo) free(lo);
+        coli_kimi_set_err(error, error_size, "no LM head after prefill");
+        return -1;
+    }
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        int t = sample_tok(lo, m->c.vocab, temp, 1.f);
+        free(lo);
+        lo = NULL;
+        int is_eos = 0;
+        for (int e = 0; e < m->c.n_eos; e++)
+            if (t == m->c.eos[e]) is_eos = 1;
+        if (on_token && on_token(user_data, t, 0.f, ordinal, ordinal)) break;
+        ordinal++;
+        if (is_eos) break;
+        if (np + ordinal >= max_t) break;
+        lo = step_chunk(m, &t, np + ordinal - 1, 1);
+    }
+    if (lo) free(lo);
+    return 0;
+}
+
+/* Visual poll stub: empty success until Kimi telemetry fill lands. */
+int coli_kimi_visual_poll(ColiKimiEngine *engine, uint32_t want, ColiHwinfoSnap *hwinfo,
+                          ColiTiersSnap *tiers, ColiExpertGridDims *emap_dims,
+                          uint8_t *emap_cells, size_t emap_cells_cap, size_t *emap_cells_len,
+                          ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                          size_t hits_bits_cap, size_t *hits_bits_len, uint64_t *hits_seq,
+                          ColiProfSnap *prof, char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_kimi_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* KIMI_NO_MAIN */

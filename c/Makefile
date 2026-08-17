@@ -215,6 +215,15 @@ endif
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
 # machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
+#
+# Process engines used by native / COLI_ENGINE (Linux, opt-in GPU):
+#   make -C c colibri HIP=1          # GLM family (also: make glm HIP=1)
+#   make -C c inkling HIP=1          # when building inkling with GPU object
+# ROCM_HOME / ROCM_PATH default /opt/rocm; HIPCC=$(ROCM_HOME)/bin/hipcc.
+# HIP_ARCH=native resolves via rocm_agent_enumerator; override on APU mismatch
+# (e.g. HIP_ARCH=gfx1152). Accept: ldd c/colibri | grep libamdhip64.
+# DeepSeek V4 process binary has no HIP expert backend (CPU process only).
+# Point locate/doctor at the HIP binary: COLI_ENGINE or COLIBRI_ENGINE.
 HIP       ?= 0
 # HIP_DLL=1 is the AMD sibling of CUDA_DLL=1 (Windows only): MinGW gcc cannot
 # compile .cu and hipcc on Windows targets the MSVC ABI, so the backend goes
@@ -232,7 +241,8 @@ ifeq ($(CUDA_DLL)$(HIP_DLL),11)
 $(error choose CUDA_DLL=1 or HIP_DLL=1, not both)
 endif
 endif
-ROCM_HOME ?= /opt/rocm
+# Prefer ROCM_HOME; fall back to ROCM_PATH (common ROCm installer env) then /opt/rocm.
+ROCM_HOME ?= $(or $(ROCM_PATH),/opt/rocm)
 ifneq ($(IS_WIN),)
 # --- Windows HIP SDK contract (HIP_DLL only; the Linux ROCM_HOME contract
 # above is untouched) ---
@@ -441,6 +451,12 @@ ifneq (,$(filter-out $(NO_WMMA_ARCHS),$(HIP_ARCH)))
 $(warning mixed HIP_ARCH list: $(filter $(HIP_ARCH),$(NO_WMMA_ARCHS)) cannot run rocWMMA -> tensor-core kernels disabled for ALL targets ($(HIP_ARCH)). Build separate binaries to keep WMMA on the capable card.)
 endif
 endif
+# Operator / build.rs: force portable kernels when rocWMMA headers are missing
+# (incomplete ROCm install) or when deliberately disabling tensor-core paths.
+# Same define the NO_WMMA_ARCHS branch uses; safe to set twice.
+ifeq ($(COLI_HIP_NO_WMMA),1)
+HIPCCFLAGS += -DCOLI_HIP_NO_WMMA
+endif
 endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
@@ -522,9 +538,16 @@ deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
 
-# phony targets — 'glm' kept for backward compatibility
-colibri: colibri$(EXE)
+# `glm` is a backward-compatible alias for the engine binary.
+# On Windows the binary is colibri.exe, so `colibri` is a phony alias.
+# On Unix the binary is already named colibri; `colibri: colibri` would be a
+# self-edge (make prints Circular colibri <- colibri dependency dropped).
+.PHONY: glm
 glm: colibri$(EXE)
+ifneq ($(EXE),)
+.PHONY: colibri
+colibri: colibri$(EXE)
+endif
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
 # `make colibri.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date"
@@ -533,7 +556,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|COLI_HIP_NO_WMMA=$(COLI_HIP_NO_WMMA)|VK=$(VK)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -548,6 +571,49 @@ endif
 
 colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+# Static library for in-process GLM embed (colibri-sys feature `ffi`).
+# No CLI main; exports coli_glm_* from colibri_api.h.
+#
+# Default (CUDA=0 HIP=0): CPU-only archive (product default for feature `ffi`).
+#
+# Opt-in Linux CUDA embed (feature `ffi-cuda`):
+#   make -C c libcolibri CUDA=1 LTO=0
+# packs backend_cuda.o into libcolibri.a and compiles colibri.lib.o with
+# -DCOLI_CUDA. The host (build.rs) must then link cudart + stdc++.
+#
+# Opt-in Linux HIP embed (feature `ffi-hip`):
+#   make -C c libcolibri HIP=1 LTO=0 [ROCM_HOME=/opt/rocm] [HIP_ARCH=native|gfxXXXX]
+# Same source backend_cuda.cu via hipcc; packs backend_cuda.o. Host must link
+# libamdhip64 + stdc++ (rpath $(ROCM_HOME)/lib). CUDA=1 and HIP=1 remain
+# mutually exclusive (process and static). Other families stay CPU-only
+# (NOCUDA for inkling; kimi has no CUDA/HIP backend). Metal / Vulkan are not
+# in the FFI static matrix.
+#
+# ROCM_HOME defaults to /opt/rocm (or set ROCM_PATH in the environment and pass
+# ROCM_HOME=$(ROCM_PATH)). HIP_ARCH=native uses rocm_agent_enumerator; for
+# cross builds or dry hosts set an explicit gfx id (e.g. HIP_ARCH=gfx1100).
+LIB_COLIBRI_A := libcolibri.a
+.PHONY: libcolibri
+libcolibri: $(LIB_COLIBRI_A)
+colibri.lib.o: colibri.c colibri_api.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h .build-config
+	$(CC) $(CFLAGS) -fPIC -DCOLIBRI_NO_MAIN -c colibri.c -o $@
+coli_model_size.o: coli_model_size.c colibri_api.h
+	$(CC) $(CFLAGS) -fPIC -c coli_model_size.c -o $@
+# Engine archives are self-contained (local disk walk). Link coli_model_size.o
+# only once from the host if you need coli_model_size_probe (not required by Rust).
+# When CUDA=1 or HIP=1, also archive backend_cuda.o so coli_cuda_* resolve in the embed.
+LIB_COLIBRI_OBJS := colibri.lib.o
+ifneq ($(strip $(CUDA_OBJ)),)
+LIB_COLIBRI_OBJS += $(CUDA_OBJ)
+endif
+# Recreate the archive from the listed objects only. `ar rcs` updates members
+# but does not delete leftover `backend_cuda.o` from a prior CUDA=1 / HIP=1
+# pack, so a later CPU-only `make libcolibri` would still export HIP/CUDA
+# symbols (`__hipUnregisterFatBinary` / `__cudaUnregisterFatBinary`).
+$(LIB_COLIBRI_A): $(LIB_COLIBRI_OBJS)
+	$(RM) $@
+	$(AR) rcs $@ $(LIB_COLIBRI_OBJS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
@@ -699,6 +765,25 @@ comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
+
+# Static library for in-process Kimi K3 embed (colibri-sys feature `ffi`).
+LIB_KIMI_A := libkimi_k3.a
+.PHONY: libkimi_k3
+libkimi_k3: $(LIB_KIMI_A)
+kimi_k3.lib.o: kimi_k3.c colibri_api.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(CFLAGS) -fPIC -DKIMI_NO_MAIN -c kimi_k3.c -o $@
+$(LIB_KIMI_A): kimi_k3.lib.o
+	$(AR) rcs $@ kimi_k3.lib.o
+
+# Static library for in-process Inkling embed (CPU only; no CLI main).
+# Strip COLI_CUDA so the archive does not need CUDA objects or runtime.
+LIB_INKLING_A := libinkling.a
+.PHONY: libinkling
+libinkling: $(LIB_INKLING_A)
+inkling.lib.o: inkling.c colibri_api.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h route_trace.h kv_prefix.h
+	$(CC) $(NOCUDA_CFLAGS) -fPIC -DINKLING_NO_MAIN -c inkling.c -o $@
+$(LIB_INKLING_A): inkling.lib.o
+	$(AR) rcs $@ inkling.lib.o
 
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(VK_OBJ) $(VK_SPV)
 ifeq ($(CUDA),1)
@@ -1028,7 +1113,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+.PHONY: all glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench

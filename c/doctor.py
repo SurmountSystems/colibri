@@ -8,24 +8,62 @@ import re
 import subprocess
 from pathlib import Path
 
-from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
-                           memory_available)
+from resource_plan import (GB, SSD_PROBE_PENDING, apply_gpu_memory_classification,
+                           build_plan, discover_gpus, format_plan, memory_available,
+                           memory_total)
 
 SAFETENSORS_MAX_HEADER = 512 << 20
 MODEL_INDEX_MAX_BYTES = SAFETENSORS_MAX_HEADER
 MAX_SAFETENSORS_SHARDS = 512
+# Must stay aligned with st_dtype_code / st_dtype_esz in c/st.h (and the Rust
+# doctor port). Integer index maps (I64/U64, e.g. DeepSeek tid2eid) and native
+# FP8 weight dtypes are valid for Colibri checkpoints the engine already loads.
 SAFETENSORS_DTYPES = {
     "BF16": 2,
     "F16": 2,
     "F32": 4,
     "U8": 1,
     "I8": 1,
+    # FP8 spellings accepted by st_dtype_code (1 byte each).
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "float8_e4m3fn": 1,
+    "F8_E8M0": 1,
+    "F8_E8M0FNU": 1,
+    # Integer index maps (8 bytes); engine code 6.
+    "I64": 8,
+    "U64": 8,
 }
-REQUIRED_CORE_TENSORS = (
+# GLM / Inkling / Kimi / Olmoe (HF-style names the engines load).
+REQUIRED_CORE_TENSORS_GLM = (
     "model.embed_tokens.weight",
     "model.norm.weight",
     "lm_head.weight",
 )
+# DeepSeek-V4 checkpoint names (c/deepseek_v4.c: embed.weight / norm.weight / head.weight).
+REQUIRED_CORE_TENSORS_DEEPSEEK_V4 = (
+    "embed.weight",
+    "norm.weight",
+    "head.weight",
+)
+# Back-compat alias for callers that still import the GLM list name.
+REQUIRED_CORE_TENSORS = REQUIRED_CORE_TENSORS_GLM
+
+
+def required_core_tensors(model_dir):
+    """Family-aware core tensor names (config model_type → engine spellings)."""
+    config_path = Path(model_dir) / "config.json"
+    model_type = ""
+    try:
+        with config_path.open() as stream:
+            document = json.load(stream)
+        if isinstance(document, dict):
+            model_type = str(document.get("model_type") or "").lower()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        model_type = ""
+    if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
+        return REQUIRED_CORE_TENSORS_DEEPSEEK_V4
+    return REQUIRED_CORE_TENSORS_GLM
 
 
 def _check(identifier, status, summary, **details):
@@ -270,15 +308,21 @@ def deep_container_report(model, mirror_dir=None):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             index = {"status": "fail", "summary": f"model index is invalid: {error}"}
 
-    missing_core = [name for name in REQUIRED_CORE_TENSORS if name not in tensor_sources]
+    required_names = required_core_tensors(model)
+    missing_core = [name for name in required_names if name not in tensor_sources]
+    if missing_core:
+        required_summary = (
+            f"{len(missing_core)} required core tensor(s) are missing: "
+            + ", ".join(missing_core)
+        )
+    else:
+        required_summary = "required core tensors are present"
     required = {
         "status": "fail" if missing_core else "pass",
-        "summary": (
-            f"{len(missing_core)} required core tensor(s) are missing"
-            if missing_core else "required core tensors are present"
-        ),
+        "summary": required_summary,
         "details": {
-            "required_tensors": len(REQUIRED_CORE_TENSORS),
+            "required_tensors": len(required_names),
+            "required_names": list(required_names),
             "missing_tensors": missing_core,
         },
     }
@@ -347,38 +391,77 @@ def deep_container_report(model, mirror_dir=None):
 
 
 def cuda_linkage(engine_path):
-    """Return CUDA linkage state without loading the executable or CUDA runtime."""
+    """Return CUDA/HIP linkage state without loading the executable or runtime.
+
+    Dict keys: linked, missing, kind (``cuda`` / ``hip`` / empty).
+    """
     engine = Path(engine_path)
     if not engine.is_file():
-        return {"linked": False, "missing": False}
+        return {"linked": False, "missing": False, "kind": ""}
     if os.name == "posix":
         try:
             result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
                                     timeout=3, check=False)
         except (OSError, subprocess.SubprocessError):
-            return {"linked": False, "missing": False}
+            return {"linked": False, "missing": False, "kind": ""}
         # A HIP/ROCm build links libamdhip64 (never libcudart), so match both
         # vendors here or a working AMD engine is reported CPU-only (#663). Mirrors
         # the vendor-aware probe cuda_binary() already uses in c/coli.
         lines = [line for line in result.stdout.splitlines()
                  if "libcudart" in line or "libamdhip64" in line]
+        kind = ""
+        for line in lines:
+            if "libamdhip64" in line:
+                kind = "hip"
+                break
+            if "libcudart" in line and not kind:
+                kind = "cuda"
         return {"linked": any("not found" not in line for line in lines),
-                "missing": any("not found" in line for line in lines)}
+                "missing": any("not found" in line for line in lines),
+                "kind": kind}
     if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        # Windows CUDA_DLL / HIP_DLL builds load coli_cuda.dll / coli_hip.dll at
+        # runtime via LoadLibrary (backend_loader.c). Detect sibling DLLs and the
+        # optional CUDA mode marker baked into the host.
         try:
-            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+            payload = engine.read_bytes()
         except OSError:
-            return {"linked": False, "missing": False}
-        if not built:
-            return {"linked": False, "missing": False}
-        dll_present = (engine.parent / "coli_cuda.dll").is_file()
-        return {"linked": dll_present, "missing": not dll_present}
-    return {"linked": False, "missing": False}
+            return {"linked": False, "missing": False, "kind": ""}
+        parent = engine.parent
+        hip_dll = (parent / "coli_hip.dll").is_file()
+        cuda_dll = (parent / "coli_cuda.dll").is_file()
+        built_cuda = b"[CUDA] mode: routed experts" in payload
+        if hip_dll:
+            return {"linked": True, "missing": False, "kind": "hip"}
+        if built_cuda or cuda_dll:
+            return {"linked": cuda_dll, "missing": bool(built_cuda and not cuda_dll),
+                    "kind": "cuda"}
+        return {"linked": False, "missing": False, "kind": ""}
+    return {"linked": False, "missing": False, "kind": ""}
+
+
+def _gpu_vendor_label(gpus):
+    nvidia = amd = False
+    for gpu in gpus:
+        vendor = (gpu.get("vendor") or "").lower()
+        name = (gpu.get("name") or "").lower()
+        if vendor == "nvidia" or "nvidia" in name or "geforce" in name or "rtx " in name:
+            nvidia = True
+        elif vendor == "amd" or "amd" in name or "radeon" in name or "instinct" in name:
+            amd = True
+    if nvidia and not amd:
+        return "nvidia"
+    if amd and not nvidia:
+        return "amd"
+    return ""
+
+
+def _gpu_free_vram_near_zero(gpu):
+    total = int(gpu.get("total_bytes") or 0)
+    free = int(gpu.get("free_bytes") or 0)
+    if total <= 0:
+        return free == 0
+    return free < 256 * 1024 * 1024 or free < total // 20
 
 
 def missing_shared_libraries(engine_path):
@@ -460,28 +543,87 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
 
     available_memory = memory_available() if available_memory is None else available_memory
-    detected_gpus = discover_gpus() if gpus is None else list(gpus)
+    detected_gpus = discover_gpus() if gpus is None else [dict(g) for g in gpus]
+    apply_gpu_memory_classification(
+        detected_gpus, max(available_memory, memory_total()))
     linkage = cuda_linkage(engine) if linkage is None else linkage
     selected_gpus = detected_gpus
     if gpu_indices is not None:
         wanted = set(gpu_indices)
         selected_gpus = [gpu for gpu in detected_gpus if gpu["index"] in wanted]
 
+    # Keep stable check id `accelerator.cuda` (wire/schema); messages are vendor-aware.
+    vendor = _gpu_vendor_label(selected_gpus)
+    runtime = (linkage.get("kind") or "").strip()
+    if not runtime:
+        runtime = "hip" if vendor == "amd" else ("cuda" if vendor == "nvidia" else "")
+    low_free = any(_gpu_free_vram_near_zero(g) for g in selected_gpus)
+    any_integrated = any(g.get("integrated") for g in selected_gpus)
+    device_ids = [gpu["index"] for gpu in selected_gpus]
+    carve_outs = [{
+        "index": g.get("index"),
+        "total_bytes": g.get("total_bytes"),
+        "free_bytes": g.get("free_bytes"),
+        "used_bytes": max(0, int(g.get("total_bytes") or 0) - int(g.get("free_bytes") or 0)),
+        "integrated": bool(g.get("integrated")),
+        "gtt_total_bytes": g.get("gtt_total_bytes"),
+        "gtt_free_bytes": g.get("gtt_free_bytes"),
+    } for g in selected_gpus]
+    acc_details = {
+        "devices": device_ids,
+        "vendor": vendor,
+        "runtime": runtime,
+        "linked": bool(linkage.get("linked")),
+        "missing": bool(linkage.get("missing")),
+        "low_free_vram": low_free,
+        "integrated": any_integrated,
+        "shared_system_memory": any_integrated,
+        "system_memory_available_bytes": available_memory,
+        "system_memory_total_bytes": memory_total(),
+        "vram_carve_out": carve_outs,
+    }
+
     if gpu_indices == []:
         checks.append(_check("accelerator.cuda", "skip", "GPU use was explicitly disabled"))
     elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
         checks.append(_check("accelerator.cuda", "fail", "one or more requested GPUs were not detected",
                              requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
-    elif selected_gpus and linkage.get("missing"):
-        checks.append(_check("accelerator.cuda", "fail", "CUDA runtime library is missing"))
-    elif selected_gpus and linkage.get("linked"):
-        checks.append(_check("accelerator.cuda", "pass", "CUDA engine and devices are available",
-                             devices=[gpu["index"] for gpu in selected_gpus]))
-    elif selected_gpus:
-        checks.append(_check("accelerator.cuda", "warn", "NVIDIA GPU detected but the engine is CPU-only",
-                             devices=[gpu["index"] for gpu in selected_gpus]))
+    elif not selected_gpus:
+        checks.append(_check("accelerator.cuda", "skip", "no GPU detected; CPU path is available"))
+    elif linkage.get("missing"):
+        if runtime == "hip":
+            summary = "HIP runtime library (libamdhip64) is missing"
+        elif runtime == "cuda":
+            summary = "CUDA runtime library is missing"
+        else:
+            summary = "GPU runtime library is missing"
+        checks.append(_check("accelerator.cuda", "fail", summary, **acc_details))
+    elif linkage.get("linked"):
+        if runtime == "hip" or vendor == "amd":
+            summary = "HIP engine and AMD device(s) are available"
+        elif runtime == "cuda" or vendor == "nvidia":
+            summary = "CUDA engine and NVIDIA device(s) are available"
+        else:
+            summary = "GPU engine and devices are available"
+        status = "pass"
+        # On UMA the BIOS VRAM window is not the GPU budget. A busy carve-out
+        # must not warn as if it were discrete VRAM.
+        if low_free and not any_integrated:
+            summary += "; free VRAM is near zero (display compositor may own most of it)"
+            status = "warn"
+        elif any_integrated:
+            summary += "; shared system memory (UMA), not discrete VRAM only"
+        checks.append(_check("accelerator.cuda", status, summary, **acc_details))
     else:
-        checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
+        if vendor == "amd":
+            summary = "AMD GPU detected but the engine is CPU-only (build with HIP=1)"
+        elif vendor == "nvidia":
+            summary = "NVIDIA GPU detected but the engine is CPU-only"
+        else:
+            summary = "GPU detected but the engine is CPU-only"
+        if any_integrated:
+            summary += "; GPU shares system memory (UMA)"
+        checks.append(_check("accelerator.cuda", "warn", summary, **acc_details))
 
     try:
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,

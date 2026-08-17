@@ -576,6 +576,29 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
 /* backward-compatible single-directory entry point */
 static void st_init(shards *S, const char *snap_dir) { st_init_multi(S, snap_dir, NULL); }
 
+/* Close shard fds and free index memory. Safe on a zeroed shards. */
+static void st_close(shards *S) {
+    if (!S) return;
+    st_mirror_reset(S);
+    for (int i = 0; i < S->nfd; i++) {
+        if (S->fds[i] >= 0) close(S->fds[i]);
+        if (S->dfds[i] >= 0) close(S->dfds[i]);
+        free(S->paths[i]);
+    }
+    if (S->t) {
+        for (int i = 0; i < S->n; i++) free(S->t[i].name);
+        free(S->t);
+    }
+    free(S->hidx);
+    for (int i = 0; i < S->fmt_n; i++) {
+        free(S->fmt_name[i]);
+        free(S->fmt_val[i]);
+    }
+    free(S->fmt_name);
+    free(S->fmt_val);
+    memset(S, 0, sizeof(*S));
+}
+
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {
         uint64_t h = st_hash(name) & (S->hcap - 1);

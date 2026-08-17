@@ -9,7 +9,7 @@ The signals under test, and the inefficiency each catches:
   - tok/s floor          : a throughput regression (broken build / bad config)
   - profile phases sum   : telemetry accounting bug (other balloons)
   - disk-wait not dominant: a tiny resident model should never be I/O-bound
-  - CPU determinism      : greedy decode is reproducible (no stray RNG/threading)
+  - CPU determinism      : same-seed greedy hit-rate / counts match (not tok/s)
   - CUDA init path       : COLI_CUDA=1 initializes and does not silently exit 2
   - CUDA dense uses VRAM : CUDA_DENSE=1 actually uploads tensors (no silent CPU fallback)
   - CPU vs CUDA TF-match : identical weights+inputs → identical argmax (kernel bug guard)
@@ -164,19 +164,30 @@ class TinyEfficiencyTest(unittest.TestCase):
     # -- determinism ----------------------------------------------------------
 
     def test_cpu_vs_cpu_determinism(self):
-        """Two greedy REPLAY runs with the same seed produce identical telemetry.
+        """Two greedy REPLAY runs with the same seed produce identical structural telemetry.
 
-        TEMP=0 = greedy (no sampling), so tok/s and hit-rate must be reproducible.
-        A drift here means non-determinism crept into the decode path (stray
-        threading, uninitialized state) — which on a real model would make A/B
-        comparisons meaningless."""
+        TEMP=0 = greedy (no sampling). Hit-rate and routing counts must match.
+        tok/s is wall-clock, not determinism: this tiny replay is ~15 ms, and a
+        quiet box already swung ~38.8% between two identical runs, so a 25%
+        throughput bound is a flaky perf gate (CI already refuses to collect
+        it for that reason). Do not put tok/s back on this check-path test.
+        """
         a = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         b = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         self.assertEqual(a["returncode"], 0)
         self.assertEqual(b["returncode"], 0)
+        self.assertIsNotNone(a["hit_pct"], f"missing hit-rate:\n{a['stderr']}")
+        self.assertIsNotNone(b["hit_pct"], f"missing hit-rate:\n{b['stderr']}")
         self.assertEqual(a["hit_pct"], b["hit_pct"], "greedy hit-rate drifted between runs")
-        # tok/s within 25% — exact equality is too strict across scheduler noise.
-        self.assertLess(abs(a["tok_s"] - b["tok_s"]) / max(a["tok_s"], b["tok_s"]), 0.25)
+        # Same-seed greedy decode must also agree on structural counts when the
+        # engine emitted them. Timing fields (tok/s, PROFILE seconds) are not
+        # part of this contract.
+        for key in ("loads_per_tok", "experts_loaded"):
+            if key in a["parsed"] or key in b["parsed"]:
+                self.assertEqual(
+                    a.get(key), b.get(key),
+                    f"greedy {key} drifted between runs",
+                )
 
 
 @unittest.skipUnless(_cuda_available(),

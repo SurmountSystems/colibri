@@ -251,19 +251,17 @@ jobs:
         # that before reading anything else out of a run.
         run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
       - name: Structural efficiency tests
-        # test_cpu_vs_cpu_determinism is NOT in this list. Despite the name its
-        # second assertion is a tok/s stability bound (two runs within 25%), and
-        # the tiny replay is 15 ms end to end -- it measured 38.8% between two
-        # identical runs on a quiet local box, so a shared runner would make it
-        # flaky on day one. Its first assertion (hit-rate identical) IS a real
-        # determinism check and does hold; splitting the two is worth doing, but
-        # not silently from a CI change.
+        # test_cpu_vs_cpu_determinism now asserts hit-rate / structural counts
+        # only. The old tok/s-within-25% bound is not determinism: the tiny
+        # replay is ~15 ms and already measured a 38.8% swing on a quiet box,
+        # so that bound stays out of this job and out of `make check`.
         run: |
           cd c
           python3 -m unittest -v \
             tests.test_inefficiency.TinyEfficiencyTest.test_telemetry_parses \
             tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
-            tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant
+            tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant \
+            tests.test_inefficiency.TinyEfficiencyTest.test_cpu_vs_cpu_determinism
 
   engine-hip-syntax:
     name: HIP syntax check

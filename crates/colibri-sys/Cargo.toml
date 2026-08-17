@@ -1,0 +1,88 @@
+[package]
+name = "colibri-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Embeddable Colibrì host crate: config, placement plan, model registry, engine process + serve mux, visual APIs, rkyv duplex stream"
+license = "MIT"
+readme = "README.md"
+keywords = ["colibri", "llm", "inference", "moe"]
+categories = ["api-bindings"]
+repository = "https://github.com/SurmountSystems/colibri"
+
+[features]
+default = ["runtime", "stream", "tokio"]
+# Process spawn + serve mux client (engine as subprocess).
+runtime = []
+# rkyv duplex frames + length-prefix codec.
+stream = ["dep:rkyv", "dep:rancor"]
+# Tokio async wrappers for engine I/O and duplex sessions.
+tokio = ["dep:tokio", "runtime"]
+# HF download orchestration (hf CLI or hf-hub).
+install = ["dep:hf-hub", "dep:indicatif"]
+# Optional multi-family CPU static link (libdeepseek_v4 / libcolibri / libkimi_k3 /
+# libinkling via build.rs + make). Process serve mux remains the product default
+# (prefer_process = true). Archives are CPU-only unless `ffi-cuda` or `ffi-hip`
+# is also enabled (one GPU vendor per binary; not both).
+ffi = []
+# Opt-in Linux CUDA objects for GLM embed only (`make libcolibri CUDA=1` + cudart).
+# Implies `ffi`. Default `ffi` stays CPU-only. Without a CUDA toolkit, build.rs
+# falls back to CPU-only (cargo warning) unless COLIBRI_REQUIRE_FFI_CUDA=1.
+# Env alternate: COLIBRI_FFI_CUDA=1 with feature `ffi`. See docs/ffi-phase-d.md.
+# Mutually exclusive with `ffi-hip` (build.rs panics if both are forced).
+ffi-cuda = ["ffi"]
+# Opt-in Linux HIP/ROCm objects for GLM embed only (`make libcolibri HIP=1` +
+# libamdhip64). Implies `ffi`. Default `ffi` stays CPU-only. Without hipcc/ROCm,
+# build.rs falls back to CPU-only (cargo warning) unless COLIBRI_REQUIRE_FFI_HIP=1.
+# Env alternate: COLIBRI_FFI_HIP=1 with feature `ffi`. ROCM_HOME / ROCM_PATH /
+# HIP_ARCH documented in GPU_BACKENDS.md and docs/ffi-phase-d.md.
+# Mutually exclusive with `ffi-cuda` (one GPU vendor link mode per binary).
+ffi-hip = ["ffi"]
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+hex = "0.4"
+tracing = "0.1"
+parking_lot = "0.12"
+bytes = "1"
+
+# stream (default rkyv features include bytecheck for decode_frame_checked)
+rkyv = { version = "0.8", optional = true, features = ["bytecheck"] }
+rancor = { version = "0.1", optional = true }
+
+# tokio
+tokio = { version = "1", optional = true, features = [
+    "io-util",
+    "process",
+    "sync",
+    "rt",
+    "macros",
+    "time",
+] }
+
+# install (hf-hub 1.x blocking sync client)
+hf-hub = { version = "1", optional = true, features = ["blocking"] }
+indicatif = { version = "0.18", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = [
+    "io-util",
+    "process",
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+] }
+
+[[example]]
+name = "embed_chat"
+required-features = ["runtime", "tokio"]
+
+[[example]]
+name = "plan_probe"
+required-features = []

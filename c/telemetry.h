@@ -116,27 +116,54 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
 #endif
 }
 
-static void hwinfo_emit(Model *m){
+/* Shared grid geometry for EMAP / HITS: sparse MoE layers (+ MTP row when present)
+ * × n_experts. Same rows/cols the process path prints. */
+static void expert_grid_dims(Model *m, int *rows_out, int *cols_out){
+    Cfg *c=&m->c;
+    int rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    int has_mtp = m->has_mtp && m->eusage && m->eusage[c->n_layers];
+    if(has_mtp) rows++;
+    if(rows_out) *rows_out=rows;
+    if(cols_out) *cols_out=c->n_experts;
+}
+
+/* Fill helpers for SERVE printf and embed poll (same byte layouts).
+ * emap/hits: cells/bits may be NULL to query size only (*out_len set).
+ * Returns 0, or -2 if non-NULL buffer is too small for the needed length. */
+
+static void hwinfo_fill(Model *m, int *cores, double *ram_total, double *ram_avail,
+                        int *ngpu, double *vram_total, char *cpu, size_t cn,
+                        char *gpu, size_t gn){
     Cfg *c=&m->c; (void)c;
-    char cpu[256]; int cores; double ram_total,ram_avail;
-    hw_probe(cpu,sizeof(cpu),&cores,&ram_total,&ram_avail);
-    int ngpu=0; double vram_total=0;
+    if(cpu && cn) cpu[0]=0;
+    if(gpu && gn) gpu[0]=0;
+    char cpu_local[256]; int c0=0; double rt=0,ra=0;
+    hw_probe(cpu_local,sizeof(cpu_local),&c0,&rt,&ra);
+    if(cores) *cores=c0;
+    if(ram_total) *ram_total=rt;
+    if(ram_avail) *ram_avail=ra;
+    int ng=0; double vt=0;
     char gpu_name[128]="";
 #ifdef COLI_CUDA
-    ngpu=g_cuda_ndev; vram_total=m->gpu_expert_bytes/1e9;
+    ng=g_cuda_ndev; vt=m->gpu_expert_bytes/1e9;
     for(int i=0;i<g_cuda_ndev;i++){
         size_t fr=0,to=0; coli_cuda_mem_info(g_cuda_devices[i],&fr,&to);
-        if(!i) vram_total=(double)to*g_cuda_ndev/1e9;
+        if(!i) vt=(double)to*g_cuda_ndev/1e9;
     }
     if(g_cuda_ndev>0)
         snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+#else
+    (void)m;
 #endif
-    printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
-        cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
-    fflush(stdout);
+    if(ngpu) *ngpu=ng;
+    if(vram_total) *vram_total=vt;
+    if(cpu && cn) snprintf(cpu,cn,"%s",cpu_local);
+    if(gpu && gn) snprintf(gpu,gn,"%s",gpu_name);
 }
 
-static void tiers_emit(Model *m){
+static void tiers_fill(Model *m, int *vram_out, int *ram_out, int *disk_out,
+                       double *vram_gb_out, double *ram_gb_out){
     Cfg *c=&m->c; int nsp=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     int total=(nsp+(m->has_mtp?1:0))*c->n_experts;
@@ -149,25 +176,35 @@ static void tiers_emit(Model *m){
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
     double eb=(double)expert_bytes_probe(m,m->ebits);
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
-    fflush(stdout);
+    if(vram_out) *vram_out=vram;
+    if(ram_out) *ram_out=ram;
+    if(disk_out) *disk_out=disk;
+    if(vram_gb_out) *vram_gb_out=vram_gb;
+    if(ram_gb_out) *ram_gb_out=ram*eb/1e9;
 }
 
-static void emap_emit(Model *m){
+/* One byte per expert, row-major: byte = (tier<<6)|heat (tier 0 disk/1 RAM/2 VRAM). */
+static int emap_fill(Model *m, uint8_t *cells, size_t cap, int *rows_out, int *cols_out,
+                     size_t *out_len){
     Cfg *c=&m->c;
-    int rows=0;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
-    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
-    if(has_mtp) rows++;
-    int cols=c->n_experts;
-    char *hex=malloc((size_t)rows*cols*2+1); int w=0;
+    int rows=0, cols=0;
+    expert_grid_dims(m,&rows,&cols);
+    size_t need=(size_t)rows*(size_t)cols;
+    if(rows_out) *rows_out=rows;
+    if(cols_out) *cols_out=cols;
+    if(out_len) *out_len=need;
+    if(!cells) return 0;
+    if(cap<need) return -2;
+    int has_mtp = m->has_mtp && m->eusage && m->eusage[c->n_layers];
+    size_t w=0;
     for(int i=0;i<=c->n_layers;i++){
         int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
             int tier=0;
-            ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+            ESlot *P=m->pin?m->pin[i]:NULL;
+            int np=m->npin?m->npin[i]:0;
+            for(int z=0;z<np;z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
 #else
@@ -176,34 +213,90 @@ static void emap_emit(Model *m){
                 break; }
             if(!tier && m->ecache && m->ecache[i])
                 for(int z=0;z<m->ecn[i];z++) if(m->ecache[i][z].eid==e){ tier=1; break; }
-            uint32_t u = m->eusage[i]?m->eusage[i][e]:0;
+            uint32_t u = m->eusage && m->eusage[i]?m->eusage[i][e]:0;
             int heat=0; while(u){ heat++; u>>=1; } if(heat>63) heat=63;
-            int b=(tier<<6)|heat;
-            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
+            cells[w++]=(uint8_t)((tier<<6)|heat);
         }
     }
-    hex[w]=0;
-    printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex);
+    return 0;
 }
 
-static void hits_emit(Model *m){
-    Cfg *c=&m->c; if(!g_ehit) return;
-    int rows=0;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
-    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
-    if(has_mtp) rows++;
-    int cols=c->n_experts, nb=(rows*cols+7)/8;
-    uint8_t *bm=calloc(nb,1); int bit=0;
+/* 1 bit per expert (little-endian bit in byte), row-major. Clears g_ehit when
+ * bits is non-NULL and the buffer is large enough (same as hits_emit). */
+static int hits_fill(Model *m, uint8_t *bits, size_t cap, int *rows_out, int *cols_out,
+                     size_t *out_len){
+    Cfg *c=&m->c;
+    int rows=0, cols=0;
+    expert_grid_dims(m,&rows,&cols);
+    size_t need=(size_t)((rows*cols+7)/8);
+    if(rows_out) *rows_out=rows;
+    if(cols_out) *cols_out=cols;
+    if(out_len) *out_len=need;
+    if(!bits) return 0;
+    if(cap<need) return -2;
+    memset(bits,0,need);
+    if(!g_ehit) return 0;
+    int has_mtp = m->has_mtp && m->eusage && m->eusage[c->n_layers];
+    int bit=0;
     for(int i=0;i<=c->n_layers;i++){
         int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
         if(!is_row) continue;
         for(int e=0;e<cols;e++,bit++)
-            if(g_ehit[i][e]){ bm[bit>>3]|=1<<(bit&7); g_ehit[i][e]=0; }
+            if(g_ehit[i] && g_ehit[i][e]){ bits[bit>>3]|=(uint8_t)(1<<(bit&7)); g_ehit[i][e]=0; }
     }
-    char *hex=malloc((size_t)nb*2+1); int w=0;
-    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
+    return 0;
+}
+
+static void hwinfo_emit(Model *m){
+    char cpu[256], gpu_name[128];
+    int cores=0, ngpu=0; double ram_total=0, ram_avail=0, vram_total=0;
+    hwinfo_fill(m,&cores,&ram_total,&ram_avail,&ngpu,&vram_total,
+                cpu,sizeof(cpu),gpu_name,sizeof(gpu_name));
+    printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
+        cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
+    fflush(stdout);
+}
+
+static void tiers_emit(Model *m){
+    int vram=0,ram=0,disk=0; double vram_gb=0,ram_gb=0;
+    tiers_fill(m,&vram,&ram,&disk,&vram_gb,&ram_gb);
+    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_gb);
+    fflush(stdout);
+}
+
+static void emap_emit(Model *m){
+    int rows=0, cols=0; size_t n=0;
+    if(emap_fill(m,NULL,0,&rows,&cols,&n)!=0) return;
+    uint8_t *cells=n?malloc(n):NULL;
+    if(n && !cells) return;
+    if(emap_fill(m,cells,n,&rows,&cols,&n)!=0){ free(cells); return; }
+    char *hex=malloc(n*2+1); if(!hex){ free(cells); return; }
+    int w=0;
+    for(size_t b=0;b<n;b++){
+        hex[w++]="0123456789abcdef"[cells[b]>>4];
+        hex[w++]="0123456789abcdef"[cells[b]&15];
+    }
     hex[w]=0;
-    printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
+    printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout);
+    free(hex); free(cells);
+}
+
+static void hits_emit(Model *m){
+    if(!g_ehit) return;
+    int rows=0, cols=0; size_t nb=0;
+    if(hits_fill(m,NULL,0,&rows,&cols,&nb)!=0) return;
+    uint8_t *bm=nb?calloc(nb,1):NULL;
+    if(nb && !bm) return;
+    if(hits_fill(m,bm,nb,&rows,&cols,&nb)!=0){ free(bm); return; }
+    char *hex=malloc(nb*2+1); if(!hex){ free(bm); return; }
+    int w=0;
+    for(size_t b=0;b<nb;b++){
+        hex[w++]="0123456789abcdef"[bm[b]>>4];
+        hex[w++]="0123456789abcdef"[bm[b]&15];
+    }
+    hex[w]=0;
+    printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout);
+    free(hex); free(bm);
 }
 
 /* The history format lives in route_trace.h so every engine writes the same bytes;

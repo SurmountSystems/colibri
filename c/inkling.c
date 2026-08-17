@@ -2024,6 +2024,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
+#ifndef INKLING_NO_MAIN
 int main(int argc, char **argv) {
     /* OpenMP hot-thread tuning, same trick (and rationale) as glm.c: the
      * per-expert matmul regions are tiny and back-to-back; the default passive
@@ -2248,3 +2249,198 @@ int main(int argc, char **argv) {
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;
 }
+#endif /* !INKLING_NO_MAIN */
+
+#ifdef INKLING_NO_MAIN
+/* ---- Public embed API (libinkling.a, CPU only) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiInkEngine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+};
+
+static void coli_ink_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+static uint64_t coli_ink_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+int coli_ink_engine_open(ColiInkEngine **engine, const ColiInkOpenOptions *options,
+                         char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_ink_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_ink_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_ink_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiInkEngine *e = (ColiInkEngine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_ink_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    int cap = options->cap; /* 0 => auto from free RAM inside model_init */
+    int bits = options->bits > 0 ? options->bits : 0;
+    if (bits && (bits < 2 || bits > 8)) {
+        free(e);
+        coli_ink_set_err(error, error_size, "bits must be 0 or 2..8");
+        return -1;
+    }
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    model_init(&e->m, e->model_dir, cap, bits);
+    pins_load(&e->m, e->model_dir);
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+void coli_ink_engine_destroy(ColiInkEngine *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+void coli_ink_engine_size(const ColiInkEngine *engine, ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "inkling");
+    snprintf(out->engine_id, sizeof(out->engine_id), "inkling");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+int coli_ink_generate(ColiInkEngine *engine, const char *prompt, size_t prompt_len,
+                      const ColiInkGenerateOptions *options, ColiTokenFn on_token,
+                      void *user_data, char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_ink_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_ink_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    const char *snap = engine->model_dir;
+    char tkp[2048];
+    snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+    FILE *tf = fopen(tkp, "rb");
+    if (!tf) {
+        coli_ink_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    fclose(tf);
+    Tok T;
+    tok_load(&T, tkp);
+    int cap = (int)prompt_len + 16;
+    if (cap < 16) cap = 16;
+    int *ids = (int *)malloc((size_t)cap * sizeof(int));
+    if (!ids) {
+        coli_ink_set_err(error, error_size, "OOM prompt ids");
+        return -1;
+    }
+    int np = tok_encode(&T, prompt, (int)prompt_len, ids, cap);
+    if (np < 1) {
+        free(ids);
+        coli_ink_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    state_reset(m);
+    kv_alloc(m, np + ngen + 8);
+    float *logit = step_mm(m, ids, np, 0, NULL, NULL, 0);
+    free(ids);
+    if (!logit) {
+        coli_ink_set_err(error, error_size, "prefill failed");
+        return -1;
+    }
+    Cfg *c = &m->c;
+    int len = np;
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        int best = 0;
+        float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++)
+            if (logit[i] > bv) {
+                bv = logit[i];
+                best = i;
+            }
+        free(logit);
+        logit = NULL;
+        if (on_token && on_token(user_data, best, bv, ordinal, ordinal)) break;
+        ordinal++;
+        if (best == c->eos) break;
+        if (s == ngen - 1) break;
+        int one = best;
+        len++;
+        logit = step(m, &one, 1, len - 1, NULL);
+        if (!logit) break;
+    }
+    if (logit) free(logit);
+    return 0;
+}
+
+/* Visual poll stub: empty success until Inkling telemetry fill lands. */
+int coli_ink_visual_poll(ColiInkEngine *engine, uint32_t want, ColiHwinfoSnap *hwinfo,
+                         ColiTiersSnap *tiers, ColiExpertGridDims *emap_dims,
+                         uint8_t *emap_cells, size_t emap_cells_cap, size_t *emap_cells_len,
+                         ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                         size_t hits_bits_cap, size_t *hits_bits_len, uint64_t *hits_seq,
+                         ColiProfSnap *prof, char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_ink_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* INKLING_NO_MAIN */

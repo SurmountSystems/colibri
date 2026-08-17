@@ -71,7 +71,7 @@ as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists c
 
 With Colibrì, private frontier model access is not limited by availability of hyperscaler-class hardware.
 
-With its multitiering features Colibrì **removes proprietary hardware dependencies aggressively 
+With its multitiering features Colibrì **removes proprietary hardware dependencies aggressively
 optimizing functional inference engine pipelines**.
 
 Our operational mission includes changing how weights are represented and moved, deciding what
@@ -551,7 +551,22 @@ web/                      browser UI (pure OpenAI-API client)
 desktop/                  Tauri v2 desktop shell wrapping the web UI
 docker/                   container images
 docs/                     reference docs, experiments, media
+crates/colibri-sys/       Rust embed host (process-first; path dependency)
+crates/colibri-native/        native GPUI host embedding colibri-sys (no HTTP)
 ```
+
+### Rust embed host (`colibri-sys`)
+
+For **Rust** apps that want to probe the machine, plan placement, run doctor,
+and **spawn Colibrì engines as subprocesses** (serve mux), use the workspace
+crate [`crates/colibri-sys`](crates/colibri-sys/README.md). It is a process-first
+host: inference stays in the C binaries under `c/`. It is **not** day-one
+`libcolibri` in-process FFI, and it is **not published to crates.io** yet.
+Depend on it with a local **path** (or git) dependency from your Cargo project.
+
+- Crate overview and features: [`crates/colibri-sys/README.md`](crates/colibri-sys/README.md)
+- Full user guide (probe, plan, embed, Grok Build HTTP harness): [`crates/colibri-sys/docs/user-guide.md`](crates/colibri-sys/docs/user-guide.md)
+- Native GPUI fidelity demo (in-process sys, rkyv duplex, no REST): [`crates/colibri-native`](crates/colibri-native/README.md)
 
 **One `.c` per model family, over shared single headers.** An engine owns its
 architecture and nothing else; anything two engines both need — the safetensors

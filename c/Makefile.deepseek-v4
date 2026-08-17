@@ -59,8 +59,21 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_OBJS = $(TARGET_OBJS)
 
-.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
+# Static library for in-process embed (colibri-sys feature `ffi`).
+# Separate *.lib.o objects so the CLI binary keeps its main; library objects
+# compile with -DCOLI_V4_SKIP_GENERATE_MAIN (no CLI main) and -fPIC.
+LIB_V4_NAME ?= libdeepseek_v4.a
+LIB_OBJS = $(addsuffix .lib.o,$(V4_TARGET_UNITS))
+# LTO objects are awkward to consume from rustc; default library builds off LTO.
+LIB_LTO ?= 0
+LIB_CFLAGS = $(filter-out -flto,$(CFLAGS)) -fPIC -DCOLI_V4_SKIP_GENERATE_MAIN
+ifeq ($(LIB_LTO),1)
+LIB_CFLAGS += -flto
+endif
+
+.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs libdeepseek-v4
 deepseek-v4: $(V4_BINARY)
+libdeepseek-v4: $(LIB_V4_NAME)
 
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
@@ -71,7 +84,17 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	native_quant_fp4_rows16.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
+# Library objects: same amalgamation units, no CLI main.
+$(LIB_OBJS): %.lib.o: deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h
+	$(CC) $(LIB_CFLAGS) -D$(patsubst %.lib.o,%,$@) -c deepseek_v4.c -o $@
+
+$(LIB_V4_NAME): $(LIB_OBJS)
+	$(AR) rcs $@ $(LIB_OBJS)
+
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(LIB_OBJS) $(LIB_V4_NAME)

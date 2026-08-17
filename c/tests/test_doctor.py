@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from doctor import exit_code, format_doctor, run_doctor
+from doctor import _tensor_layout, exit_code, format_doctor, run_doctor
 from resource_plan import GB
 
 
@@ -137,18 +137,40 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(check["status"], "warn")
         self.assertEqual(report["status"], "warning")
         self.assertEqual(exit_code(report), 0)
+        self.assertNotIn("NVIDIA", check["summary"])
 
     def test_missing_cuda_runtime_is_a_failure(self):
-        gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
-               "free_bytes": 10 * GB}
+        gpu = {"index": 0, "name": "NVIDIA GeForce", "total_bytes": 12 * GB,
+               "free_bytes": 10 * GB, "vendor": "nvidia"}
         report = self.report(gpu_indices=[0], gpus=[gpu],
-                             linkage={"linked": False, "missing": True})
+                             linkage={"linked": False, "missing": True, "kind": "cuda"})
 
         self.assertEqual(
             self.checks_by_id(report)["accelerator.cuda"]["summary"],
             "CUDA runtime library is missing",
         )
         self.assertEqual(report["status"], "error")
+
+    def test_amd_gpu_cpu_engine_does_not_say_nvidia(self):
+        gpu = {"index": 0, "name": "AMD Radeon 860M Graphics", "total_bytes": 4 * GB,
+               "free_bytes": 2 * GB, "vendor": "amd", "source": "rocm-smi"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": False, "missing": False, "kind": ""})
+        check = self.checks_by_id(report)["accelerator.cuda"]
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("AMD", check["summary"])
+        self.assertNotIn("NVIDIA", check["summary"])
+
+    def test_amd_hip_ready_pass(self):
+        gpu = {"index": 0, "name": "AMD Radeon 860M Graphics", "total_bytes": 4 * GB,
+               "free_bytes": 3 * GB, "vendor": "amd"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False, "kind": "hip"})
+        check = self.checks_by_id(report)["accelerator.cuda"]
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("HIP", check["summary"])
+        self.assertIn("AMD", check["summary"])
+        self.assertNotIn("NVIDIA", check["summary"])
 
     # #379: doctor surfaces the cached F_NOCACHE probe read-only (S4) -- it
     # never re-measures storage itself, only reflects what colibri.c already wrote.
@@ -231,6 +253,48 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["model.required"]["status"], "pass")
         self.assertEqual(checks["model.index"]["status"], "skip")
         self.assertEqual(checks["storage.mirror"]["status"], "skip")
+
+    def test_tensor_layout_accepts_i64_and_f8_runtime_dtypes(self):
+        """Integer index maps and FP8 dtypes match c/st.h; not float-only."""
+        self.assertEqual(
+            _tensor_layout(
+                {"dtype": "I64", "shape": [4, 2], "data_offsets": [0, 64]},
+                64,
+            ),
+            (0, 64),
+        )
+        self.assertEqual(
+            _tensor_layout(
+                {"dtype": "U64", "shape": [2], "data_offsets": [0, 16]},
+                16,
+            ),
+            (0, 16),
+        )
+        for dtype in (
+            "F8_E4M3",
+            "F8_E4M3FN",
+            "float8_e4m3fn",
+            "F8_E8M0",
+            "F8_E8M0FNU",
+        ):
+            self.assertEqual(
+                _tensor_layout(
+                    {"dtype": dtype, "shape": [8], "data_offsets": [0, 8]},
+                    8,
+                ),
+                (0, 8),
+                msg=dtype,
+            )
+        with self.assertRaisesRegex(ValueError, "unsupported dtype"):
+            _tensor_layout(
+                {"dtype": "F64", "shape": [1], "data_offsets": [0, 8]},
+                8,
+            )
+        with self.assertRaisesRegex(ValueError, "shape and dtype disagree"):
+            _tensor_layout(
+                {"dtype": "I64", "shape": [4, 2], "data_offsets": [0, 32]},
+                64,
+            )
 
     def test_deep_check_rejects_overlapping_tensor_ranges(self):
         header = {

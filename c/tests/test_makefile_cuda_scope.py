@@ -77,6 +77,68 @@ class MakefileCudaScopeTest(unittest.TestCase):
         self.assertIn("-DCOLI_CUDA", out,
                       "colibri.c does have a CUDA backend and must keep it")
 
+    def test_libcolibri_cuda_packs_backend_object(self):
+        """FFI GLM archive with CUDA=1 must include backend_cuda (open:ffi-gpu)."""
+        out = recipe("libcolibri", "CUDA=1")
+        self.assertIn("-DCOLI_CUDA", out,
+                      "colibri.lib.o must compile with COLI_CUDA when CUDA=1")
+        self.assertIn("backend_cuda", out,
+                      "libcolibri.a must pack backend_cuda.o for embed CUDA")
+        self.assertIn("libcolibri.a", out)
+
+    def test_libcolibri_default_is_cpu_only(self):
+        """Default feature=ffi matrix: no CUDA objects in the GLM archive."""
+        out = recipe("libcolibri")
+        for marker in CUDA_MARKERS:
+            self.assertNotIn(marker, out,
+                             f"default libcolibri must stay CPU-only; found {marker}")
+        # backend_cuda.o must not be a prerequisite of the CPU archive recipe.
+        ar_lines = [l for l in out.splitlines() if "libcolibri.a" in l or "ar " in l.lower()]
+        joined = "\n".join(ar_lines) if ar_lines else out
+        self.assertNotIn("backend_cuda", joined,
+                         "CPU libcolibri must not archive backend_cuda.o")
+
+
+def hip_flag_is_accepted():
+    """Whether this toolchain emits a HIP recipe at all (Linux + ROCm path)."""
+    # Explicit HIP_ARCH avoids rocm_agent_enumerator failures on GPU-less hosts.
+    return "-DCOLI_CUDA" in recipe("libcolibri", "HIP=1", "HIP_ARCH=gfx1100")
+
+
+@unittest.skipUnless(shutil.which("make"), "make is not installed")
+@unittest.skipUnless(shutil.which("make") and hip_flag_is_accepted(),
+                     "this toolchain rejects HIP=1 before any recipe is emitted")
+class MakefileHipFfiScopeTest(unittest.TestCase):
+    """FFI static lib packs HIP backend objects (feature ffi-hip / HIP=1)."""
+
+    def test_libcolibri_hip_packs_backend_object(self):
+        out = recipe("libcolibri", "HIP=1", "HIP_ARCH=gfx1100")
+        self.assertIn("-DCOLI_CUDA", out,
+                      "colibri.lib.o must compile with COLI_CUDA when HIP=1")
+        self.assertIn("backend_cuda", out,
+                      "libcolibri.a must pack backend_cuda.o for embed HIP")
+        self.assertIn("libcolibri.a", out)
+        # HIP path must use hipcc (or name HIP compiler tooling). Do not OR with
+        # backend_cuda alone — that marker is already required above and would
+        # make a CUDA-only mis-recipe under HIP=1 pass vacuously.
+        self.assertTrue(
+            "hipcc" in out or "HIPCC" in out,
+            f"HIP=1 recipe must invoke hipcc (not only pack backend_cuda):\n{out}",
+        )
+
+    def test_libcolibri_cuda_and_hip_mutually_exclusive(self):
+        result = subprocess.run(
+            ["make", "-Bn", "libcolibri", "CUDA=1", "HIP=1", "HIP_ARCH=gfx1100"],
+            cwd=HERE, text=True, capture_output=True, check=False, timeout=120,
+        )
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0,
+                            "CUDA=1 and HIP=1 together must fail")
+        self.assertTrue(
+            "choose CUDA=1 or HIP=1" in combined or "not both" in combined,
+            f"expected mutual-exclusion error:\n{combined}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

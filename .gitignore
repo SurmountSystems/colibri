@@ -6,6 +6,9 @@ __pycache__/
 web/node_modules/
 web/dist/
 web/*.tsbuildinfo
+# Rust workspace (colibri-sys, colibri-native, …)
+/target/
+
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 
@@ -25,6 +28,9 @@ c/tok_test
 c/backend_cuda.o
 c/backend_cuda_test
 c/backend_loader.o
+c/backend_metal.o
+c/backend_metal_test
+c/backend_vulkan.o
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
@@ -32,6 +38,10 @@ c/coli_hip.dll
 c/coli_hip.lib
 c/coli_hip.exp
 c/coli_hip.pdb
+# Object files + static libs from make / cargo feature=ffi (never commit)
+c/*.o
+c/*.lib.o
+c/*.a
 c/tests/test_*
 !c/tests/test_*.c
 !c/tests/test_*.cu
@@ -76,8 +86,6 @@ stats*.txt
 /quant_test.py
 /profile_run.py
 /sweep.py
-c/backend_metal.o
-c/backend_metal_test
 c/tests/test_tier
 c/mio_env/
 c/bench/

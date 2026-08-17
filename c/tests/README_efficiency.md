@@ -68,7 +68,7 @@ The tiny-model asserted floors live in `tools/efficiency.py` (`TINY_TOK_S_FLOOR`
 - tiny tok/s ≥ floor (throughput regression)
 - PROFILE phases present and non-negative (accounting sanity)
 - disk-wait not dominant on a resident model (I/O-path regression)
-- CPU determinism (two greedy runs agree)
+- CPU determinism (two same-seed greedy runs: identical hit-rate / counts, not tok/s)
 - **CUDA** (skip unless CUDA built): init path, dense uploads VRAM, CPU-vs-CUDA
   argmax agreement ≥ 70% (kernel-correctness guard)
 

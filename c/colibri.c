@@ -430,6 +430,35 @@ typedef struct {
 } Model;
 
 #include "quant.h"
+/* Engine knobs for integer-dot paths. These used to be file-scope statics in
+ * quant.h, so every kernel-only unit-test TU compiled unused copies.
+ * Policy lives with the engine; quant.h stays kernels/inlines. */
+static int g_idot=1;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static int g_i4s=1;
+#elif defined(__VSX__)
+static int g_i4s=1;
+#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
+static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
+                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
+                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
+                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
+                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
+#else
+static int g_i4s=2;
+#endif
+static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
+                       * region across all experts of the batch-union block instead of ~2
+                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
+                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
+                       * byte-identical to that family (same dot_i4i8 per row, same silu,
+                       * same requant, same accumulation order into out). Measured on a
+                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
+                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
+                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
+                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
+                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
+                       * opt-in; measure on your host. */
 static int g_no_fused_pair=0;
 static int g_spec_pin=1;
 static int g_spec_live=0;
@@ -1753,6 +1782,9 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 }
 #endif
 
+/* 1 after a successful model_init. Used so test injects can split pre-load vs leftover MemAvailable. */
+static int g_model_inited=0;
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
@@ -1932,6 +1964,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     for(int i=0;i<c->n_layers;i++) if(!m->L[i].sparse) rt_drop_row(i);
     if(!m->has_mtp) rt_drop_row(c->n_layers);
     m->resident_bytes=rb;
+    g_model_inited=1;
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
@@ -5568,6 +5601,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     layer_forward_rows(m,l,li,x,S,pos_base,NULL,NULL,nrm,tmp);
 }
+static int coli_decode_should_stop(void);
 static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                                 KVState *const *kvs, const int *positions){
     Cfg *c=&m->c; int D=c->hidden;
@@ -5597,6 +5631,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
 #endif
     double tl0=now_s();
     for(int i=0;i<c->n_layers;i++){
+        if(coli_decode_should_stop()) break;
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
@@ -5717,6 +5752,9 @@ static void kv_bind(Model *m, KVState *k){
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
+static int coli_decode_should_stop(void);
+int coli_prefill_should_run_leftover(int remaining_tokens);
+
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     /* Chunked prefill (COLI_PREFILL_CHUNK=N): run a long prompt through the
@@ -5734,6 +5772,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     if(chunk>0 && S>chunk && !(m->has_mtp && g_draft>0)){
         int done=0;
         while(S-done>chunk){
+            if(coli_decode_should_stop()) break;
             float *cx=falloc((int64_t)chunk*D);
             for(int s=0;s<chunk;s++) embed_row(m, ids[done+s], cx+(int64_t)s*D);
             layers_forward(m,cx,chunk,pos_base+done);
@@ -5741,6 +5780,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
             done+=chunk;
         }
         ids+=done; S-=done; pos_base+=done;
+    }
+    if(!coli_prefill_should_run_leftover(S)){
+        return NULL;
     }
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
@@ -6071,6 +6113,21 @@ static void intr_install(void){}
  * a mux spec turn is running and are reset at each turn boundary, so every other
  * spec_decode caller (chat, run, oracle) sees them permanently 0. */
 static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
+static volatile sig_atomic_t g_embed_stop=0;
+
+void coli_embed_request_stop(void){ g_embed_stop=1; }
+void coli_embed_clear_stop(void){ g_embed_stop=0; }
+
+static int coli_decode_should_stop(void){
+    return g_intr || g_mux_stop || g_mux_cancel || g_embed_stop;
+}
+
+int coli_embed_should_stop(void){ return coli_decode_should_stop(); }
+
+int coli_prefill_should_run_leftover(int remaining_tokens){
+    if(remaining_tokens<=0) return 0;
+    return !coli_decode_should_stop();
+}
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
@@ -6093,7 +6150,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     if(gd_window<4)gd_window=4;if(gd_window>256)gd_window=256;
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
-    while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
+    while(emitted<n_new && !done && !coli_decode_should_stop()){
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
@@ -8268,6 +8325,14 @@ static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare
  * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
+    const char *inj;
+    if(g_model_inited){
+        inj=getenv("COLI_TEST_MEM_AVAIL_AFTER_GB");
+        if(inj&&*inj) return atof(inj);
+    }else{
+        inj=getenv("COLI_TEST_MEM_AVAIL_GB");
+        if(inj&&*inj) return atof(inj);
+    }
 #ifdef __APPLE__
     mach_msg_type_number_t cnt=HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
@@ -8341,7 +8406,7 @@ static double expert_cache_bytes_per_slot(Model *m, int ebits){
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
  * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
-static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
+static int cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx, int embed){
     Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     if(m->has_mtp) nsp+=2;                       /* riga cache MTP: conta ~doppia (expert int8 = 2x int4) */
     int64_t eb=expert_bytes_probe(m,ebits);
@@ -8409,6 +8474,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
                 "available on this machine, so the kernel would OOM-kill this run mid-generation.\n"
                 "[RAM] lower PIN_GB, lower the context, or raise the RAM budget if the box really has it "
                 "(COLI_RAM_OVERCOMMIT=1 overrides this check).\n", g_mem_avail_boot);
+            if(embed) return -1;
             exit(2);
         }
     }
@@ -8448,6 +8514,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
                 (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
     }
+    return 0;
 }
 
 /* The user's generation prompt. COLI_PROMPT is honored on every platform; a bare
@@ -8861,6 +8928,7 @@ static int coli_env_on(const char *name)
              strcmp(v,"off")==0 || strcmp(v,"no")==0);
 }
 
+#ifndef COLIBRI_NO_MAIN
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
@@ -9397,7 +9465,7 @@ int main(int argc, char **argv){
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
-      cap_for_ram(&m, ram_env, ebits, est_ctx);
+      cap_for_ram(&m, ram_env, ebits, est_ctx, 0);
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
 #ifdef COLI_VULKAN
@@ -9512,3 +9580,553 @@ int main(int argc, char **argv){
     if(stats) stats_dump(&m,stats);
     return 0;
 }
+#endif /* !COLIBRI_NO_MAIN */
+
+#ifdef COLIBRI_NO_MAIN
+/* ---- Public embed API (libcolibri.a) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiGlmEngine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+    ColiProfSnap last_prof; /* last completed generate (PROF fields) */
+    uint64_t hits_seq;      /* increments on each successful HITS poll */
+};
+
+static void coli_glm_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+static uint64_t coli_glm_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+static void qt_release(QT *t){
+    if(!t) return;
+#ifdef COLI_CUDA
+    qt_cuda_reset(t);
+#endif
+#ifdef COLI_VULKAN
+    qt_vk_reset(t);
+#endif
+    qt_unwire_mmap(t);
+    free(t->qf); t->qf=NULL;
+    free(t->q8); t->q8=NULL;
+    free(t->q4); t->q4=NULL;
+    free(t->s); t->s=NULL;
+    memset(t,0,sizeof(*t));
+}
+
+static void layer_release(Layer *l){
+    if(!l) return;
+    free(l->in_ln); l->in_ln=NULL;
+    free(l->post_ln); l->post_ln=NULL;
+    free(l->q_a_ln); l->q_a_ln=NULL;
+    free(l->kv_a_ln); l->kv_a_ln=NULL;
+    qt_release(&l->q_a); qt_release(&l->q_b);
+    qt_release(&l->kv_a); qt_release(&l->kv_b); qt_release(&l->o);
+    qt_release(&l->gate_proj); qt_release(&l->up_proj); qt_release(&l->down_proj);
+    qt_release(&l->sh_gate); qt_release(&l->sh_up); qt_release(&l->sh_down);
+    free(l->router); l->router=NULL;
+    free(l->router_bias); l->router_bias=NULL;
+}
+
+static void eslot_release(ESlot *s){
+    if(!s) return;
+    qt_release(&s->g); qt_release(&s->u); qt_release(&s->d);
+    if(!s->aslab) free(s->slab);
+    if(!s->afslab) free(s->fslab);
+    s->slab=s->aslab=NULL;
+    s->fslab=s->afslab=NULL;
+}
+
+/* Drop weight slabs, shard fds, and calloc arrays. Used on embed RAM refuse
+ * and destroy so a failed Start does not leave the resident set in the host. */
+static void model_release(Model *m){
+    if(!m) return;
+    int nlay=m->c.n_layers;
+    int NR=nlay+1;
+    qt_release(&m->embed);
+    qt_release(&m->lm_head);
+    free(m->final_norm); m->final_norm=NULL;
+    if(m->L){
+        for(int i=0;i<nlay;i++) layer_release(&m->L[i]);
+        free(m->L); m->L=NULL;
+    }
+    if(m->has_mtp){
+        layer_release(&m->mtpL);
+        qt_release(&m->eh_proj);
+        free(m->enorm); free(m->hnorm); free(m->mtp_norm);
+        m->enorm=m->hnorm=m->mtp_norm=NULL;
+    }
+    if(m->has_dsa){
+        if(m->ix_wq && m->ix_wk && m->ix_wp){
+            for(int i=0;i<nlay;i++){
+                qt_release(&m->ix_wq[i]);
+                qt_release(&m->ix_wk[i]);
+                qt_release(&m->ix_wp[i]);
+            }
+        }
+        free(m->ix_wq); free(m->ix_wk); free(m->ix_wp);
+        m->ix_wq=m->ix_wk=m->ix_wp=NULL;
+        if(m->ix_knw){
+            for(int i=0;i<nlay;i++){
+                free(m->ix_knw[i]);
+                if(m->ix_knb) free(m->ix_knb[i]);
+            }
+        }
+        free(m->ix_knw); free(m->ix_knb);
+        m->ix_knw=m->ix_knb=NULL;
+    }
+    if(m->ecache){
+        for(int i=0;i<NR;i++){
+            if(!m->ecache[i]) continue;
+            for(int s=0;s<m->ecap;s++) eslot_release(&m->ecache[i][s]);
+            free(m->ecache[i]);
+        }
+        free(m->ecache); m->ecache=NULL;
+    }
+    if(m->pin){
+        for(int i=0;i<NR;i++){
+            if(!m->pin[i]) continue;
+            int np=m->npin?m->npin[i]:0;
+            for(int s=0;s<np;s++) eslot_release(&m->pin[i][s]);
+            free(m->pin[i]);
+        }
+        free(m->pin); m->pin=NULL;
+    }
+    if(m->kv){
+        KVState *k=m->kv;
+        if(k->Lc){
+            for(int i=0;i<NR;i++){
+#ifdef COLI_METAL
+                if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
+#endif
+                free(k->Lc[i]);
+                if(k->Rc) free(k->Rc[i]);
+            }
+            free(k->Lc); free(k->Rc);
+        }
+        if(k->Ic){
+            for(int i=0;i<nlay;i++) free(k->Ic[i]);
+            free(k->Ic);
+        }
+        free(k->kv_start);
+        if(k->disk_fp) fclose(k->disk_fp);
+        free(k->disk_buf);
+        free(m->kv); m->kv=NULL;
+    }
+    for(int z=0;z<64;z++) eslot_release(&m->ws[z]);
+    if(m->eroute){ for(int i=0;i<NR;i++) free(m->eroute[i]); free(m->eroute); m->eroute=NULL; }
+    if(m->eheat){ for(int i=0;i<NR;i++) free(m->eheat[i]); free(m->eheat); m->eheat=NULL; }
+    if(m->elast){ for(int i=0;i<NR;i++) free(m->elast[i]); free(m->elast); m->elast=NULL; }
+    if(m->elast_dc){ for(int i=0;i<NR;i++) free(m->elast_dc[i]); free(m->elast_dc); m->elast_dc=NULL; }
+    if(m->elast_pre){ for(int i=0;i<NR;i++) free(m->elast_pre[i]); free(m->elast_pre); m->elast_pre=NULL; }
+    free(m->ecn); m->ecn=NULL;
+    free(m->enr); m->enr=NULL;
+    free(m->npin); m->npin=NULL;
+    free(m->kv_dev_L); free(m->kv_dev_R); free(m->kv_dev_valid);
+    m->kv_dev_L=m->kv_dev_R=NULL; m->kv_dev_valid=NULL;
+#ifdef COLI_VULKAN
+    free(m->vk_kv_valid); m->vk_kv_valid=NULL;
+#endif
+    free(m->hlast); free(m->h_all); m->hlast=m->h_all=NULL;
+    free(m->dsa_sel); free(m->dsa_nsel); m->dsa_sel=m->dsa_nsel=NULL;
+    st_close(&m->S);
+    memset(m,0,sizeof(*m));
+    g_model_inited=0;
+}
+
+int coli_nice_compute_threads(int nice)
+{
+#ifdef _WIN32
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+#else
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+    (void)nice;
+    return 0;
+#else
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+        (void)setpriority(PRIO_PROCESS, 0, nice);
+    }
+#else
+    (void)setpriority(PRIO_PROCESS, 0, nice);
+#endif
+    return 0;
+#endif
+}
+
+int coli_openmp_team_all_at_nice(int nice)
+{
+#ifdef _WIN32
+    (void)nice;
+    return 1;
+#else
+    int mismatches = 0;
+#ifdef _OPENMP
+#pragma omp parallel reduction(+ : mismatches)
+    {
+        errno = 0;
+        if (getpriority(PRIO_PROCESS, 0) != nice) mismatches++;
+    }
+#else
+    errno = 0;
+    if (getpriority(PRIO_PROCESS, 0) != nice) mismatches++;
+#endif
+    return mismatches == 0;
+#endif
+}
+
+int coli_glm_engine_open(ColiGlmEngine **engine, const ColiGlmOpenOptions *options,
+                         char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_glm_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_glm_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_glm_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiGlmEngine *e = (ColiGlmEngine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_glm_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    int cap = options->cap > 0 ? options->cap : 64;
+    int ebits = options->expert_bits > 0 ? options->expert_bits : 4;
+    int dbits = options->dense_bits > 0 ? options->dense_bits : 8;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    /* Same order as CLI: sample MemAvailable before load. cap_for_ram treats
+     * g_mem_avail_boot as pre-load RAM; leftover after model_init is smaller
+     * by about resident_bytes and would false-refuse. */
+    g_mem_avail_boot = mem_available_gb();
+    /* model_init may abort process on fatal load errors (legacy CLI path). */
+    model_init(&e->m, e->model_dir, cap, ebits, dbits);
+    {
+        double ram_env = getenv("RAM_GB") ? atof(getenv("RAM_GB")) : 0.0;
+        int est_ctx = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (est_ctx < 1) est_ctx = 4096;
+        if (cap_for_ram(&e->m, ram_env, ebits, est_ctx, 1) != 0) {
+            coli_glm_set_err(error, error_size,
+                "not enough RAM for even one expert working set. Free memory or set COLI_RAM_OVERCOMMIT=1 to start anyway.");
+            model_release(&e->m);
+            free(e);
+            return -1;
+        }
+    }
+    /* Persistent libgomp pool is created during model_init. Nice the team
+     * here so later matmuls do not sit at default nice 0 next to GPUI. */
+    (void)coli_nice_compute_threads(COLI_COMPUTE_NICE);
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+void coli_glm_engine_destroy(ColiGlmEngine *engine) {
+    if (!engine) return;
+    if (engine->alive) model_release(&engine->m);
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+void coli_glm_engine_size(const ColiGlmEngine *engine, ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "glm");
+    snprintf(out->engine_id, sizeof(out->engine_id), "colibri");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+typedef struct {
+    ColiTokenFn fn;
+    void *ud;
+    int stop;
+    int ordinal;
+} ColiGlmEmit;
+
+static void coli_glm_emit_cb(int t, void *ud) {
+    ColiGlmEmit *e = (ColiGlmEmit *)ud;
+    if (!e || e->stop) return;
+    if (e->fn) {
+        if (e->fn(e->ud, t, 0.f, e->ordinal, e->ordinal)) {
+            e->stop = 1;
+            g_embed_stop = 1;
+        }
+    }
+    e->ordinal++;
+}
+
+/* Record PROF deltas for one embed generate (same fields as mux_done PROF line). */
+static void coli_glm_record_prof(ColiGlmEngine *engine, const ProfBase *base, double t0,
+                                 int prompt_tokens, int completion_tokens) {
+    if (!engine || !base) return;
+    Model *m = &engine->m;
+    double dt = now_s() - t0;
+    if (dt < 1e-6) dt = 1e-6;
+    ColiProfSnap *p = &engine->last_prof;
+    p->wall_s = dt;
+    p->prompt_tokens = prompt_tokens > 0 ? (uint32_t)prompt_tokens : 0;
+    p->completion_tokens = completion_tokens > 0 ? (uint32_t)completion_tokens : 0;
+    p->expert_disk_s = edisk_s() - base->edisk;
+    p->expert_wait_s = m->t_ewait - base->ewait;
+    p->expert_matmul_s = m->t_emm - base->emm;
+    p->attention_s = m->t_attn - base->attn;
+    p->lm_head_s = m->t_head - base->head;
+    p->forwards = m->n_fw - base->n_fw;
+    p->seq += 1;
+    p->valid = 1;
+}
+
+int coli_glm_generate(ColiGlmEngine *engine, const char *prompt, size_t prompt_len,
+                      const ColiGlmGenerateOptions *options, ColiTokenFn on_token,
+                      void *user_data, char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_glm_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    (void)coli_nice_compute_threads(COLI_COMPUTE_NICE);
+    coli_embed_clear_stop();
+    if (!prompt) {
+        coli_glm_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    const char *snap = engine->model_dir;
+    char tkp[2048];
+    snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+    Tok T;
+    tok_load(&T, tkp);
+    int eos = tok_id_of(&T, "<|endoftext|>");
+    stops_arm_tok(&m->c, eos, &T);
+    grammar_setup(&g_grd, &T);
+    if (g_temp < 0) g_temp = 0.7f;
+    int cap = (int)prompt_len + 16;
+    int *pids = (int *)malloc((size_t)(cap + 2) * sizeof(int));
+    if (!pids) {
+        coli_glm_set_err(error, error_size, "OOM prompt ids");
+        return -1;
+    }
+    int np = tok_encode(&T, prompt, (int)prompt_len, pids, cap);
+    if (np < 1) {
+        free(pids);
+        coli_glm_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    int templ = getenv("CHAT_TEMPLATE") ? atoi(getenv("CHAT_TEMPLATE")) : 1;
+    if (templ) {
+        int gmask = tok_id_of(&T, "[gMASK]"), sop = tok_id_of(&T, "<sop>");
+        if (gmask >= 0 && sop >= 0 && (np < 2 || pids[0] != gmask || pids[1] != sop)) {
+            memmove(pids + 2, pids, (size_t)np * sizeof(int));
+            pids[0] = gmask;
+            pids[1] = sop;
+            np += 2;
+        }
+    }
+    kv_alloc(m, np + ngen + g_draft + 2);
+    int *all = (int *)malloc((size_t)(np + ngen + g_draft + 2) * sizeof(int));
+    if (!all) {
+        free(pids);
+        coli_glm_set_err(error, error_size, "OOM all ids");
+        return -1;
+    }
+    memcpy(all, pids, (size_t)np * sizeof(int));
+    ProfBase pb;
+    prof_base(m, &pb);
+    double t0 = now_s();
+    float *logit = step(m, pids, np, 0);
+    ColiGlmEmit em = {on_token, user_data, 0, 0};
+    if(logit && !coli_decode_should_stop())
+        (void)spec_decode(m, all, np, ngen, eos, logit, coli_glm_emit_cb, &em, NULL, NULL);
+    else
+        free(logit);
+    coli_glm_record_prof(engine, &pb, t0, np, em.ordinal);
+    free(all);
+    free(pids);
+    return 0;
+}
+
+/* Greedy free-generate from raw prompt ids — mirrors CLI generate() used by
+ * SNAP=./glm_tiny ./colibri (no PROMPT → ref_glm.json prompt_ids path). No
+ * tokenizer, no chat template, eos disabled (-1) so max_new_tokens is exact. */
+int coli_glm_generate_ids(ColiGlmEngine *engine, const int *prompt_ids, int n_prompt,
+                          const ColiGlmGenerateOptions *options, ColiTokenFn on_token,
+                          void *user_data, char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_glm_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    (void)coli_nice_compute_threads(COLI_COMPUTE_NICE);
+    coli_embed_clear_stop();
+    if (!prompt_ids || n_prompt < 1) {
+        coli_glm_set_err(error, error_size, "prompt_ids required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    float saved_temp = g_temp;
+    g_temp = 0.f; /* greedy for golden / parity */
+    kv_alloc(m, n_prompt + ngen + g_draft + 2);
+    int *all = (int *)malloc((size_t)(n_prompt + ngen + g_draft + 2) * sizeof(int));
+    if (!all) {
+        g_temp = saved_temp;
+        coli_glm_set_err(error, error_size, "OOM all ids");
+        return -1;
+    }
+    memcpy(all, prompt_ids, (size_t)n_prompt * sizeof(int));
+    ProfBase pb;
+    prof_base(m, &pb);
+    double t0 = now_s();
+    float *logit = step(m, prompt_ids, n_prompt, 0);
+    ColiGlmEmit em = {on_token, user_data, 0, 0};
+    if(logit && !coli_decode_should_stop())
+        (void)spec_decode(m, all, n_prompt, ngen, -1, logit, coli_glm_emit_cb, &em, NULL, NULL);
+    else
+        free(logit);
+    coli_glm_record_prof(engine, &pb, t0, n_prompt, em.ordinal);
+    free(all);
+    g_temp = saved_temp;
+    return 0;
+}
+
+int coli_glm_visual_poll(ColiGlmEngine *engine, uint32_t want, ColiHwinfoSnap *hwinfo,
+                         ColiTiersSnap *tiers, ColiExpertGridDims *emap_dims,
+                         uint8_t *emap_cells, size_t emap_cells_cap, size_t *emap_cells_len,
+                         ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                         size_t hits_bits_cap, size_t *hits_bits_len, uint64_t *hits_seq,
+                         ColiProfSnap *prof, char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_glm_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    Model *m = &engine->m;
+    int rc = 0;
+
+    if (want & COLI_VISUAL_HWINFO) {
+        if (!hwinfo) {
+            coli_glm_set_err(error, error_size, "hwinfo buffer required");
+            return -1;
+        }
+        memset(hwinfo, 0, sizeof(*hwinfo));
+        int cores = 0, ngpu = 0;
+        double rt = 0, ra = 0, vt = 0;
+        hwinfo_fill(m, &cores, &rt, &ra, &ngpu, &vt, hwinfo->cpu, sizeof(hwinfo->cpu),
+                    hwinfo->gpu, sizeof(hwinfo->gpu));
+        hwinfo->cores = cores > 0 ? (uint32_t)cores : 0;
+        hwinfo->ram_total_gb = rt;
+        hwinfo->ram_avail_gb = ra;
+        hwinfo->gpus = ngpu > 0 ? (uint32_t)ngpu : 0;
+        hwinfo->vram_total_gb = vt;
+    }
+
+    if (want & COLI_VISUAL_TIERS) {
+        if (!tiers) {
+            coli_glm_set_err(error, error_size, "tiers buffer required");
+            return -1;
+        }
+        memset(tiers, 0, sizeof(*tiers));
+        int v = 0, r = 0, d = 0;
+        double vgb = 0, rgb = 0;
+        tiers_fill(m, &v, &r, &d, &vgb, &rgb);
+        tiers->vram_experts = v > 0 ? (uint32_t)v : 0;
+        tiers->ram_experts = r > 0 ? (uint32_t)r : 0;
+        tiers->disk_experts = d > 0 ? (uint32_t)d : 0;
+        tiers->vram_gb = vgb;
+        tiers->ram_gb = rgb;
+    }
+
+    if (want & COLI_VISUAL_EMAP) {
+        int rows = 0, cols = 0;
+        size_t need = 0;
+        int er = emap_fill(m, NULL, 0, &rows, &cols, &need);
+        if (er != 0) {
+            coli_glm_set_err(error, error_size, "emap fill failed");
+            return -1;
+        }
+        if (emap_dims) {
+            emap_dims->rows = rows > 0 ? (uint32_t)rows : 0;
+            emap_dims->cols = cols > 0 ? (uint32_t)cols : 0;
+        }
+        if (emap_cells_len) *emap_cells_len = need;
+        if (emap_cells) {
+            er = emap_fill(m, emap_cells, emap_cells_cap, &rows, &cols, &need);
+            if (er == -2) {
+                coli_glm_set_err(error, error_size, "emap buffer too small");
+                rc = -2;
+            } else if (er != 0) {
+                coli_glm_set_err(error, error_size, "emap fill failed");
+                return -1;
+            }
+        }
+    }
+
+    if (want & COLI_VISUAL_HITS) {
+        int rows = 0, cols = 0;
+        size_t need = 0;
+        int er = hits_fill(m, NULL, 0, &rows, &cols, &need);
+        if (er != 0) {
+            coli_glm_set_err(error, error_size, "hits fill failed");
+            return -1;
+        }
+        if (hits_dims) {
+            hits_dims->rows = rows > 0 ? (uint32_t)rows : 0;
+            hits_dims->cols = cols > 0 ? (uint32_t)cols : 0;
+        }
+        if (hits_bits_len) *hits_bits_len = need;
+        if (hits_bits) {
+            er = hits_fill(m, hits_bits, hits_bits_cap, &rows, &cols, &need);
+            if (er == -2) {
+                coli_glm_set_err(error, error_size, "hits buffer too small");
+                rc = -2;
+            } else if (er != 0) {
+                coli_glm_set_err(error, error_size, "hits fill failed");
+                return -1;
+            } else {
+                engine->hits_seq += 1;
+                if (hits_seq) *hits_seq = engine->hits_seq;
+            }
+        } else if (hits_seq) {
+            *hits_seq = engine->hits_seq;
+        }
+    }
+
+    if (want & COLI_VISUAL_PROF) {
+        if (!prof) {
+            coli_glm_set_err(error, error_size, "prof buffer required");
+            return -1;
+        }
+        *prof = engine->last_prof;
+    }
+
+    return rc;
+}
+#endif /* COLIBRI_NO_MAIN */

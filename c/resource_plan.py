@@ -76,6 +76,36 @@ def analyze_model(model):
     }
 
 
+def memory_total():
+    """Total installed system RAM in bytes (best-effort)."""
+    try:
+        text = Path("/proc/meminfo").read_text()
+        return int(re.search(r"MemTotal:\s+(\d+)", text).group(1)) * 1024
+    except (OSError, AttributeError):
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            total_kb = ctypes.c_ulonglong(0)
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetPhysicallyInstalledSystemMemory.argtypes = [ctypes.c_void_p]
+            kernel32.GetPhysicallyInstalledSystemMemory.restype = ctypes.c_int
+            if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(total_kb)):
+                return total_kb.value * 1024
+        except OSError:
+            pass
+    if sys.platform == "darwin":
+        try:
+            total = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], text=True,
+                capture_output=True, timeout=5).stdout.strip()
+            if total:
+                return int(total)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    return 0
+
+
 def memory_available():
     # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
     try:
@@ -227,13 +257,103 @@ SSD_PROBE_PENDING = {
 }
 
 
+def parse_gpu_memory_mode(raw):
+    """Parse COLI_GPU_MEMORY: unified → True, discrete → False, else None."""
+    if raw is None:
+        return None
+    key = str(raw).strip().lower()
+    if key in ("unified", "uma", "integrated", "shared"):
+        return True
+    if key in ("discrete", "dgpu", "vram"):
+        return False
+    return None
+
+
+def gpu_memory_mode_override():
+    return parse_gpu_memory_mode(os.environ.get("COLI_GPU_MEMORY"))
+
+
+def name_looks_like_integrated_gpu(name):
+    """AMD / mobile iGPU name patterns (Radeon 860M Graphics, 8060S, …)."""
+    n = (name or "").lower()
+    if "instinct" in n:
+        return False
+    if " rx " in n or n.startswith("rx ") or "radeon rx" in n:
+        return False
+    if "integrated" in n or "igpu" in n:
+        return True
+    if "radeon" in n:
+        # Digit run ending in M (860M) or S APU (8060S).
+        i = 0
+        while i < len(n):
+            if n[i].isdigit():
+                start = i
+                while i < len(n) and n[i].isdigit():
+                    i += 1
+                if i > start and i < len(n) and n[i] in "ms" and (i - start) >= 3:
+                    return True
+            else:
+                i += 1
+        if "graphics" in n and "rx" not in n:
+            return True
+    return False
+
+
+def name_looks_like_discrete_gpu(name):
+    n = (name or "").lower()
+    return (
+        "instinct" in n
+        or " rx " in n
+        or "rx " in n
+        or "radeon rx" in n
+        or "geforce" in n
+        or "rtx " in n
+        or "quadro" in n
+        or "tesla" in n
+    )
+
+
+def infer_gpu_integrated(gpu, system_ram_bytes):
+    """Heuristic only: is this device integrated / UMA?"""
+    name = gpu.get("name") or ""
+    if name_looks_like_integrated_gpu(name):
+        return True
+    if name_looks_like_discrete_gpu(name):
+        return False
+    total = int(gpu.get("total_bytes") or 0)
+    small_vram = 0 < total <= 8 * GB
+    large_ram = int(system_ram_bytes or 0) >= 16 * GB
+    vendor = (gpu.get("vendor") or "").lower()
+    is_amd = vendor == "amd" or "amd" in name.lower() or "radeon" in name.lower()
+    if is_amd and small_vram and large_ram:
+        return True
+    gtt = gpu.get("gtt_total_bytes")
+    if gtt is not None and is_amd and small_vram and int(gtt) >= total // 2 and int(gtt) > 0:
+        return True
+    return False
+
+
+def apply_gpu_memory_classification(gpus, system_ram_bytes, mode_override=None):
+    """Apply COLI_GPU_MEMORY override (wins) or heuristics. Mutates and returns gpus."""
+    if mode_override is None:
+        mode_override = gpu_memory_mode_override()
+    if mode_override is not None:
+        for g in gpus:
+            g["integrated"] = bool(mode_override)
+        return gpus
+    for g in gpus:
+        g["integrated"] = infer_gpu_integrated(g, system_ram_bytes)
+    return gpus
+
+
 def discover_gpus():
     # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
     # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
     devices = _discover_nvidia_gpus()
-    if devices:
-        return devices
-    return _discover_amd_gpus()
+    if not devices:
+        devices = _discover_amd_gpus()
+    system_ram = max(memory_total(), memory_available())
+    return apply_gpu_memory_classification(devices, system_ram)
 
 
 def _discover_nvidia_gpus():
@@ -268,23 +388,56 @@ def _discover_nvidia_gpus():
                 total = free = 0
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024})
+                        "free_bytes": free * 1024 * 1024,
+                        "vendor": "nvidia", "source": "nvidia-smi",
+                        "integrated": False})
     return devices
 
 
-def _discover_amd_gpus():
-    """ROCm/HIP discovery via rocm-smi (#662). Absent on non-AMD hosts, so this
-    returns [] there. rocm-smi --showmeminfo vram reports BYTES (unlike nvidia-smi's
-    MiB), so no unit scaling. Column names drift across ROCm versions, so match them
-    by substring rather than position. VERIFY on AMD hardware (labelled
-    hardware-owner-needed) -- authored without a ROCm host to test against."""
-    command = ["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--csv"]
-    try:
-        result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return []
+def _rocm_smi_candidates():
+    """Absolute rocm-smi paths when the binary is not on PATH.
+
+    Order: ROCM_PATH, ROCM_HOME, HIP_PATH (each …/bin/rocm-smi), then
+    /opt/rocm/bin/rocm-smi. PATH bare name is tried first by the caller.
+    """
+    out = []
+    for key in ("ROCM_PATH", "ROCM_HOME", "HIP_PATH"):
+        root = os.environ.get(key) or ""
+        if root:
+            out.append(str(Path(root) / "bin" / "rocm-smi"))
+    out.append("/opt/rocm/bin/rocm-smi")
+    return out
+
+
+def _run_rocm_smi_csv():
+    """PATH-first rocm-smi, then well-known install paths. Returns stdout or None."""
+    args = ["--showmeminfo", "vram", "--showproductname", "--csv"]
+    bins = ["rocm-smi", *_rocm_smi_candidates()]
+    for bin_path in bins:
+        if bin_path != "rocm-smi" and not Path(bin_path).is_file():
+            continue
+        try:
+            result = subprocess.run(
+                [bin_path, *args], text=True, capture_output=True, check=True, timeout=5)
+            return result.stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def _parse_rocm_smi_csv(text):
+    """Parse rocm-smi CSV inventory. Values are bytes (unlike nvidia-smi MiB)."""
     import csv
-    rows = list(csv.DictReader(result.stdout.splitlines()))
+    # Skip warning lines until a header with a device column.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    header_i = None
+    for i, ln in enumerate(lines):
+        if "device" in ln.lower() and "," in ln:
+            header_i = i
+            break
+    if header_i is None:
+        return []
+    rows = list(csv.DictReader(lines[header_i:]))
     if not rows:
         return []
 
@@ -304,6 +457,7 @@ def _discover_amd_gpus():
         used_col = find_col(row, "vram", "used")
         name_col = (find_col(row, "card", "series") or find_col(row, "card", "model")
                     or find_col(row, "product"))
+        arch_col = find_col(row, "gfx", "version") or find_col(row, "gfx")
         try:
             total = int((row.get(total_col) or "0").strip())
         except (ValueError, TypeError):
@@ -314,9 +468,119 @@ def _discover_amd_gpus():
             used = 0
         free = max(total - used, 0)
         name = (row.get(name_col) or "").strip() if name_col else ""
-        devices.append({"index": index, "name": name or f"AMD GPU {index}",
-                        "total_bytes": total, "free_bytes": free})
+        arch = (row.get(arch_col) or "").strip() if arch_col else ""
+        if arch and not arch.lower().startswith("gfx"):
+            arch = ""
+        entry = {"index": index, "name": name or f"AMD GPU {index}",
+                 "total_bytes": total, "free_bytes": free,
+                 "vendor": "amd", "source": "rocm-smi",
+                 "integrated": False}
+        if arch:
+            entry["arch"] = arch
+        devices.append(entry)
     return devices
+
+
+def _discover_amd_gpus_sysfs(drm_root="/sys/class/drm"):
+    """Best-effort AMD inventory from amdgpu DRM sysfs when rocm-smi is missing.
+
+    Limits: DRM card ordinals may not match HIP/ROCm COLI_GPU indices; product
+    names are often only PCI ids; free VRAM can be approximate under display load.
+    Prefer rocm-smi when present.
+    """
+    root = Path(drm_root)
+    if not root.is_dir():
+        return []
+    cards = []
+    for ent in root.iterdir():
+        name = ent.name
+        if name.startswith("card") and name[4:].isdigit():
+            cards.append((int(name[4:]), ent))
+    cards.sort(key=lambda t: t[0])
+    devices = []
+    ordinal = 0
+    for card_n, card_path in cards:
+        device_dir = card_path / "device"
+        try:
+            vendor = (device_dir / "vendor").read_text().strip().lower()
+        except OSError:
+            continue
+        if vendor not in ("0x1002", "1002"):
+            continue
+        try:
+            uevent = (device_dir / "uevent").read_text()
+        except OSError:
+            uevent = ""
+        if "DRIVER=amdgpu" not in uevent and "DRIVER=" in uevent:
+            continue
+        try:
+            total = int((device_dir / "mem_info_vram_total").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if total <= 0:
+            continue
+        try:
+            used = int((device_dir / "mem_info_vram_used").read_text().strip())
+        except (OSError, ValueError):
+            used = 0
+        free = max(total - used, 0)
+        gtt_total = None
+        gtt_free = None
+        try:
+            gtt_total = int((device_dir / "mem_info_gtt_total").read_text().strip())
+            try:
+                gtt_used = int((device_dir / "mem_info_gtt_used").read_text().strip())
+            except (OSError, ValueError):
+                gtt_used = 0
+            gtt_free = max(gtt_total - gtt_used, 0)
+        except (OSError, ValueError):
+            pass
+        try:
+            pci = (device_dir / "device").read_text().strip()
+        except OSError:
+            pci = ""
+        name = (f"AMD GPU (PCI {pci}, drm card{card_n})" if pci
+                else f"AMD GPU (drm card{card_n})")
+        entry = {
+            "index": ordinal,
+            "name": name,
+            "total_bytes": total,
+            "free_bytes": free,
+            "vendor": "amd",
+            "source": "sysfs",
+            "integrated": False,
+        }
+        if gtt_total is not None:
+            entry["gtt_total_bytes"] = gtt_total
+            entry["gtt_free_bytes"] = gtt_free
+        devices.append(entry)
+        ordinal += 1
+    return devices
+
+
+def _enrich_amd_gtt_from_sysfs(devices, drm_root="/sys/class/drm"):
+    """Fill gtt_* on AMD devices from sysfs when present (best-effort)."""
+    sysfs = _discover_amd_gpus_sysfs(drm_root)
+    for dst, src in zip(devices, sysfs):
+        if "gtt_total_bytes" not in dst and "gtt_total_bytes" in src:
+            dst["gtt_total_bytes"] = src["gtt_total_bytes"]
+            if "gtt_free_bytes" in src:
+                dst["gtt_free_bytes"] = src["gtt_free_bytes"]
+
+
+def _discover_amd_gpus():
+    """ROCm/HIP discovery via rocm-smi (#662), PATH then install paths, else sysfs.
+
+    rocm-smi --showmeminfo vram reports BYTES (unlike nvidia-smi's MiB), so no
+    unit scaling. Column names drift across ROCm versions; match by substring.
+    """
+    text = _run_rocm_smi_csv()
+    if text:
+        devices = _parse_rocm_smi_csv(text)
+        if devices:
+            _enrich_amd_gtt_from_sysfs(devices)
+            return devices
+    return _discover_amd_gpus_sysfs()
 
 
 def _physical_cores_warn(message):
@@ -342,26 +606,31 @@ def physical_cpu_count():
         # come c_int di default, quindi il probe puo' fallire silenziosamente.
         try:
             import ctypes
-            k32 = ctypes.windll.kernel32
-            k32.GetLogicalProcessorInformationEx.argtypes = [
-                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
-            k32.GetLogicalProcessorInformationEx.restype = ctypes.c_int
-            need = ctypes.c_ulong(0)
-            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
-            buf = (ctypes.c_char * need.value)()
-            if k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
-                raw, cores, off = bytes(buf), 0, 0
-                while off + 8 <= need.value:
-                    relationship = int.from_bytes(raw[off:off + 4], "little")
-                    size = int.from_bytes(raw[off + 4:off + 8], "little")
-                    if size <= 0:
-                        break
-                    if relationship == 0:  # RelationProcessorCore
-                        cores += 1
-                    off += size
-                if cores:
-                    return cores
-            _physical_cores_warn("GetLogicalProcessorInformationEx returned no cores")
+            # Linux CPython has no windll. Tests that mock platform=win32
+            # (and any host that reports win32 without WinAPI) fall through
+            # to lscpu instead of warning about a missing Windows API.
+            windll = getattr(ctypes, "windll", None)
+            if windll is not None:
+                k32 = windll.kernel32
+                k32.GetLogicalProcessorInformationEx.argtypes = [
+                    ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+                k32.GetLogicalProcessorInformationEx.restype = ctypes.c_int
+                need = ctypes.c_ulong(0)
+                k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
+                buf = (ctypes.c_char * need.value)()
+                if k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
+                    raw, cores, off = bytes(buf), 0, 0
+                    while off + 8 <= need.value:
+                        relationship = int.from_bytes(raw[off:off + 4], "little")
+                        size = int.from_bytes(raw[off + 4:off + 8], "little")
+                        if size <= 0:
+                            break
+                        if relationship == 0:  # RelationProcessorCore
+                            cores += 1
+                        off += size
+                    if cores:
+                        return cores
+                _physical_cores_warn("GetLogicalProcessorInformationEx returned no cores")
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
     if sys.platform == "darwin":
@@ -536,7 +805,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             available_disk = usage.free
         except OSError:
             available_disk = 500 * GB
-    gpus = discover_gpus() if gpus is None else gpus
+    gpus = discover_gpus() if gpus is None else [dict(g) for g in gpus]
+    # Re-apply override/heuristics so COLI_GPU_MEMORY wins and fixtures classify.
+    apply_gpu_memory_classification(gpus, max(available_memory, memory_total()))
     if gpu_indices is not None:
         wanted = set(gpu_indices)
         gpus = [gpu for gpu in gpus if gpu["index"] in wanted]
@@ -554,49 +825,87 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
     configured_experts = int(cfg.get("n_routed_experts") or 0)
-    cap = int(cache_bytes // per_cap) if per_cap else 0
-    if configured_experts:
-        cap = min(cap, configured_experts)
 
-    reserve = 2 * GB
+    # Discrete: free VRAM − 2 GiB. UMA/integrated: hot from shared free system RAM.
+    VRAM_RESERVE = 2 * GB
+    UMA_OS_HEADROOM = 4 * GB
+    UMA_HOT_FRACTION = 0.5
+    any_uma = any(g.get("integrated") for g in gpus)
+    n_integrated = max(1, sum(1 for g in gpus if g.get("integrated")))
+    uma_shared_hot = 0
+    if any_uma:
+        free_after_headroom = max(0, available_memory - UMA_OS_HEADROOM)
+        uma_shared_hot = int(free_after_headroom * UMA_HOT_FRACTION)
+
     gpu_plan = []
     safe_vram = 0
     for gpu in gpus:
-        usable = max(0, gpu["free_bytes"] - reserve)
+        discrete_usable = max(0, gpu["free_bytes"] - VRAM_RESERVE)
+        if gpu.get("integrated"):
+            share = uma_shared_hot // n_integrated
+            usable = max(share, discrete_usable)
+        else:
+            usable = discrete_usable
         safe_vram += usable
-        gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
+        gpu_plan.append(dict(gpu, reserve_bytes=VRAM_RESERVE, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
-    # VRAM-resident experts do not need duplicate RAM backing: the checkpoint is
-    # their recovery source. RAM is therefore an independent warm compute tier.
+    # VRAM-resident experts do not need duplicate RAM backing on discrete GPUs:
+    # the checkpoint is their recovery source. On UMA, hot and warm share DDR;
+    # subtract hot from the warm cache below (planner mirror of engine #653).
     vram_budget = min(requested_vram, safe_vram, info["expert_bytes"])
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
-    warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), cache_bytes)
+    warm_cap = max(0, cache_bytes - hot_bytes) if any_uma else cache_bytes
+    cap = int(warm_cap // per_cap) if per_cap else 0
+    if configured_experts:
+        cap = min(cap, configured_experts)
+    warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), warm_cap)
     cold_bytes = max(0, info["expert_bytes"] - hot_bytes - warm_bytes)
 
     warnings = []
+    notes = []
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
-        warnings.append("VRAM tier was clamped by free VRAM or model expert size")
-    # The plan sizes the hot tier from *free* VRAM, so running it while an engine
-    # instance already holds the GPUs silently produces a tiny tier and a
-    # pessimistic hit rate that describe nothing. That is exactly when a user
-    # reaches for `coli plan` -- before changing a live deployment -- so say so
-    # rather than let the numbers be read as a capacity answer.
-    if gpus:
-        gpu_total = sum(g["total_bytes"] for g in gpus)
-        gpu_free = sum(g["free_bytes"] for g in gpus)
-        if gpu_total and gpu_free < 0.75 * gpu_total:
+        if any_uma:
             warnings.append(
-                f"{format_bytes(gpu_total - gpu_free)} of VRAM is already in use "
-                f"(only {format_bytes(gpu_free)} of {format_bytes(gpu_total)} free): "
-                "this plan plans against the remainder. Stop the running engine "
-                "for a representative plan.")
+                "hot expert tier was clamped by unified system memory budget or model expert size")
+        else:
+            warnings.append("VRAM tier was clamped by free VRAM or model expert size")
+    # Per device: a busy BIOS window on an integrated GPU is not discrete
+    # VRAM headroom (note the unified budget). A busy discrete card still
+    # warns. Mixed AMD iGPU + RX must do both.
+    uma_carveout_busy = False
+    disc_busy_total = 0
+    disc_busy_free = 0
+    for gpu in gpus:
+        total = int(gpu.get("total_bytes") or 0)
+        free = int(gpu.get("free_bytes") or 0)
+        if not total or free >= 0.75 * total:
+            continue
+        if gpu.get("integrated"):
+            uma_carveout_busy = True
+        else:
+            disc_busy_total += total
+            disc_busy_free += free
+    if uma_carveout_busy:
+        notes.append(
+            "using unified system memory budget "
+            f"{format_bytes(vram_budget)} for GPU-resident experts")
+    if disc_busy_total:
+        warnings.append(
+            f"{format_bytes(disc_busy_total - disc_busy_free)} of VRAM is already in use "
+            f"(only {format_bytes(disc_busy_free)} of {format_bytes(disc_busy_total)} free): "
+            "this plan plans against the remainder. Stop the running engine "
+            "for a representative plan.")
     if cold_bytes:
-        warnings.append("cold expert misses may reach disk; normal decode speed depends on hit rate")
+        # Model larger than RAM/unified budget: cold experts on the existing
+        # store/SSD is intended overflow, not a misconfig. Native Memory plan
+        # prints notes plain; doctor placement.plan only warns on `warnings`.
+        notes.append(
+            "cold expert misses may reach disk; normal decode speed depends on hit rate")
 
     total_expert = info["expert_bytes"]
     resident_expert = hot_bytes + warm_bytes
@@ -635,7 +944,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
             "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
-                    "runtime_bytes": runtime_bytes, "expert_cache_bytes": cache_bytes,
+                    "runtime_bytes": runtime_bytes, "expert_cache_bytes": warm_cap,
                     "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,
@@ -651,6 +960,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             {"target": "Disk", "reason": "immutable recovery source for cold experts"},
         ],
         "warnings": warnings,
+        "notes": notes,
         # #379: read-only surfacing of the cached Metal-cache storage probe, if
         # the engine has already measured this model dir. gbs is None unless
         # the engine itself would trust the cache; the state says WHY (#386 r2,
@@ -726,7 +1036,7 @@ def format_plan(plan):
         lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
-        lines.append("VRAM   no NVIDIA device detected · CPU path")
+        lines.append("VRAM   no GPU device detected · CPU path")
     if plan.get("ssd_probe_gbs") is not None:
         lines.append(f"ssd    {plan['ssd_probe_gbs']:.1f} GB/s F_NOCACHE (cached probe, #379)")
     elif plan.get("ssd_probe_state") in SSD_PROBE_PENDING:
@@ -745,5 +1055,6 @@ def format_plan(plan):
         hint = tune.get("_numa_hint")
         if hint:
             lines.append(f"  hint: {hint}")
+    lines.extend(plan.get("notes") or [])
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

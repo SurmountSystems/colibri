@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +22,18 @@ from resource_plan import (
     read_ssd_probe,
     ssd_probe_state,
 )
+
+
+@contextmanager
+def without_coli_gpu_memory():
+    saved = os.environ.pop("COLI_GPU_MEMORY", None)
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("COLI_GPU_MEMORY", None)
+        else:
+            os.environ["COLI_GPU_MEMORY"] = saved
 
 
 def write_shard(path, tensors):
@@ -202,6 +215,141 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
         self.assertIn("clamped", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
+
+    def test_uma_busy_carveout_is_note_not_warning(self):
+        # Native Memory plan prefixes warnings as "Warning:". On UMA the BIOS
+        # carve-out is not discrete VRAM; mention unified budget as information.
+        gpus = [{
+            "index": 0,
+            "name": "AMD Radeon 860M Graphics",
+            "total_bytes": int(4.3 * GB),
+            "free_bytes": int(0.4 * GB),
+            "vendor": "amd",
+            "source": "rocm-smi",
+            "arch": "gfx1152",
+            "integrated": False,
+        }]
+        with without_coli_gpu_memory():
+            plan = build_plan(
+                self.model,
+                available_memory=int(81.2 * GB),
+                available_disk=500 * GB,
+                gpus=gpus,
+                physical_cpus=8,
+                cpu_sockets=1,
+            )
+        text = format_plan(plan)
+        self.assertFalse(any("carve-out is busy" in w for w in plan["warnings"]))
+        self.assertFalse(any("VRAM is already in use" in w for w in plan["warnings"]))
+        self.assertTrue(any(
+            n.startswith("using unified system memory budget")
+            for n in plan.get("notes", [])))
+        self.assertNotIn("warn   device VRAM carve-out is busy", text)
+        self.assertIn("unified system memory budget", text)
+        self.assertNotIn("warn   using unified system memory budget", text)
+
+    def test_intended_cold_overflow_is_note_not_warning(self):
+        # Operator-shaped: huge MoE vs ~39 GB unified budget. Overflow is
+        # intended SSD paging, not a misconfiguration. Same sentence as native.
+        info = analyze_model(self.model)
+        info["expert_bytes"] = 400 * GB
+        info["typical_expert_bytes"] = 100_000_000
+        info["per_cap_bytes"] = 600_000_000
+        info["dense_bytes"] = 2 * GB
+        gpus = [{
+            "index": 0,
+            "name": "AMD Radeon 860M Graphics",
+            "total_bytes": int(4.3 * GB),
+            "free_bytes": int(0.4 * GB),
+            "vendor": "amd",
+            "source": "rocm-smi",
+            "arch": "gfx1152",
+            "integrated": True,
+        }]
+        with without_coli_gpu_memory():
+            with mock.patch("resource_plan.analyze_model", return_value=info):
+                plan = build_plan(
+                    self.model,
+                    available_memory=int(45 * GB),
+                    available_disk=500 * GB,
+                    gpus=gpus,
+                    physical_cpus=8,
+                    cpu_sockets=1,
+                )
+        sentence = (
+            "cold expert misses may reach disk; "
+            "normal decode speed depends on hit rate"
+        )
+        self.assertGreater(plan["tiers"]["disk"]["cold_expert_bytes"], 0)
+        self.assertIn(sentence, plan.get("notes", []))
+        self.assertFalse(any("cold expert misses" in w for w in plan["warnings"]))
+        text = format_plan(plan)
+        self.assertIn(sentence, text)
+        self.assertNotIn(f"warn   {sentence}", text)
+
+    def test_discrete_busy_vram_still_warns(self):
+        gpus = [{
+            "index": 0,
+            "name": "AMD Radeon RX 7900 XTX",
+            "total_bytes": 24 * GB,
+            "free_bytes": 6 * GB,
+            "vendor": "amd",
+            "source": "rocm-smi",
+            "integrated": False,
+        }]
+        with without_coli_gpu_memory():
+            plan = build_plan(
+                self.model,
+                available_memory=64 * GB,
+                available_disk=500 * GB,
+                gpus=gpus,
+                physical_cpus=16,
+                cpu_sockets=1,
+            )
+        text = format_plan(plan)
+        self.assertTrue(any("VRAM is already in use" in w for w in plan["warnings"]))
+        self.assertFalse(any("carve-out is busy" in w for w in plan["warnings"]))
+        self.assertFalse(any(
+            "unified system memory budget" in n for n in plan.get("notes", [])))
+        self.assertIn("warn   ", text)
+        self.assertIn("VRAM is already in use", text)
+
+    def test_mixed_amd_igpu_and_discrete_still_warns_vram_busy(self):
+        gpus = [
+            {
+                "index": 0,
+                "name": "AMD Radeon 860M Graphics",
+                "total_bytes": int(4.3 * GB),
+                "free_bytes": int(0.4 * GB),
+                "vendor": "amd",
+                "source": "rocm-smi",
+                "arch": "gfx1152",
+                "integrated": False,
+            },
+            {
+                "index": 1,
+                "name": "AMD Radeon RX 7900 XTX",
+                "total_bytes": 24 * GB,
+                "free_bytes": 6 * GB,
+                "vendor": "amd",
+                "source": "rocm-smi",
+                "integrated": False,
+            },
+        ]
+        with without_coli_gpu_memory():
+            plan = build_plan(
+                self.model,
+                available_memory=int(81.2 * GB),
+                available_disk=500 * GB,
+                gpus=gpus,
+                physical_cpus=16,
+                cpu_sockets=1,
+            )
+        self.assertTrue(any("VRAM is already in use" in w for w in plan["warnings"]))
+        self.assertTrue(any(
+            n.startswith("using unified system memory budget")
+            for n in plan.get("notes", [])))
+        self.assertFalse(any("carve-out is busy" in w for w in plan["warnings"]))
 
     def test_auto_tier_thread_count_uses_physical_cores(self):
         # End-to-end for #325: build_plan + environment_for_plan must export the
@@ -499,6 +647,17 @@ class PhysicalCpuCountTest(unittest.TestCase):
              mock.patch("resource_plan.os.cpu_count", return_value=16), \
              mock.patch("sys.stderr"):
             self.assertEqual(physical_cpu_count(), 16)
+
+    def test_win32_without_windll_falls_through_to_lscpu(self):
+        # Linux CPython has no ctypes.windll. Mocking platform=win32 (as
+        # test_env_defaults does) must not print a Windows probe warning;
+        # fall through to lscpu and count physical cores.
+        blob = self._lscpu_topology(sockets=1, cores_per_socket=4, threads_per_core=2)
+        with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu(blob)), \
+             mock.patch.object(sys, "platform", "win32"), \
+             mock.patch("resource_plan._physical_cores_warn") as warn:
+            self.assertEqual(physical_cpu_count(), 4)
+            warn.assert_not_called()
 
     def test_zero_logical_cores_warns_and_returns_one(self):
         # The genuine degenerate case: no probe works and os.cpu_count() is

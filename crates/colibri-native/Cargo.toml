@@ -1,0 +1,50 @@
+[package]
+name = "colibri-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Native GPUI host for colibri-sys (in-process probe/plan/doctor/chat via rkyv EngineDuplex)"
+license = "MIT"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "colibri-native"
+path = "src/main.rs"
+
+[dependencies]
+colibri-sys = { path = "../colibri-sys", features = ["runtime", "stream", "tokio"] }
+gpui = "0.2"
+# OS desktop notifications (FreeDesktop / macOS / Windows toast). Fail soft.
+notify-rust = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1"
+
+[features]
+default = ["install", "ffi"]
+# HF download UI + colibri-sys install orchestration (prefer-cli default).
+install = ["colibri-sys/install"]
+# Multi-family CPU static engines via colibri-sys. When this feature is built,
+# the native host defaults to try FFI first (process fallback on open failure).
+# Library embeds still default ColibriConfig.prefer_process = true.
+# Kill-switch: COLIBRI_FORCE_PROCESS=1 always forces the engine process.
+# COLIBRI_PREFER_FFI remains accepted (redundant under this feature default).
+# Process-only: `cargo build -p colibri-native --no-default-features --features install`
+# or COLIBRI_FORCE_PROCESS=1 at runtime.
+# GPU honesty: default `ffi` is CPU-only for kernels. On ROCm machines add
+# `ffi-hip` (below). On NVIDIA add colibri-sys `ffi-cuda` the same way. Do not
+# enable both GPU vendor features on one binary.
+ffi = ["colibri-sys/ffi"]
+# Opt-in Linux HIP/ROCm for in-process GLM (implies ffi). Prefer this on AMD
+# hosts with ROCm installed. Example:
+#   cargo build -p colibri-native --features ffi-hip
+# Requires hipcc + libamdhip64; without ROCm, build falls back to CPU-only
+# (cargo warning) unless COLIBRI_REQUIRE_FFI_HIP=1. See GPU_BACKENDS.md.
+ffi-hip = ["colibri-sys/ffi-hip", "ffi"]
+
+[dev-dependencies]
+tempfile = "3"
