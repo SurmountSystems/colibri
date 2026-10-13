@@ -9,7 +9,7 @@ export function NavigationDock({ view, onNavigate, loading }: { view: View; onNa
   const [open, setOpen] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   const handle = useRef<HTMLButtonElement>(null)
-  const timer = useRef<ReturnType<typeof setTimeout>>()
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const gesture = useRef<number | null>(null)
   const swipe = useRef(false)
   const pointerKind = useRef("mouse")

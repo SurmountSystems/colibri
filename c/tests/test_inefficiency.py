@@ -24,6 +24,13 @@ from tools.efficiency import (
     TINY_TOK_S_FLOOR, MAX_DISK_WAIT_SHARE, MIN_CPU_CUDA_AGREEMENT,
 )
 
+# Measured once by `make check` (c-check), after the C compile. `just check`
+# sets this for the later discover so those two runs are not repeated hot.
+_TOK_S_TIMING = frozenset({
+    "test_tiny_tok_s_floor",
+    "test_cpu_vs_cpu_tok_s_stability",
+})
+
 HERE = Path(__file__).resolve().parent
 C_DIR = HERE.parent
 # The engine was renamed glm -> colibri, and this file kept pointing at
@@ -284,6 +291,29 @@ class TinyCudaEfficiencyTest(unittest.TestCase):
             f"{MIN_CPU_CUDA_AGREEMENT:.0%} — CUDA kernel likely regressed. "
             f"Differing positions: {diff[:10]}{'...' if len(diff)>10 else ''}",
         )
+
+
+def _omit_tok_s_timing(suite):
+    kept = unittest.TestSuite()
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            inner = _omit_tok_s_timing(item)
+            if inner.countTestCases():
+                kept.addTest(inner)
+        elif getattr(item, "_testMethodName", "") not in _TOK_S_TIMING:
+            kept.addTest(item)
+    return kept
+
+
+def load_tests(loader, tests, pattern):
+    """Keep discover as the runner. Omit the two tok/s tests only when asked.
+
+    Unset, both tests stay. This is not a skip decorator and does not change
+    the import path.
+    """
+    if os.environ.get("COLI_OMIT_TOK_S_TIMING") != "1":
+        return tests
+    return _omit_tok_s_timing(tests)
 
 
 if __name__ == "__main__":

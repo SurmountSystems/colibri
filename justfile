@@ -24,7 +24,9 @@ install features="install,ffi":
 # ---------------------------------------------------------------------------
 
 # Full local gate: Rust (fmt → clippy → nextest), C `make check`, Python, web.
-check: rust-fmt rust-clippy rust-nextest c-check python-test web-check
+# The two tok/s tests run once inside c-check, after the C compile.
+# python-test then discovers the rest and does not measure them again.
+check: rust-fmt rust-clippy rust-nextest c-check (python-test "1") web-check
     @echo ""
     @echo "just check: all local gates passed."
 
@@ -151,8 +153,17 @@ c-test:
 # ---------------------------------------------------------------------------
 
 # Discover and run all c/tests/test_*.py (stdlib unittest; no extra pip deps).
-python-test:
-    cd c && python3 -m unittest discover -s tests -p 'test_*.py' -v
+# omit_tok_s=1 is only for `just check`, after c-check already measured
+# test_tiny_tok_s_floor and test_cpu_vs_cpu_tok_s_stability once.
+# Same discover from c/. A bare `just python-test` still runs both.
+python-test omit_tok_s="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd c
+    if [[ "{{ omit_tok_s }}" == "1" ]]; then
+      export COLI_OMIT_TOK_S_TIMING=1
+    fi
+    python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # ---------------------------------------------------------------------------
 # Web UI (TypeScript / Vite / Vitest)
