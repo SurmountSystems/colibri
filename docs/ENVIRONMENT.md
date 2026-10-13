@@ -307,11 +307,51 @@ Every engine on the routed-expert tier. A second GPU holds the experts after the
 
 See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=1` (see that doc for why).
 
-## CUDA (NVIDIA)
+## Process engine path (host / native)
+
+The host (the Rust native app and the `coli` wrappers) reads these. The C
+engine kernels do not. They select which process binary to spawn.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_CUDA` | off | Enable the CUDA backend. Requires a CUDA build. An explicit `COLI_CUDA=0` disables it **and suppresses the Windows bare-run auto-enable** (before this, Windows "CPU" runs with `COLI_CUDA=0` silently got a VRAM expert tier). The CLI flag `--gpu none` is the canonical hard off-switch on every platform. |
+| `COLI_ENGINE` | unset | Absolute path to a process engine binary (`colibri`, `inkling`, `kimi_k3`, `deepseek_v4`, ...). Wins over the default locate. |
+| `COLIBRI_ENGINE` | unset | Same role as `COLI_ENGINE` when `COLI_ENGINE` is unset. |
+
+For AMD GPU process inference on Linux, build that binary with ROCm HIP and
+point these variables at it (or leave locate to find the in-tree `c/<engine>`
+after the HIP rebuild):
+
+```sh
+make -C c colibri HIP=1
+# ROCM_HOME defaults to /opt/rocm; set HIP_ARCH=gfxNNNN when the native arch is wrong
+export COLI_ENGINE=/path/to/c/colibri
+```
+
+Wire env for the GPU path stays CUDA-shaped under HIP (`COLI_CUDA=1`,
+`CUDA_EXPERT_GB`, ...). See [GPU_BACKENDS.md](../GPU_BACKENDS.md).
+
+## Host planner / inventory (Rust and Python)
+
+`colibri-sys` plan, probe, and doctor read these, and so do Python
+`resource_plan.py` and `doctor.py`, before the engine starts.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_GPU_MEMORY` | unset (heuristic) | Force the GPU memory mode for placement. `unified` / `uma` / `integrated` / `shared` uses the UMA shared-pool hot budget. `discrete` / `dgpu` / `vram` uses free VRAM minus the reserve. This wins over name and size heuristics. |
+| `COLIBRI_FFI_HIP` | unset | Build-time ask with Cargo `ffi`: the same as feature `ffi-hip`. Make the static GLM archive with `HIP=1` and link `amdhip64` when ROCm is present. |
+| `COLIBRI_REQUIRE_FFI_HIP` | unset | Build-time hard fail when `ffi-hip` was requested and ROCm, `hipcc`, or `libamdhip64` is missing. No CPU fallback. |
+| `COLIBRI_FFI_CUDA` / `COLIBRI_REQUIRE_FFI_CUDA` | unset | NVIDIA analogue of the two rows above (`ffi-cuda`). |
+
+UMA detail and the process/FFI build matrix: [GPU_BACKENDS.md](../GPU_BACKENDS.md).
+
+## CUDA (NVIDIA) / HIP (AMD) runtime env
+
+The same env keys apply once the process engine is GPU-linked (`CUDA=1` or
+`HIP=1`). HIP does not add a separate `COLI_HIP=1` runtime switch.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_CUDA` | off | Enable the CUDA/HIP expert backend. Requires a GPU-linked build (`CUDA=1` or `HIP=1`). An explicit `COLI_CUDA=0` disables it **and suppresses the Windows bare-run auto-enable** (before this, Windows "CPU" runs with `COLI_CUDA=0` silently got a VRAM expert tier). The CLI flag `--gpu none` is the canonical hard off-switch on every platform. |
 | `COLI_GPU` / `COLI_GPUS` | unset | Device selection (`auto`, `none`, or a list like `0,1`). Requires `COLI_CUDA=1`. |
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. Off by default the engine reports `routed experts only (resident dense on CPU)`: on a host where the CPU is the limiter this leaves the dense path of every layer on the CPU while the VRAM tier serves experts only. Measured x2.8 on a 4x A6000 / 24-core host (1.53 -> 4.26 tok/s). |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. Also accepts `auto`. |

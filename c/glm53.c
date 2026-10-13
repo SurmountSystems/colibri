@@ -4462,6 +4462,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 }
 
 #ifndef GLM53_NO_MAIN
+#include "backend_xdna.h"
 int main(int argc, char **argv) {
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
@@ -4469,6 +4470,7 @@ int main(int argc, char **argv) {
      * +2.3x from this alone on a 16C/32T part and the effect grows with the
      * logical/core ratio. OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
     coli_omp_tune_threads("glm53");
+    coli_xdna_engine_qualified_submit("glm53", NULL, NULL, 0);
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
@@ -5242,3 +5244,190 @@ int coli_glm53_edge_adapter_register(void) {
     return coli_edge_adapter_register(&glm53_edge_adapter);
 }
 #endif /* COLI_EDGE_ADAPTER */
+
+#ifdef GLM53_NO_MAIN
+/* ---- Public embed API (libglm53.a) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiGlm53Engine {
+    GModel m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int cap; /* accepted and stored; model_load only takes the directory */
+    int alive;
+};
+
+static void coli_glm53_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+/* Top-level *.safetensors only, same walk as coli_kimi_walk_disk. A missing
+ * directory fails opendir and totals 0. */
+static uint64_t coli_glm53_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+COLI_FFI_EXPORT int coli_glm53_engine_open(ColiGlm53Engine **engine,
+                                           const ColiGlm53OpenOptions *options,
+                                           char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_glm53_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_glm53_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_glm53_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiGlm53Engine *e = (ColiGlm53Engine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_glm53_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    e->cap = options->cap;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    coli_omp_tune_threads("glm53");
+    model_load(&e->m, e->model_dir);
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+COLI_FFI_EXPORT void coli_glm53_engine_destroy(ColiGlm53Engine *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+COLI_FFI_EXPORT void coli_glm53_engine_size(const ColiGlm53Engine *engine,
+                                            ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "glm53");
+    snprintf(out->engine_id, sizeof(out->engine_id), "glm53");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+COLI_FFI_EXPORT int coli_glm53_generate(ColiGlm53Engine *engine, const char *prompt,
+                                        size_t prompt_len,
+                                        const ColiGlm53GenerateOptions *options,
+                                        ColiTokenFn on_token, void *user_data,
+                                        char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_glm53_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_glm53_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    char tp[4200];
+    if (snprintf(tp, sizeof(tp), "%s/tokenizer.json", engine->model_dir) >= (int)sizeof(tp)) {
+        coli_glm53_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    FILE *tf = fopen(tp, "rb");
+    if (!tf) {
+        coli_glm53_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    fclose(tf);
+    Tok T;
+    tok_load(&T, tp);
+    int ids[65536];
+    int np = tok_encode(&T, prompt, (int)prompt_len, ids, 65536);
+    if (np < 1) {
+        tok_free(&T);
+        coli_glm53_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    int stops[8];
+    const int n_stops = load_stops(engine->model_dir, stops, 8);
+    int n = np;
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        /* Text prompts do not need the vision tower. forward recomputes the
+         * whole prefix, samples from the last row, and closes its session. */
+        float *lo = forward(&engine->m, ids, n, NULL, 0);
+        if (!lo) {
+            tok_free(&T);
+            coli_glm53_set_err(error, error_size, "forward failed");
+            return -1;
+        }
+        const int vocab = engine->m.c.vocab;
+        int t = sample_token(lo + (size_t)(n - 1) * (size_t)vocab, vocab);
+        free(lo);
+        int is_eos = 0;
+        for (int e = 0; e < n_stops; e++)
+            if (t == stops[e]) is_eos = 1;
+        if (on_token && on_token(user_data, t, 0.f, ordinal, ordinal)) break;
+        ordinal++;
+        if (is_eos) break;
+        if (n + 1 >= 65536) break;
+        ids[n++] = t;
+    }
+    tok_free(&T);
+    return 0;
+}
+
+/* Visual poll stub: empty success until GLM-5.3 telemetry fill lands. */
+COLI_FFI_EXPORT int coli_glm53_visual_poll(ColiGlm53Engine *engine, uint32_t want,
+                                           ColiHwinfoSnap *hwinfo, ColiTiersSnap *tiers,
+                                           ColiExpertGridDims *emap_dims, uint8_t *emap_cells,
+                                           size_t emap_cells_cap, size_t *emap_cells_len,
+                                           ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                                           size_t hits_bits_cap, size_t *hits_bits_len,
+                                           uint64_t *hits_seq, ColiProfSnap *prof,
+                                           char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_glm53_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* GLM53_NO_MAIN */

@@ -9,7 +9,7 @@ The signals under test, and the inefficiency each catches:
   - tok/s floor          : a throughput regression (broken build / bad config)
   - profile phases sum   : telemetry accounting bug (other balloons)
   - disk-wait not dominant: a tiny resident model should never be I/O-bound
-  - CPU determinism      : greedy decode is reproducible (no stray RNG/threading)
+  - CPU determinism      : same-seed greedy hit-rate / counts match (not tok/s)
   - CUDA init path       : COLI_CUDA=1 initializes and does not silently exit 2
   - CUDA dense uses VRAM : CUDA_DENSE=1 actually uploads tensors (no silent CPU fallback)
   - CPU vs CUDA TF-match : identical weights+inputs → identical argmax (kernel bug guard)
@@ -176,7 +176,18 @@ class TinyEfficiencyTest(unittest.TestCase):
         b = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         self.assertEqual(a["returncode"], 0)
         self.assertEqual(b["returncode"], 0)
+        self.assertIsNotNone(a["hit_pct"], f"missing hit-rate:\n{a['stderr']}")
+        self.assertIsNotNone(b["hit_pct"], f"missing hit-rate:\n{b['stderr']}")
         self.assertEqual(a["hit_pct"], b["hit_pct"], "greedy hit-rate drifted between runs")
+        # Same-seed greedy decode must also agree on structural counts when the
+        # engine emitted them. Timing fields (tok/s, PROFILE seconds) stay in
+        # test_cpu_vs_cpu_tok_s_stability and are not part of this contract.
+        for key in ("loads_per_tok", "experts_loaded"):
+            if key in a["parsed"] or key in b["parsed"]:
+                self.assertEqual(
+                    a.get(key), b.get(key),
+                    f"greedy {key} drifted between runs",
+                )
 
     def test_cpu_vs_cpu_tok_s_stability(self):
         """Two identical runs land within 25% in tok/s.

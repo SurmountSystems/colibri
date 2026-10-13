@@ -8,11 +8,12 @@
  * helper only ever executes one already-selected, already-qualified operation.
  *
  * This header and backend_xdna.c are the C-side owners and they NEVER include
- * or link XRT. XRT lives exclusively behind an optional native helper DLL
- * (coli_xdna.dll), resolved at runtime the way backend_loader.c resolves the
- * GPU backend. An ordinary Colibri build has no XRT dependency at all, and a
- * machine with no helper, no XRT and no NPU is a normal machine, not a broken
- * one.
+ * or link XRT. XRT lives exclusively behind an optional native helper, resolved
+ * at runtime the way backend_loader.c resolves the GPU backend. Windows loads
+ * coli_xdna.dll. Linux loads libcoli_xdna.so. Both are beside the executable,
+ * by absolute path, with no PATH search. An ordinary Colibri build has no XRT
+ * dependency at all, and a machine with no helper, no XRT and no NPU is a
+ * normal machine, not a broken one.
  *
  * Scope of THIS slice (W2-N7-I1): binding only. Nothing here opens a device,
  * reads an artifact, prepares a weight or executes anything -- see the state
@@ -42,6 +43,14 @@ extern "C" {
 /* Symbols the helper must export, all prefixed coli_xdna_helper_ so they can
  * never collide with the host-side coli_xdna_ names in this header. */
 #define COLI_XDNA_HELPER_DLL "coli_xdna.dll"
+/* Linux helper. Same lookup rule as the DLL: beside the executable, absolute
+ * path only. The host dlopens it and does not link XRT. */
+#define COLI_XDNA_HELPER_SO  "libcoli_xdna.so"
+#ifdef _WIN32
+#define COLI_XDNA_HELPER_FILE COLI_XDNA_HELPER_DLL
+#else
+#define COLI_XDNA_HELPER_FILE COLI_XDNA_HELPER_SO
+#endif
 
 /* Directory, relative to the executable, holding the qualified artifacts of the
  * optional XDNA package. A fixed relative name, joined to an absolute
@@ -83,6 +92,57 @@ const char *coli_xdna_binding_text(ColiXdnaBinding state);
  * released, so no entry point can outlive the module that provided it. */
 void coli_xdna_shutdown(void);
 
+/* Linux dispatch selection for one 2.0 roster id.
+ *
+ * Returns 1 when this platform accepts the model for the lane.
+ * Returns 0 when model_id is NULL, empty, or not on the roster.
+ * Returns -1 when the id is on the roster but the historical Windows gate
+ * refuses it because it is not a GLM shared-expert model. Linux never
+ * returns -1 for a roster id. Every 2.0 roster model is accepted there,
+ * not only GLM at K=6144 N=2048.
+ *
+ * Acceptance is not execution. This does not open a device, does not submit
+ * work, and does not write an output buffer. */
+int coli_xdna_model_accepted(const char *model_id);
+
+/* Copy the amdxdna accel node path, for example /dev/accel/accel0.
+ * Returns 1 when a node whose driver is amdxdna exists and `out` holds it.
+ * Returns 0 when no such node exists, out is NULL, or cap is too small.
+ * Does not open the node. Windows returns 0. */
+int coli_xdna_linux_device_node(char *out, size_t cap);
+
+/* Run the qualified synthetic op for one roster model.
+ *
+ * Returns 1 only when a registry row exists for that model's family and the
+ * helper completed on the device with an int32 output that matches the host
+ * reference for the synthetic buffers. Returns 0 when the model is not on
+ * the roster, when no row exists (the caller sees ARTIFACT_UNAVAILABLE),
+ * when the artifact bytes are missing or do not hash, when COLI_XDNA is off,
+ * or when the device result does not match. This is one matmul, not a token
+ * generate, and it does not report a throughput number.
+ *
+ * reason receives a single-line cause. node receives the amdxdna path when
+ * one exists. *matched is 1 only on a full element match. On a full match,
+ * if out_i32 is non-NULL, the device int32 buffer (64*64) is copied there.
+ * Not the host reference. NULL means do not copy. Windows returns 0.
+ */
+int coli_xdna_linux_roster_op(const char *model_id,
+                              const char *helper_path,
+                              const char *artifact_root,
+                              char *reason, size_t reason_cap,
+                              char *node, size_t node_cap,
+                              int *matched,
+                              int32_t *out_i32);
+
+/* Map an owned engine binary name to its 2.0 roster id. NULL if unknown. */
+const char *coli_xdna_engine_roster_id(const char *engine_name);
+/* 1 only for the on-disk 64x64 i16 program. Does not open a device. */
+int coli_xdna_shape_would_run(int k, int n, char *reason, size_t reason_cap);
+int coli_xdna_engine_qualified_submit(const char *engine_name,
+                                      int32_t *qualified_i32,
+                                      char *decline, size_t decline_cap);
+const char *coli_xdna_decline_reason(void);
+
 /* -- test seams -----------------------------------------------------------
  * Mirrors the coli_loader_test_* convention in backend_loader.c: exercised by
  * c/tests/test_backend_loader.py against synthetic helpers that contain no
@@ -117,7 +177,9 @@ int coli_xdna_test_entry_points_bound(void);
 typedef enum {
     COLI_XDNA_DT_NONE = 0,
     COLI_XDNA_DT_BF16 = 1,
-    COLI_XDNA_DT_F32  = 2
+    COLI_XDNA_DT_F32  = 2,
+    COLI_XDNA_DT_I16  = 3,   /* IRON npu2 integer matmul input */
+    COLI_XDNA_DT_I32  = 4    /* IRON npu2 integer matmul output */
 } ColiXdnaDtype;
 
 typedef enum {
@@ -131,7 +193,22 @@ typedef enum {
  * may never inherit the other's qualification. */
 typedef enum {
     COLI_XDNA_FAMILY_NONE = 0,
-    COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP = 1   /* MoE shared-expert gate/up projection */
+    COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP = 1,  /* MoE shared-expert gate/up projection */
+    /* One synthetic-op identity per 2.0 roster family. Same M/K/N must not
+     * collapse two families onto one row. These are not the GLM gate/up. */
+    COLI_XDNA_FAMILY_ROSTER_GLM = 2,
+    COLI_XDNA_FAMILY_ROSTER_GLM53 = 3,
+    COLI_XDNA_FAMILY_ROSTER_INKLING = 4,
+    COLI_XDNA_FAMILY_ROSTER_KIMI = 5,
+    COLI_XDNA_FAMILY_ROSTER_DEEPSEEK_V4 = 6,
+    COLI_XDNA_FAMILY_ROSTER_OLMOE = 7,
+    COLI_XDNA_FAMILY_ROSTER_QWEN_IMAGE = 8,
+    COLI_XDNA_FAMILY_ROSTER_QWEN36 = 9,
+    COLI_XDNA_FAMILY_ROSTER_QWEN38 = 10,
+    COLI_XDNA_FAMILY_ROSTER_DEEPSEEK_V41 = 11,
+    COLI_XDNA_FAMILY_ROSTER_MIMO = 12,
+    COLI_XDNA_FAMILY_ROSTER_LAYA = 13,
+    COLI_XDNA_FAMILY_ROSTER_GLINER_DECIDE = 14
 } ColiXdnaFamily;
 
 /* One qualified artifact. Every field is a fact about the artifact; none is a

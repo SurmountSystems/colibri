@@ -18,16 +18,103 @@ only — never `#ifdef __HIP__` (or CUDA-specific code) in `backend_cuda.cu`.
 | CUDA (`CUDA=1`) | Linux x86-64 | CUDA toolkit (nvcc), `CUDA_HOME=/usr/local/cuda` default | `make -C c glm CUDA=1 [CUDA_ARCH=native\|sm_XX]` |
 | HIP (`HIP=1`) | Linux x86-64 | ROCm (hipcc), `ROCM_HOME=/opt/rocm` default; tested on ROCm 7.2 | `make -C c glm HIP=1 [HIP_ARCH=native\|gfxXXXX]` |
 | HIP DLL (`HIP_DLL=1`) — build **and** runtime; validated on one configuration | Windows x86-64 | HIP SDK (hipcc) + a compatible MSVC x64 host toolchain; `HIP_SDK_ROOT` from `HIP_PATH` | `make -C c hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk-root> HIP_ARCH=gfxNNNN` → `c/coli_hip.dll` |
+| FFI CUDA (`ffi-cuda`) | Linux x86-64 | same as CUDA process | `cargo build -p colibri-sys --features ffi-cuda` → `make -C c libcolibri CUDA=1` and link cudart |
+| FFI HIP (`ffi-hip`) | Linux x86-64 | same as HIP process | `cargo build -p colibri-sys --features ffi-hip` → `make -C c libcolibri HIP=1` and link amdhip64 |
 
 `CUDA=1` and `HIP=1` are mutually exclusive and both opt-in: the default build
 remains pure, dependency-free CPU. Both are **directly linked** paths and remain
-Linux-only, refused elsewhere with an early `$(error)`. The Windows HIP path is
+Linux-only, refused elsewhere with an early `$(error)`. The same exclusion
+applies to Cargo features `ffi-cuda` and `ffi-hip` (one GPU vendor per host
+binary). The Windows HIP path is
 selected separately as `HIP_DLL=1` and does not go through `HIP=1`; on Windows
 `CUDA_DLL=1` and `HIP_DLL=1` are likewise mutually exclusive. `*_ARCH=native`
 targets the local GPU; pass an explicit arch when distributing or on machines
 with an unsupported iGPU visible to the runtime (and mask iGPUs at runtime with
 `HIP_VISIBLE_DEVICES=<ordinal>` on ROCm). On Windows `HIP_ARCH` **must** be an
 explicit `gfxNNNN` — see below.
+
+### In-process FFI GPU matrix (colibri-sys / colibri-native)
+
+| Cargo features | GLM in-process GPU | Notes |
+|---|---|---|
+| `ffi` only | CPU kernels only | Product default for the static embed |
+| `ffi` + `ffi-hip` | HIP when ROCm is present | Links `libamdhip64`; cfg `ffi_hip_linked` |
+| `ffi` + `ffi-cuda` | CUDA when the toolkit is present | Links `cudart`; cfg `ffi_cuda_linked` |
+| process `HIP=1` / `CUDA=1` binary | Process path | Independent of the FFI features |
+| `ffi-cuda` + `ffi-hip` | Build error | Mutual exclusion in `build.rs` |
+
+Static archive (same source as the process backend):
+
+```sh
+# HIP FFI archive (operator / build.rs)
+make -C c libcolibri HIP=1 LTO=0 ROCM_HOME=/opt/rocm [HIP_ARCH=native|gfxXXXX]
+# CUDA FFI archive
+make -C c libcolibri CUDA=1 LTO=0
+```
+
+`ROCM_HOME` defaults to `ROCM_PATH` when that is set, otherwise `/opt/rocm`.
+On a ROCm host the native desktop build is
+`cargo build -p colibri-native --features ffi-hip`.
+
+### Linux process engines (native / COLI_ENGINE)
+
+Native and doctor resolve process engines by basename (`colibri`, `inkling`,
+and the other engine binaries). A HIP build does not change the filename:
+rebuild the same target with `HIP=1` so `ldd` lists `libamdhip64`, then point
+the host at that binary.
+
+```sh
+# GLM / default process engine (also: make -C c glm HIP=1)
+make -C c colibri HIP=1
+# Optional: pin the ROCm tree, or the arch when native is wrong (860M-class APUs)
+# ROCM_HOME=/opt/rocm HIP_ARCH=gfx1152 make -C c colibri HIP=1
+
+ldd c/colibri | grep libamdhip64   # acceptance: HIP-linked
+export COLI_ENGINE=$PWD/c/colibri  # or COLIBRI_ENGINE; locate also finds c/colibri
+```
+
+| Variable | Role |
+|---|---|
+| `ROCM_HOME` / `ROCM_PATH` | SDK root (default `/opt/rocm`); `hipcc` at `$ROCM_HOME/bin/hipcc` |
+| `HIP_ARCH` | `native` (via `rocm_agent_enumerator`) or an explicit `gfxNNNN` (a list is allowed) |
+| `COLI_ENGINE` / `COLIBRI_ENGINE` | Absolute path override for the process binary (HIP or CPU) |
+
+Doctor: an AMD GPU with a process engine that is not HIP-linked warns that the
+engine is CPU-only and records a hint to rebuild with `HIP=1`. A HIP-linked
+process engine passes. It warns when measured free VRAM on a discrete card is
+near zero. On a unified APU it passes and says the GPU shares system memory.
+A busy BIOS carve-out is not that warning. A HIP-linked engine is not reported
+as CPU-only.
+
+`colibri` / `glm` and `inkling` pick up `HIP=1` through the shared
+`backend_cuda.o` path. `deepseek_v4` keeps its own CUDA DLL tier and does not
+use this `HIP=1` process link. `kimi_k3` can compile `COLI_CUDA`, and its
+routed-expert GPU path in this tree is also Vulkan (`VK=1`).
+
+### Unified / UMA memory plan (APU hosts)
+
+On an integrated AMD GPU the small carved VRAM window is not the whole working
+pool. Host inventory marks `integrated` (name and size heuristics, plus GTT
+from sysfs when that file is present). The placement planner then budgets hot
+GPU experts from a share of free system RAM (half of free RAM after 4 GiB of
+OS headroom), and does not count the same DDR twice as hot VRAM and warm RAM.
+That share is also clamped to the bytes left in the one physical pool after
+dense weights and the runtime reservation (`available − dense − runtime` in
+`c/resource_plan.py`). It is not the BIOS VRAM carve-out, and not carve-out
+free minus 2 GiB. A discrete GPU keeps free VRAM minus 2 GiB. Linux
+`rocm-smi` reports that carve-out as `free_bytes`. An 860M-class name is
+classified integrated, so the hot tier still uses the shared-RAM share, not
+carve-out free minus 2 GiB.
+
+| Knob | Effect |
+|---|---|
+| `COLI_GPU_MEMORY=unified` (also `uma` / `integrated` / `shared`) | Force the UMA budget path |
+| `COLI_GPU_MEMORY=discrete` (also `dgpu` / `vram`) | Force classic free-VRAM minus reserve |
+
+When HIP or CUDA is up, `coli_cuda_device_integrated` reports the device
+property. The C engine shrinks the host RAM snapshot by the placed GPU expert
+tier when the device is integrated (issue 653). Plan inventory and the runtime
+property can disagree. That is one detail note, not a hard failure.
 
 ### Windows HIP DLL
 

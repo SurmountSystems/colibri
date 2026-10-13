@@ -352,6 +352,13 @@ endif
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
 # machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
+#
+# Process engines used by native / COLI_ENGINE (Linux, opt-in GPU):
+#   make -C c colibri HIP=1
+# ROCM_HOME, else ROCM_PATH, else /opt/rocm. HIPCC=$(ROCM_HOME)/bin/hipcc.
+# HIP_ARCH=native resolves via rocm_agent_enumerator; override on an APU
+# mismatch (e.g. HIP_ARCH=gfx1152). COLI_ENGINE or COLIBRI_ENGINE points
+# locate/doctor at that HIP binary. DeepSeek V4 has no HIP expert backend.
 HIP       ?= 0
 # HIP_DLL=1 is the AMD sibling of CUDA_DLL=1 (Windows only): MinGW gcc cannot
 # compile .cu and hipcc on Windows targets the MSVC ABI, so the backend goes
@@ -369,7 +376,8 @@ ifeq ($(CUDA_DLL)$(HIP_DLL),11)
 $(error choose CUDA_DLL=1 or HIP_DLL=1, not both)
 endif
 endif
-ROCM_HOME ?= /opt/rocm
+# Prefer an explicit ROCM_HOME; else ROCM_PATH (the ROCm installer env), else /opt/rocm.
+ROCM_HOME ?= $(or $(ROCM_PATH),/opt/rocm)
 ifneq ($(IS_WIN),)
 # --- Windows HIP SDK contract (HIP_DLL only; the Linux ROCM_HOME contract
 # above is untouched) ---
@@ -664,6 +672,11 @@ ifneq (,$(filter-out $(NO_WMMA_ARCHS),$(HIP_ARCH)))
 $(warning mixed HIP_ARCH list: $(filter $(HIP_ARCH),$(NO_WMMA_ARCHS)) cannot run rocWMMA -> tensor-core kernels disabled for ALL targets ($(HIP_ARCH)). Build separate binaries to keep WMMA on the capable card.)
 endif
 endif
+# Force portable kernels when rocWMMA headers are missing or when tensor-core
+# paths are deliberately off. Same define as NO_WMMA_ARCHS; safe to set twice.
+ifeq ($(COLI_HIP_NO_WMMA),1)
+HIPCCFLAGS += -DCOLI_HIP_NO_WMMA
+endif
 endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
@@ -746,21 +759,26 @@ VK_SPV   += shaders/chain_attn_full.spv shaders/chain_attn_coop.spv
 VK_SPV   += shaders/chain_vae.spv
 endif
 
-# Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
-# a switch, a define, an object. Deliberately NOT a second executable -- the
-# capability compiles into the ordinary host and stays off until the user passes
-# `coli --xdna`.
+# Optional AMD XDNA2 (Ryzen AI NPU) lane. XDNA=1 adds -DCOLI_XDNA. It is not a
+# second executable. The host object is the real coli_xdna_engine_qualified_submit
+# in backend_xdna.c. With the COLI_XDNA environment variable unset, that function
+# returns ENGINE_LANE_NOT_CALLED and does not open a helper or a device.
 #
-# No LDFLAGS entry, unlike VK: this side never links XRT. backend_xdna.c resolves
-# the optional helper (coli_xdna.dll) through LoadLibraryExA at runtime, so an
-# XDNA=1 host has the same import table as a default one and starts normally on a
-# machine with no NPU, no XRT and no helper. See docs/xdna.md.
+# The archive is prepended onto LDFLAGS, ahead of -lm / -pthread / -ldl and
+# ahead of -static / -lpsapi. test_vk_links_no_vulkan_loader requires those
+# tails. The referencing .o is still before the archive on the colibri and
+# engine link lines, so the linker pulls backend_xdna.o only when the symbol
+# is undefined. A test that already compiles backend_xdna.c, or that links
+# tests/backend_xdna_lane.o, keeps a single copy, and a shared library that
+# does not call the function does not take the member. No XRT on the link.
+# See docs/xdna.md.
 XDNA      ?= 0
-XDNA_OBJ   =
+XDNA_OBJ   = backend_xdna.o
+XDNA_LIB   = libbackend_xdna.a
 ifeq ($(XDNA),1)
 CFLAGS   += -DCOLI_XDNA
-XDNA_OBJ  = backend_xdna.o
 endif
+LDFLAGS := $(XDNA_LIB) $(LDFLAGS)
 
 all: colibri$(EXE)
 
@@ -849,7 +867,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|COLI_HIP_NO_WMMA=$(COLI_HIP_NO_WMMA)|VK=$(VK)|XDNA=$(XDNA)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -871,8 +889,49 @@ endif
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+# Static library for in-process GLM embed (colibri-sys feature `ffi`).
+# No CLI main; exports coli_glm_* from colibri_api.h. Not the segment archive
+# (build/segment/libcolibri_segment_edge.a) and not -DCOLI_SEGMENT_ADAPTER.
+#
+# Default (CUDA=0 HIP=0): CPU-only archive (product default for feature `ffi`).
+#
+# Opt-in Linux CUDA embed (feature `ffi-cuda`):
+#   make -C c libcolibri CUDA=1 LTO=0
+# packs backend_cuda.o into libcolibri.a and compiles colibri.lib.o with
+# -DCOLI_CUDA. The host (build.rs) must then link cudart + stdc++.
+#
+# Opt-in Linux HIP embed (feature `ffi-hip`):
+#   make -C c libcolibri HIP=1 LTO=0 [ROCM_HOME=/opt/rocm] [HIP_ARCH=native|gfxXXXX]
+# Same source backend_cuda.cu via hipcc; packs backend_cuda.o. Host must link
+# libamdhip64 + stdc++ (rpath $(ROCM_HOME)/lib). CUDA=1 and HIP=1 remain
+# mutually exclusive. Metal, Vulkan, and XDNA are not in this static archive.
+#
+# coli_model_size.o may be built for coli_model_size_probe. The archive does
+# not pack it; the host links that object only if it wants the probe.
+LIB_COLIBRI_A := libcolibri.a
+.PHONY: libcolibri
+libcolibri: $(LIB_COLIBRI_A)
+# colibri_api.h is the FFI surface. Depend on it when the header is in the
+# tree; a missing header must not hide this recipe from `make -n`.
+colibri.lib.o: colibri.c $(wildcard colibri_api.h) st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h .build-config
+	$(CC) $(CFLAGS) -fPIC -DCOLIBRI_NO_MAIN -c colibri.c -o $@
+coli_model_size.o: coli_model_size.c $(wildcard colibri_api.h)
+	$(CC) $(CFLAGS) -fPIC -c coli_model_size.c -o $@
+# CUDA=1 and HIP=1 set CUDA_OBJ to backend_cuda.o. Windows DLL builds set it
+# to backend_loader.o; that loader is not part of this Linux FFI archive.
+LIB_COLIBRI_OBJS := colibri.lib.o
+ifneq ($(filter 1,$(CUDA) $(HIP)),)
+LIB_COLIBRI_OBJS += $(CUDA_OBJ)
+endif
+# Recreate the archive from the listed objects only. `ar rcs` updates members
+# but does not drop a leftover backend_cuda.o from a prior CUDA=1 / HIP=1 pack,
+# so a later CPU-only `make libcolibri` would still export GPU unregister symbols.
+$(LIB_COLIBRI_A): $(LIB_COLIBRI_OBJS)
+	$(RM) $@
+	$(AR) rcs $@ $(LIB_COLIBRI_OBJS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c .build-config
@@ -927,14 +986,16 @@ backend_loader.o: backend_loader.c .build-config
 # no XRT import library and no NPU, exactly like backend_loader.o needs no CUDA
 # SDK.
 #
-# W2-N8: colibri$(EXE) NOW links it, but only under XDNA=1 (see the switch
-# beside VK above). The default build still does not, and stays byte-for-byte
-# what it was. `make xdna-obj` remains useful on its own so a break in the C
-# side is caught without building a whole host.
+# colibri$(EXE) links this object on every build, through $(XDNA_LIB), including
+# portable where XDNA=0. `make xdna-obj` still builds the object alone.
 .PHONY: xdna-obj
 xdna-obj: backend_xdna.o
 backend_xdna.o: backend_xdna.c .build-config
 	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
+$(XDNA_LIB): $(XDNA_OBJ)
+	$(RM) $@
+	$(AR) rcs $@ $(XDNA_OBJ)
+$(TEST_BINS): $(XDNA_LIB)
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
@@ -1264,7 +1325,7 @@ ifneq ($(EXE),)
 .PHONY: olmoe
 olmoe: olmoe$(EXE)
 endif
-olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
+olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
@@ -1319,7 +1380,7 @@ qpack.o: qpack.c .build-config
 	$(CC) $(QWEN36_CFLAGS) -c qpack.c -o $@
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
@@ -1414,7 +1475,7 @@ ifneq ($(EXE),)
 .PHONY: deepseek_v41
 deepseek_v41: deepseek_v41$(EXE)
 endif
-deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
+deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
@@ -1423,7 +1484,7 @@ ifneq ($(EXE),)
 .PHONY: mimo
 mimo: mimo$(EXE)
 endif
-mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
+mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
 
 # Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
@@ -1453,7 +1514,7 @@ ifneq ($(EXE),)
 .PHONY: qwen38
 qwen38: qwen38$(EXE)
 endif
-qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
@@ -1716,7 +1777,7 @@ ifneq ($(EXE),)
 .PHONY: inkling
 inkling: inkling$(EXE)
 endif
-inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
@@ -1731,21 +1792,64 @@ NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
+# Static library for in-process Inkling embed (CPU only; no CLI main).
+# Strip COLI_CUDA so the archive does not need CUDA objects or the runtime.
+LIB_INKLING_A := libinkling.a
+.PHONY: libinkling
+libinkling: $(LIB_INKLING_A)
+inkling.lib.o: inkling.c $(wildcard colibri_api.h) st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h route_trace.h kv_prefix.h .build-config
+	$(CC) $(NOCUDA_CFLAGS) -fPIC -DINKLING_NO_MAIN -c inkling.c -o $@
+$(LIB_INKLING_A): inkling.lib.o
+	$(AR) rcs $@ inkling.lib.o
+
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
 # METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
 ifneq ($(EXE),)
 .PHONY: glm53
 glm53: glm53$(EXE)
 endif
-glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_LIB) .build-config
 	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 ifneq ($(EXE),)
 .PHONY: kimi_k3
 kimi_k3: kimi_k3$(EXE)
 endif
-kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
+kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) $(XDNA_LIB) .build-config
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+
+# Static library for in-process Kimi K3 embed (colibri-sys feature `ffi`).
+# -DKIMI_NO_MAIN (the FFI name; the segment object uses KIMI_K3_NO_MAIN).
+# Archive kimi_k3.lib.o only. No CUDA object. The CLI rule above is unchanged.
+LIB_KIMI_A := libkimi_k3.a
+.PHONY: libkimi_k3
+libkimi_k3: $(LIB_KIMI_A)
+kimi_k3.lib.o: kimi_k3.c $(wildcard colibri_api.h) st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h .build-config
+	$(CC) $(CFLAGS) -fPIC -DKIMI_NO_MAIN -c kimi_k3.c -o $@
+$(LIB_KIMI_A): kimi_k3.lib.o
+	$(AR) rcs $@ kimi_k3.lib.o
+
+# CPU embed archives for the 2.0 text MoE families that are not the original
+# four. One translation unit, no CUDA, no Vulkan object. Hidden visibility plus
+# objcopy --localize-hidden keeps generic symbols local so these archives can
+# be linked next to libcolibri.a. CLI link lines above are unchanged.
+define COLI_TEXT_LIB
+.PHONY: lib$(1)
+lib$(1): lib$(1).a
+$(1).lib.o: $(1).c $$(wildcard colibri_api.h) .build-config
+	$$(CC) $$(NOCUDA_CFLAGS) -fPIC -fvisibility=hidden -D$(2) -c $(1).c -o $$@
+	objcopy --localize-hidden $$@
+lib$(1).a: $(1).lib.o
+	rm -f $$@
+	$$(AR) rcs $$@ $(1).lib.o
+endef
+
+$(eval $(call COLI_TEXT_LIB,glm53,GLM53_NO_MAIN))
+$(eval $(call COLI_TEXT_LIB,olmoe,OLMOE_NO_MAIN))
+$(eval $(call COLI_TEXT_LIB,qwen36,QWEN36_NO_MAIN))
+$(eval $(call COLI_TEXT_LIB,qwen38,QWEN38_NO_MAIN))
+$(eval $(call COLI_TEXT_LIB,deepseek_v41,DEEPSEEK_V41_NO_MAIN))
+$(eval $(call COLI_TEXT_LIB,mimo,MIMO_NO_MAIN))
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -2445,36 +2549,45 @@ edge-adapters-real: tests/test_edge_adapters_real$(EXE)
 
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
+# tests/test_v4_serve_framing writes these unit objects in the cwd. This test
+# writes the same units under build/v4test so `make -j` cannot change a file
+# the other link is reading (wild: file changed while we were running).
+V4_TEST_DIR = build/v4test
 V4_TEST_LINK_OBJS = \
-	COLI_V4_UNIT_ST.o \
-	COLI_V4_UNIT_CONFIG.o \
-	COLI_V4_UNIT_MATH.o \
-	COLI_V4_UNIT_SPARSE_ATTENTION.o \
-	COLI_V4_UNIT_RESOURCE_PLAN.o \
-	COLI_V4_UNIT_PROMPT.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_ST.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_CONFIG.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_MATH.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_RESOURCE_PLAN.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_PROMPT.o \
 	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o COLI_V4_UNIT_EXPERT.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
 	$(V4_HOT_TEST_OBJ) \
 	$(V4_BATCH_TEST_OBJ) \
-	COLI_V4_UNIT_EXPERT_ROWS16.o \
-	COLI_V4_UNIT_NATIVE_QUANT.o \
-	COLI_V4_UNIT_NATIVE_QUANT_DUAL.o \
-	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
+	$(V4_TEST_DIR)/COLI_V4_UNIT_EXPERT_ROWS16.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_NATIVE_QUANT_DUAL.o \
+	$(V4_TEST_DIR)/COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
 # Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
 # is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
 # native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
-# without a DLL next to the test binary.
+# without a DLL next to the test binary. Same private directory: the serve
+# test also compiles these two names in the cwd.
 ifneq ($(IS_WIN),)
-V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
-V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+V4_TEST_LINK_OBJS += $(V4_TEST_DIR)/COLI_V4_UNIT_GPU.o $(V4_TEST_DIR)/backend_loader_dsv4.o
+V4_TEST_EXTRA_TARGETS = $(V4_TEST_DIR)/COLI_V4_UNIT_GPU.o $(V4_TEST_DIR)/backend_loader_dsv4.o
 endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_v4.c deepseek_v4.h compat.h \
 		Makefile.deepseek-v4.units Makefile.deepseek-v4
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
-		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
-		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
-		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
-		COLI_V4_UNIT_EXPERT_ROWS16.o \
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_OBJDIR=$(V4_TEST_DIR) \
+		deepseek-v4-test-objs \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_ST.o $(V4_TEST_DIR)/COLI_V4_UNIT_CONFIG.o \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_MATH.o $(V4_TEST_DIR)/COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_RESOURCE_PLAN.o $(V4_TEST_DIR)/COLI_V4_UNIT_PROMPT.o \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_NATIVE_QUANT_DUAL.o \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		$(V4_TEST_DIR)/COLI_V4_UNIT_EXPERT_ROWS16.o \
 		$(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_TEST_EXTRA_TARGETS)
@@ -2843,12 +2956,19 @@ test-c: $(TEST_BINS)
 test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
-test: test-c test-python
+# Full discover, including test_inefficiency.py. Depends on test-c so
+# `make -j` cannot start the suite while those C objects are still compiling.
+# Run from c/, the same way `make test-python` does. No custom loader.
+test-python-rest: $(RANSLIB) test-c
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+test: test-c test-python-rest
 
 # --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
-# The tiny-model assertions live in test_inefficiency.py and run as part of
-# test-python (they're discovered by the test_*.py glob). These targets are
-# convenience entry points; the opt-in full-model report is NEVER in `make test`.
+# The tiny-model assertions live in test_inefficiency.py and are part of
+# discover. `make test` and `make check` run that discover only after test-c.
+# These targets are convenience entry points; the opt-in full-model report
+# is NEVER in `make test`.
 #
 #   make efficiency        tiny-model asserted regression tests (CPU; part of test-python)
 #   make efficiency-cuda   the CUDA-path tests (requires a CUDA build — see below)
@@ -2966,10 +3086,12 @@ bench: iobench$(EXE)
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
-	test-c test-python test check clean install uninstall bench
+	test-c test-python test check clean install uninstall bench \
+	libcolibri libkimi_k3 libinkling
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
+.PHONY: test-python-rest
 .PHONY: test-asan
 .PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
 

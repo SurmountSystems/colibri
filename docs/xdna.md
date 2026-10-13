@@ -1,9 +1,18 @@
-# XDNA backend (Windows, AMD Ryzen AI NPU)
+# XDNA backend (AMD Ryzen AI NPU)
 
-colibrì includes an **experimental, opt-in** backend that runs some GLM
-operations on an AMD XDNA2 NPU using a **reduced-precision BF16 compute path**.
+colibrì includes an **experimental, opt-in** backend that can run qualified
+work on an AMD XDNA NPU using a **reduced-precision BF16 compute path**.
 It is off by default, it is never selected automatically, and model output may
 differ from the normal path.
+
+Windows still loads `coli_xdna.dll` and still limits execution to the qualified
+GLM shared-expert artifacts. Linux loads `libcoli_xdna.so` the same way
+(beside the executable, absolute path, no PATH search). Dispatch selection
+accepts every model on the 2.0 roster. A roster family also has one qualified
+synthetic op: the public IRON npu2 single-core matmul, M=K=N=64, int16 in,
+int32 out. That op is not a token generate. The GLM shared-expert files
+(K=6144, N=2048) are still not in this tree, so that gate/up still declines.
+No throughput number is claimed.
 
 ```bash
 coli run --xdna "your prompt"
@@ -19,26 +28,29 @@ without the flag. That is the only other way in.
 
 ## What runs on the NPU
 
-Only the **MoE shared-expert gate/up projection** for GLM
-(`K=6144, N=2048`, fmt=4 grouped int4, group size 64), and only at sequence
-lengths the qualified artifacts cover:
+With `COLI_XDNA=1`, each owned engine main calls
+`coli_xdna_engine_qualified_submit` once at session start and that submits
+the 64x64x64 int16 program. The int32 result is not an expert GEMM output.
+This is not a token generate. No throughput number is claimed.
 
-| rows per call | runs on |
-|---|---|
-| 1 – 64 | NPU, M64 artifact |
-| 65 – 256 | NPU, M256 artifact |
-| more than 256 | normal path |
+`coli_xdna_try_matmul` at K=6144 N=2048 still declines `ARTIFACT_UNAVAILABLE`.
+The wa_F3 files are not on disk. Any other native K,N declines
+`SHAPE_NO_PROGRAM`. `COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and does
+not open the device.
 
-Everything else — the down projection, routed experts, attention, every other
-model — uses the normal path. Any operation the lane does not support, and any
-runtime failure, falls back to the exact computation the engine performs
-without this backend.
+The historical MoE shared-expert gate/up projection for GLM
+(`K=6144, N=2048`, fmt=4 grouped int4, group size 64) is still the shape
+`coli_xdna_try_matmul` knows. Those artifacts are not in this tree, so that
+call declines and the normal path runs. It does not execute the 64x64x64
+program and it does not write a 64 result into the expert output.
 
 ## Precision
 
-The NPU path converts activations and weights to BF16 and accumulates in F32.
-This is **not** the same arithmetic as the normal path, and it is not claimed to
-be equivalent:
+The session submit that runs today is int16 in and int32 out. It is not BF16.
+The historical GLM shared-expert path converts activations and weights to BF16
+and accumulates in F32. That path still declines, because the K=6144 N=2048
+files are not on disk. BF16 on that path is not the same arithmetic as the
+normal path, and it is not claimed to be equivalent:
 
 - per-option scores on a small internal benchmark changed on every operation the
   NPU handled;
@@ -186,9 +198,86 @@ To confirm the ordinary download is unaffected, install the core archive on its
 own and run normally: no helper is loaded, no device is opened, and nothing
 about the default path changes.
 
+## Linux
+
+The lane stays off until `COLI_XDNA` parses as a non-zero integer. Unset,
+empty, `0`, and non-numeric values leave it off. A device node by itself does
+not turn it on, and a missing helper is reported as unavailable rather than
+available.
+
+Place the helper beside the executable:
+
+```
+<colibri directory>/
+    colibri
+    libcoli_xdna.so
+    xdna/
+        ...qualified artifacts, when you have them...
+```
+
+The host resolves that path from `/proc/self/exe` and passes the absolute path
+to `dlopen`. It does not search `PATH` or `LD_LIBRARY_PATH` for the helper.
+The default CPU build does not link XRT. XRT is linked only into
+`libcoli_xdna.so`, and only when you build that helper.
+
+The kernel driver is `amdxdna`. A present device is a node under `/dev/accel/`
+whose sysfs driver is `amdxdna` (on this class of machine, `/dev/accel/accel0`).
+No such node means the device is absent. The report says so. It does not invent
+a device and it does not invent a generate.
+
+Userspace is AMD's XRT plus the XDNA SHIM (`libxrt_coreutil.so` and
+`libxrt_driver_xdna.so`). Upstream documents the install prefix as
+`/opt/xilinx/xrt/lib` and the kernel module as `amdxdna.ko`. See
+[AMD XDNA Driver for Linux](https://github.com/amd/xdna-driver/blob/main/README.md)
+(accessed: 2026-10-12). A distribution package may install the same libraries
+under `/usr/lib` and the headers under `/usr/include/xrt`. Either location is
+the user's install. Colibrì does not bundle them.
+
+Build the helper on a machine that has those headers and `libxrt_coreutil`:
+
+```bash
+make -C c/xdna
+```
+
+That writes `c/xdna/libcoli_xdna.so`. Copy it beside the executable. The
+ordinary `c/Makefile` build does not do this and does not link XRT.
+
+Linux dispatch selection accepts every id from the 2.0 roster (`glm`, `kimi`,
+`inkling`, `deepseek_v4`, `olmoe`, `qwen_image`, `glm53`, `qwen36`, `qwen38`,
+`deepseek_v41`, `mimo`, `laya`, `gliner_decide`). A non-GLM model is not
+refused just because it is not the old GLM shared-expert shape.
+
+Each of those families has a registry row for one program:
+`mlir_aie_single_core_matmul_npu2.xclbin` plus its instruction file, under
+`c/xdna/kernels`. The shape is M=K=N=64, int16 inputs, int32 output. The
+helper copies the weight into a host-only buffer on kernel argument group 4,
+which is the argument layout of that `MLIR_AIE` program (opcode 3, instructions
+on group 1, buffers on groups 3, 4, and 5). `coli_xdna_linux_roster_op` runs
+that program with synthetic buffers and keeps the result only when every int32
+matches the host reference. That is one matmul per family. It is not a
+downloaded-weight generate.
+
+The two GLM shared-expert rows (K=6144, N=2048, M64 and M256) are still in
+the registry. Their files are not shipped. `coli_xdna_try_matmul` at that
+shape declines `ARTIFACT_UNAVAILABLE`. Any other native K,N declines
+`SHAPE_NO_PROGRAM`. With `COLI_XDNA=1`, each owned engine main calls
+`coli_xdna_engine_qualified_submit` once at session start and that submits
+the 64x64x64 int16 program. The int32 result is not an expert GEMM output.
+`COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and does not open the device.
+Work with no matching artifact declines to the normal path. Acceptance
+of a model id does not mean a generate ran. This is not a token generate.
+No throughput number is claimed.
+
 ## What this backend does not do
 
 - It is not enabled by having the hardware, the helper, or the package.
 - It does not choose between the NPU and the normal path on speed or cost.
 - No speed claim is made here.
-- It does not extend to other models or other operations.
+- Windows execution stays the qualified GLM shared-expert lane.
+- Linux selection covers the 2.0 roster. A family with no row still declines.
+  The synthetic 64x64x64 int16 matmul is not a token generate, and a declined
+  operation is not reported as a run.
+- It does not claim the GLM K=6144 N=2048 gate/up ran. Those files are absent.
+  That shape declines `ARTIFACT_UNAVAILABLE`. Any other native K,N declines
+  `SHAPE_NO_PROGRAM`. `COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and
+  does not open the device.

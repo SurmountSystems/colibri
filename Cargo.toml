@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/colibri-sys",
+    "crates/colibri-native",
+]
+
+# Tauri desktop stays a separate package under desktop/src-tauri so its
+# identity and edition/MSRV are not forced by this workspace.
+# Native GPUI host (colibri-native) is a workspace member and embeds
+# colibri-sys in-process (no HTTP gateway).

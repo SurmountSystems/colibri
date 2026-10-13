@@ -680,7 +680,11 @@ desktop/                  Tauri desktop shell around the dashboard
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website
+crates/colibri-sys/       Rust embed host for the C engines
+crates/colibri-native/    native GPUI app (no HTTP)
 ```
+
+A native GPUI app exists in `crates/colibri-native`.
 
 **One `.c` per model family, over shared single headers.** An engine owns its
 architecture and nothing else; anything two engines both need lives in a header

@@ -2796,8 +2796,10 @@ static int ref_fits(const int *prompt, int np, const int *full, int nfull, int v
 }
 
 #ifndef OLMOE_NO_MAIN
+#include "backend_xdna.h"
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
+    coli_xdna_engine_qualified_submit("olmoe", NULL, NULL, 0);
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
@@ -3527,3 +3529,262 @@ int coli_olmoe_edge_adapter_register(void) {
     return coli_edge_adapter_register(&olmoe_edge_adapter);
 }
 #endif /* COLI_EDGE_ADAPTER */
+
+#ifdef OLMOE_NO_MAIN
+/* Public embed API (libolmoe.a). Decode calls step(), not generate(). */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiOlmoeEngine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+};
+
+static void coli_olmoe_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+/* Top-level *.safetensors only, same walk as coli_kimi_walk_disk. */
+static uint64_t coli_olmoe_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+/* attention()'s sc[4096] is the hard context. malloc, not falloc: no exit. */
+static int coli_olmoe_kv_fit(Model *m, int need, char *error, size_t error_size) {
+    Cfg *c = &m->c;
+    if (need < 1) need = 1;
+    if (need > 4096) need = 4096;
+    if (m->K && m->V && m->max_t >= need) return 0;
+    if (m->K) {
+        for (int i = 0; i < c->n_layers; i++) {
+            free(m->K[i]);
+            if (m->V) free(m->V[i]);
+        }
+    }
+    free(m->K);
+    free(m->V);
+    m->K = NULL;
+    m->V = NULL;
+    m->max_t = 0;
+    m->kv_len = 0;
+    float **K = calloc((size_t)c->n_layers, sizeof(float *));
+    float **V = calloc((size_t)c->n_layers, sizeof(float *));
+    if (!K || !V) {
+        free(K);
+        free(V);
+        coli_olmoe_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        size_t nbytes = (size_t)c->n_heads * (size_t)need * (size_t)c->head_dim * sizeof(float);
+        K[i] = malloc(nbytes);
+        V[i] = malloc(nbytes);
+        if (!K[i] || !V[i]) {
+            for (int j = 0; j <= i; j++) {
+                free(K[j]);
+                free(V[j]);
+            }
+            free(K);
+            free(V);
+            coli_olmoe_set_err(error, error_size, "OOM");
+            return -1;
+        }
+    }
+    m->K = K;
+    m->V = V;
+    m->max_t = need;
+    return 0;
+}
+
+COLI_FFI_EXPORT int coli_olmoe_engine_open(ColiOlmoeEngine **engine,
+                                           const ColiOlmoeOpenOptions *options,
+                                           char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_olmoe_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_olmoe_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_olmoe_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    /* CLI omits the args as cache/layer 16 and expert bits 8. 0 is that omit. */
+    int cap = options->cap > 0 ? options->cap : 16;
+    int bits = options->bits > 0 ? options->bits : 8;
+    if (bits < 2 || bits > 8) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "quant_bits must be 2..8 (got %d)", bits);
+        coli_olmoe_set_err(error, error_size, msg);
+        return -1;
+    }
+    ColiOlmoeEngine *e = (ColiOlmoeEngine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_olmoe_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    coli_omp_tune_threads("olmoe");
+    model_init(&e->m, e->model_dir, cap, bits);
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+COLI_FFI_EXPORT void coli_olmoe_engine_destroy(ColiOlmoeEngine *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+COLI_FFI_EXPORT void coli_olmoe_engine_size(const ColiOlmoeEngine *engine,
+                                            ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "olmoe");
+    snprintf(out->engine_id, sizeof(out->engine_id), "olmoe");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+COLI_FFI_EXPORT int coli_olmoe_generate(ColiOlmoeEngine *engine, const char *prompt,
+                                        size_t prompt_len,
+                                        const ColiOlmoeGenerateOptions *options,
+                                        ColiTokenFn on_token, void *user_data,
+                                        char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_olmoe_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_olmoe_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    const char *snap = engine->model_dir;
+    char tp[2048];
+    snprintf(tp, sizeof(tp), "%s/tokenizer.json", snap);
+    FILE *tf = fopen(tp, "rb");
+    if (!tf) {
+        coli_olmoe_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    fclose(tf);
+    Tok T;
+    tok_load(&T, tp);
+    int tok_eos = tok_id_of(&T, "|||IP_ADDRESS|||");
+    stops_arm_tok(&m->c, tok_eos, &T);
+    enum { COLI_OLMOE_CTX = 4096 };
+    int *ids = (int *)malloc((size_t)(COLI_OLMOE_CTX + 1) * sizeof(int));
+    if (!ids) {
+        tok_free(&T);
+        coli_olmoe_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    int np = tok_encode(&T, prompt, (int)prompt_len, ids, COLI_OLMOE_CTX + 1);
+    tok_free(&T);
+    if (np < 1) {
+        free(ids);
+        coli_olmoe_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    if (np > COLI_OLMOE_CTX) {
+        free(ids);
+        coli_olmoe_set_err(error, error_size, "prompt exceeds context");
+        return -1;
+    }
+    if (np + ngen > COLI_OLMOE_CTX) ngen = COLI_OLMOE_CTX - np;
+    if (ngen < 1) {
+        free(ids);
+        coli_olmoe_set_err(error, error_size, "prompt exceeds context");
+        return -1;
+    }
+    if (coli_olmoe_kv_fit(m, np + ngen, error, error_size) != 0) {
+        free(ids);
+        return -1;
+    }
+    /* Greedy, same pick as generate(). step() writes KV; the callback can stop. */
+    float *logit = step(m, ids, np, 0);
+    free(ids);
+    Cfg *c = &m->c;
+    int len = np;
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        int best = 0;
+        float bv = logit[0];
+        for (int i = 1; i < c->vocab; i++)
+            if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit);
+        logit = NULL;
+        if (is_stop(best)) break;
+        if (on_token && on_token(user_data, best, bv, ordinal, ordinal)) break;
+        ordinal++;
+        if (s == ngen - 1) break;
+        int one = best;
+        logit = step(m, &one, 1, len);
+        len++;
+    }
+    if (logit) free(logit);
+    return 0;
+}
+
+/* Visual poll stub: empty success until OLMoE telemetry fill lands. */
+COLI_FFI_EXPORT int coli_olmoe_visual_poll(ColiOlmoeEngine *engine, uint32_t want,
+                                           ColiHwinfoSnap *hwinfo, ColiTiersSnap *tiers,
+                                           ColiExpertGridDims *emap_dims, uint8_t *emap_cells,
+                                           size_t emap_cells_cap, size_t *emap_cells_len,
+                                           ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                                           size_t hits_bits_cap, size_t *hits_bits_len,
+                                           uint64_t *hits_seq, ColiProfSnap *prof,
+                                           char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_olmoe_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* OLMOE_NO_MAIN */

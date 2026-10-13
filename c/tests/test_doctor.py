@@ -151,6 +151,7 @@ class DoctorTest(unittest.TestCase):
         self.assertNotIn("GPU", report["plan"]["expected_bottleneck"])
         self.assertEqual(report["status"], "warning")
         self.assertEqual(exit_code(report), 0)
+        self.assertNotIn("NVIDIA", check["summary"])
 
     def test_gpu_engine_with_detected_gpu_keeps_vram_plan(self):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
@@ -184,6 +185,92 @@ class DoctorTest(unittest.TestCase):
         )
         self.assertEqual(report["status"], "error")
 
+    def test_missing_named_cuda_runtime_is_a_failure(self):
+        gpu = {"index": 0, "name": "NVIDIA GeForce", "total_bytes": 12 * GB,
+               "free_bytes": 10 * GB, "vendor": "nvidia"}
+        report = self.report(gpu_indices=[0], gpus=[gpu],
+                             linkage={"linked": False, "missing": True, "kind": "cuda"})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["summary"], "CUDA runtime library is missing")
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(report["status"], "error")
+        self.assertNotIn("AMD", check["summary"])
+
+    def test_amd_gpu_cpu_engine_does_not_say_nvidia(self):
+        gpu = {"index": 0, "name": "AMD Radeon 860M Graphics", "total_bytes": 4 * GB,
+               "free_bytes": 2 * GB, "vendor": "amd", "source": "rocm-smi"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": False, "missing": False, "kind": ""})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("AMD", check["summary"])
+        self.assertIn("HIP=1", check["summary"])
+        self.assertNotIn("NVIDIA", check["summary"])
+
+    def test_amd_hip_ready_pass(self):
+        gpu = {"index": 0, "name": "AMD Radeon 860M Graphics", "total_bytes": 4 * GB,
+               "free_bytes": 3 * GB, "vendor": "amd"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False, "kind": "hip"})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("HIP", check["summary"])
+        self.assertIn("AMD", check["summary"])
+        self.assertNotIn("NVIDIA", check["summary"])
+
+    def test_linked_nvidia_names_cuda(self):
+        gpu = {"index": 0, "name": "NVIDIA GeForce RTX 4090", "total_bytes": 24 * GB,
+               "free_bytes": 20 * GB, "vendor": "nvidia"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False, "kind": "cuda"})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("CUDA", check["summary"])
+        self.assertIn("NVIDIA", check["summary"])
+        self.assertNotIn("AMD", check["summary"])
+        self.assertTrue(check["details"]["unified"] is False)
+
+    def test_linked_discrete_near_zero_vram_warns(self):
+        gpu = {"index": 0, "name": "NVIDIA GeForce RTX 4090", "total_bytes": 24 * GB,
+               "free_bytes": 32 * 1024 * 1024, "vendor": "nvidia"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False, "kind": "cuda"})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("free VRAM is near zero", check["summary"])
+        self.assertTrue(check["details"]["low_free_vram"])
+
+    def test_linked_uma_near_zero_carveout_stays_pass(self):
+        gpu = {"index": 0, "name": "AMD Radeon 860M Graphics", "total_bytes": int(4.3 * GB),
+               "free_bytes": int(0.4 * GB), "vendor": "amd"}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False, "kind": "hip"})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("shared system memory", check["summary"])
+        self.assertNotIn("free VRAM is near zero", check["summary"])
+        self.assertNotIn("NVIDIA", check["summary"])
+        self.assertTrue(check["details"]["shared_system_memory"])
+        self.assertIn("unified", check["details"])
+
+    def test_posix_ldd_kind_names_hip_before_cuda(self):
+        hip = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="\tlibcudart.so.12 => /lib/libcudart.so.12\n"
+                   "\tlibamdhip64.so.5 => /opt/rocm/lib/libamdhip64.so.5\n",
+            stderr="")
+        with mock.patch("doctor.subprocess.run", return_value=hip):
+            self.assertEqual(cuda_linkage(self.engine),
+                             {"linked": True, "missing": False, "kind": "hip"})
+        missing = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="\tlibcudart.so.12 => not found\n", stderr="")
+        with mock.patch("doctor.subprocess.run", return_value=missing):
+            self.assertEqual(cuda_linkage(self.engine),
+                             {"linked": False, "missing": True, "kind": "cuda"})
+        self.assertEqual(cuda_linkage(self.root / "absent"),
+                         {"linked": False, "missing": False, "kind": ""})
+
     # #379: doctor surfaces the cached F_NOCACHE probe read-only (S4) -- it
     # never re-measures storage itself, only reflects what colibri.c already wrote.
     # --- Windows backend-artifact linkage ---------------------------------
@@ -214,33 +301,33 @@ class DoctorTest(unittest.TestCase):
     def test_windows_cuda_host_accepts_its_own_backend(self):
         engine = self._win_engine("coli_cuda.dll", ["coli_cuda.dll"])
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": True, "missing": False})
+                         {"linked": True, "missing": False, "kind": "cuda"})
 
     def test_windows_hip_host_accepts_its_own_backend(self):
         engine = self._win_engine("coli_hip.dll", ["coli_hip.dll"])
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": True, "missing": False})
+                         {"linked": True, "missing": False, "kind": "hip"})
 
     def test_windows_hip_host_is_not_satisfied_by_the_cuda_backend(self):
         engine = self._win_engine("coli_hip.dll", ["coli_cuda.dll"])
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": False, "missing": True})
+                         {"linked": False, "missing": True, "kind": ""})
 
     def test_windows_cuda_host_is_not_satisfied_by_the_hip_backend(self):
         engine = self._win_engine("coli_cuda.dll", ["coli_hip.dll"])
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": False, "missing": True})
+                         {"linked": False, "missing": True, "kind": ""})
 
     def test_windows_missing_backend_artifact_still_fails(self):
         engine = self._win_engine("coli_hip.dll")
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": False, "missing": True})
+                         {"linked": False, "missing": True, "kind": ""})
 
     def test_windows_cpu_only_engine_is_not_a_gpu_build(self):
         engine = self.root / "colibri.exe"
         engine.write_bytes(b"a plain CPU build with no backend loader")
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": False, "missing": False})
+                         {"linked": False, "missing": False, "kind": ""})
 
     def test_windows_kimi_cuda_host_without_glm_banner(self):
         """Kimi K3 CUDA_DLL=1 never prints [CUDA] mode: routed experts.
@@ -250,13 +337,13 @@ class DoctorTest(unittest.TestCase):
         engine.write_bytes(b"MZ [K3-CUDA] MXFP4 routed experts coli_cuda.dll")
         (self.root / "coli_cuda.dll").write_bytes(b"")
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": True, "missing": False})
+                         {"linked": True, "missing": False, "kind": "cuda"})
 
     def test_windows_kimi_cuda_host_missing_dll_is_missing(self):
         engine = self.root / "kimi_k3.exe"
         engine.write_bytes(b"MZ [K3-CUDA] MXFP4 routed experts coli_cuda.dll")
         self.assertEqual(self._win_linkage(engine),
-                         {"linked": False, "missing": True})
+                         {"linked": False, "missing": True, "kind": ""})
 
     def test_hip_host_with_its_backend_reports_gpu_available(self):
         # End-to-end: the same host that previously reported a hard error
@@ -371,8 +458,13 @@ class DoctorTest(unittest.TestCase):
             meta = {"dtype": dtype, "shape": [elements], "data_offsets": [0, span]}
             self.assertEqual(_tensor_layout(meta, span), (0, span))
             bad = {"dtype": dtype, "shape": [elements], "data_offsets": [0, span - 1]}
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "shape and dtype disagree"):
                 _tensor_layout(bad, span)
+        with self.assertRaisesRegex(ValueError, "unsupported dtype"):
+            _tensor_layout(
+                {"dtype": "F64", "shape": [1], "data_offsets": [0, 8]},
+                8,
+            )
 
     def test_deep_check_rejects_overlapping_tensor_ranges(self):
         header = {

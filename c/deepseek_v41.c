@@ -5068,6 +5068,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
 }
 #endif
 
+#ifndef DEEPSEEK_V41_NO_MAIN
+#include "backend_xdna.h"
 int main(int argc, char **argv) {
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
@@ -5081,6 +5083,7 @@ int main(int argc, char **argv) {
      * docs/experiments/dsv41-omp-team-2026-09-15.md.
      * OMP_NUM_THREADS still wins, COLI_NO_OMP_TUNE=1 still disables it. */
     coli_omp_tune_threads("deepseek-v41");
+    coli_xdna_engine_qualified_submit("deepseek-v41", NULL, NULL, 0);
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {   /* KV_SLOTS: the conversations decoded at once */
@@ -5337,3 +5340,183 @@ int main(int argc, char **argv) {
     free(logits); free(prompt); free(expected); json_free(root); free(arena); free(text);
     return (matched == n_expected && !vision_failed && !spec_failed) ? 0 : 1;
 }
+#endif /* DEEPSEEK_V41_NO_MAIN */
+
+#ifdef DEEPSEEK_V41_NO_MAIN
+/* ---- Public embed API (libdeepseek_v41.a, CPU only) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiV41Engine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+};
+
+static void coli_v41_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+/* Top-level *.safetensors only, same walk as coli_kimi_walk_disk.
+ * A missing directory is 0, which open reports as no weights. */
+static uint64_t coli_v41_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+COLI_FFI_EXPORT int coli_v41_engine_open(ColiV41Engine **engine, const ColiV41OpenOptions *options,
+                                         char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_v41_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_v41_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_v41_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiV41Engine *e = (ColiV41Engine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_v41_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    /* CLI: no cap argument is 8; V41_ENGRAM_ROWS unset is 65536. */
+    int ecap = options->ecap != 0 ? options->ecap : 8;
+    int engram_rows = options->engram_cache_rows != 0 ? options->engram_cache_rows : 65536;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    coli_omp_tune_threads("deepseek-v41");
+    model_load(&e->m, e->model_dir, ecap, engram_rows);
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+COLI_FFI_EXPORT void coli_v41_engine_destroy(ColiV41Engine *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+COLI_FFI_EXPORT void coli_v41_engine_size(const ColiV41Engine *engine, ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "deepseek_v41");
+    snprintf(out->engine_id, sizeof(out->engine_id), "deepseek_v41");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+COLI_FFI_EXPORT int coli_v41_generate(ColiV41Engine *engine, const char *prompt, size_t prompt_len,
+                                      const ColiV41GenerateOptions *options, ColiTokenFn on_token,
+                                      void *user_data, char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_v41_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_v41_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    const char *snap = engine->model_dir;
+    float temp = getenv("COLI_TEMP") ? (float)atof(getenv("COLI_TEMP")) : 0.f;
+    int ids[65536], np = 0;
+    Tok T;
+    char tp[2048];
+    snprintf(tp, sizeof(tp), "%s/tokenizer.json", snap);
+    FILE *tf = fopen(tp, "rb");
+    if (!tf) {
+        coli_v41_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    fclose(tf);
+    tok_load(&T, tp);
+    np += tok_encode(&T, prompt, (int)prompt_len, ids + np, 65536 - np);
+    tok_free(&T);
+    if (np < 1) {
+        coli_v41_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    float *lo = (float *)malloc((size_t)m->c.vocab * sizeof(float));
+    if (!lo) {
+        coli_v41_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    model_reset(m);
+    forward(m, ids, np, lo);
+    int eos_ids[8];
+    int n_eos = serve_eos(m, snap, eos_ids, 8);
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        int t = serve_sample(lo, m->c.vocab, temp, 1.f);
+        int is_eos = 0;
+        for (int e = 0; e < n_eos; e++)
+            if (t == eos_ids[e]) is_eos = 1;
+        if (on_token && on_token(user_data, t, lo[t], ordinal, ordinal)) break;
+        ordinal++;
+        if (is_eos) break;
+        if (ordinal >= ngen) break;
+        if (m->pos >= m->c.max_positions) break;
+        forward(m, &t, 1, lo);
+    }
+    free(lo);
+    return 0;
+}
+
+/* Visual poll stub: empty success until DeepSeek V4.1 telemetry fill lands. */
+COLI_FFI_EXPORT int coli_v41_visual_poll(ColiV41Engine *engine, uint32_t want, ColiHwinfoSnap *hwinfo,
+                                         ColiTiersSnap *tiers, ColiExpertGridDims *emap_dims,
+                                         uint8_t *emap_cells, size_t emap_cells_cap, size_t *emap_cells_len,
+                                         ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                                         size_t hits_bits_cap, size_t *hits_bits_len, uint64_t *hits_seq,
+                                         ColiProfSnap *prof, char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_v41_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* DEEPSEEK_V41_NO_MAIN */

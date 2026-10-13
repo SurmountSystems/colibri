@@ -16708,12 +16708,14 @@ static int v4_omp_reserve_loader_cpus(void) {
 }
 #endif
 
+#include "backend_xdna.h"
 int main(int argc, char **argv) {
 #ifdef _OPENMP
     if (!v4_omp_reserve_loader_cpus())
         fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",
                 omp_get_max_threads());
 #endif
+    coli_xdna_engine_qualified_submit("deepseek_v4", NULL, NULL, 0);
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
         return v4_serve_main();
     double process_started = spec_now();

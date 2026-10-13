@@ -1,9 +1,10 @@
 /* Optional AMD XDNA2 helper binding -- the C side, which never touches XRT.
  *
- * The split mirrors backend_loader.c: the host resolves an optional native DLL
- * at runtime and links none of its dependencies, so an ordinary Colibri build
- * has no XRT headers, no XRT import library and no XRT DLL import. Everything
- * that needs XRT lives in coli_xdna.dll, which this file loads and may refuse.
+ * The split mirrors backend_loader.c: the host resolves an optional native
+ * helper at runtime and links none of its dependencies, so an ordinary Colibri
+ * build has no XRT headers, no XRT import library and no XRT import. Everything
+ * that needs XRT lives in the helper (coli_xdna.dll on Windows,
+ * libcoli_xdna.so on Linux), which this file loads and may refuse.
  *
  * Refusal is the normal case. A machine with no NPU, no XRT or no helper is
  * ordinary, and every rejection path here ends the same way: the lane is
@@ -30,6 +31,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dirent.h>
+#include <dlfcn.h>
+#include <limits.h>
 #endif
 
 /* Entry points required of a helper at ABI generation 2. Still minimal: exactly
@@ -59,6 +64,8 @@ static struct {
     char            path[1024];      /* test override; empty = default lookup */
 #ifdef _WIN32
     HMODULE         dll;
+#else
+    void           *so;
 #endif
     coli_xdna_fn_abi_version    abi_version;
     coli_xdna_fn_open           open;
@@ -240,18 +247,124 @@ void coli_xdna_shutdown(void){
      * is not a reason to re-probe it later in the same process. */
 }
 
-#else  /* !_WIN32 */
+#else  /* Linux */
 
-/* The qualified XDNA lane is Windows/XDNA2-specific (see the N6 architecture
- * freeze). Elsewhere the loader compiles and answers ABSENT, so the rest of the
- * engine needs no platform branches and the contract stays uniform. */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* Directory of this process's executable. Absolute. No PATH search. */
+static int coli_xdna_exe_dir(char *out, size_t cap){
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if(n <= 0 || (size_t)n >= sizeof exe - 1) return 0;
+    exe[n] = '\0';
+    char *slash = strrchr(exe, '/');
+    if(!slash || slash == exe) return 0;
+    *slash = '\0';
+    size_t len = strlen(exe);
+    if(len + 1 > cap) return 0;
+    memcpy(out, exe, len + 1);
+    return 1;
+}
+
+static int coli_xdna_default_helper_path(char *out, size_t cap){
+    char dir[PATH_MAX];
+    if(!coli_xdna_exe_dir(dir, sizeof dir)) return 0;
+    int written = snprintf(out, cap, "%s/%s", dir, COLI_XDNA_HELPER_SO);
+    return written > 0 && (size_t)written < cap;
+}
+
+/* dlopen of a name with no slash searches LD_LIBRARY_PATH. This lane never
+ * does that. realpath fails when the file is not there, which is ABSENT. */
+static int coli_xdna_absolute_helper(const char *path, char *out, size_t cap){
+    char resolved[PATH_MAX];
+    if(!path || !path[0]) return 0;
+    if(!realpath(path, resolved)) return 0;
+    size_t len = strlen(resolved);
+    if(resolved[0] != '/' || len + 1 > cap) return 0;
+    memcpy(out, resolved, len + 1);
+    return 1;
+}
+
 static void coli_xdna_probe(void){
-    g_xdna.state = COLI_XDNA_ABSENT;
+    char candidate[PATH_MAX];
+    char absolute[PATH_MAX];
+    const char *path = g_xdna.path[0] ? g_xdna.path : NULL;
+
+    if(!path){
+        if(!coli_xdna_default_helper_path(candidate, sizeof candidate)){
+            g_xdna.state = COLI_XDNA_ABSENT;
+            return;
+        }
+        path = candidate;
+    }
+
+    if(!coli_xdna_absolute_helper(path, absolute, sizeof absolute)){
+        g_xdna.state = COLI_XDNA_ABSENT;
+        return;
+    }
+
+    g_xdna.load_attempts++;
+    /* RTLD_LOCAL keeps the helper's XRT symbols out of the host. The path is
+     * absolute, so this is not a library search. */
+    void *so = dlopen(absolute, RTLD_NOW | RTLD_LOCAL);
+    if(!so){
+        g_xdna.state = COLI_XDNA_LOAD_FAILED;
+        return;
+    }
+
+#if defined(__GNUC__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wcast-function-type"
+#endif
+    coli_xdna_fn_abi_version abi_version =
+        (coli_xdna_fn_abi_version)dlsym(so, "coli_xdna_helper_abi_version");
+    coli_xdna_fn_open open_fn =
+        (coli_xdna_fn_open)dlsym(so, "coli_xdna_helper_open");
+    coli_xdna_fn_wrap_weight wrap_fn =
+        (coli_xdna_fn_wrap_weight)dlsym(so, "coli_xdna_helper_wrap_weight");
+    coli_xdna_fn_execute exec_fn =
+        (coli_xdna_fn_execute)dlsym(so, "coli_xdna_helper_execute");
+    coli_xdna_fn_release_weight relw_fn =
+        (coli_xdna_fn_release_weight)dlsym(so, "coli_xdna_helper_release_weight");
+    coli_xdna_fn_shutdown shutdown =
+        (coli_xdna_fn_shutdown)dlsym(so, "coli_xdna_helper_shutdown");
+    coli_xdna_fn_last_error lasterr_fn =
+        (coli_xdna_fn_last_error)dlsym(so, "coli_xdna_helper_last_error");
+#if defined(__GNUC__)
+    #pragma GCC diagnostic pop
+#endif
+
+    if(!abi_version || abi_version() != COLI_XDNA_ABI_VERSION){
+        dlclose(so);
+        g_xdna.state = COLI_XDNA_ABI_INCOMPATIBLE;
+        return;
+    }
+    if(!open_fn || !wrap_fn || !exec_fn || !relw_fn || !shutdown || !lasterr_fn){
+        dlclose(so);
+        g_xdna.state = COLI_XDNA_SYMBOL_INCOMPLETE;
+        return;
+    }
+
+    g_xdna.so             = so;
+    g_xdna.abi_version    = abi_version;
+    g_xdna.open           = open_fn;
+    g_xdna.wrap_weight    = wrap_fn;
+    g_xdna.execute        = exec_fn;
+    g_xdna.release_weight = relw_fn;
+    g_xdna.shutdown       = shutdown;
+    g_xdna.last_error     = lasterr_fn;
+    g_xdna.state          = COLI_XDNA_AVAILABLE;
 }
 
 void coli_xdna_shutdown(void){
     coli_xdna_execution_shutdown();
     coli_xdna_clear_entry_points();
+    if(g_xdna.so){
+        dlclose(g_xdna.so);
+        g_xdna.so = NULL;
+    }
 }
 
 #endif /* _WIN32 */
@@ -279,6 +392,88 @@ ColiXdnaBinding coli_xdna_test_state(void){ return g_xdna.state; }
 int coli_xdna_test_load_attempts(void){ return g_xdna.load_attempts; }
 int coli_xdna_test_entry_points_bound(void){
     return g_xdna.abi_version != NULL && g_xdna.shutdown != NULL;
+}
+
+/* 2.0 roster ids. Linux accepts every row. Windows accepts only family "glm",
+ * which is the historical shared-expert lane, and returns -1 for the rest.
+ * Keep these ids aligned with supported_models() in
+ * crates/colibri-sys/src/model/catalog.rs. Selection does not execute. */
+static const struct {
+    const char *id;
+    const char *family;
+} g_xdna_roster[] = {
+    { "glm-5.2-colibri", "glm" },
+    { "glm-5.3", "glm" },
+    { "inkling-colibri", "inkling" },
+    { "kimi-k3-colibri", "kimi" },
+    { "deepseek-v4-colibri", "deepseek_v4" },
+    { "deepseek-v4-flash-reap", "deepseek_v4" },
+    { "olmoe-colibri", "olmoe" },
+    { "qwen-image-2.1-colibri", "qwen_image" },
+    { "glm-5.3-flash-colibri", "glm53" },
+    { "qwen36-35b", "qwen36" },
+    { "qwen3-coder-30b", "qwen36" },
+    { "qwen3.8-27b-colibri", "qwen36" },
+    { "qwen3-coder-reap-25b-a3b-colibri", "qwen36" },
+    { "qwen3.8-2.4t-a95b", "qwen36" },
+    { "qwen38-flash-next", "qwen38" },
+    { "deepseek-v4.1-flash-colibri", "deepseek_v41" },
+    { "mimo-v2.6-flash", "mimo" },
+    { "mimo-v2.6-pro", "mimo" },
+    { "laya", "laya" },
+    { "laya-multilingual", "laya" },
+    { "gliner2.5-decide", "gliner_decide" }
+};
+
+int coli_xdna_model_accepted(const char *model_id){
+    if(!model_id || !model_id[0]) return 0;
+    size_t n = sizeof g_xdna_roster / sizeof g_xdna_roster[0];
+    for(size_t i = 0; i < n; i++){
+        if(strcmp(g_xdna_roster[i].id, model_id) != 0) continue;
+#ifdef _WIN32
+        return strcmp(g_xdna_roster[i].family, "glm") == 0 ? 1 : -1;
+#else
+        (void)g_xdna_roster[i].family;
+        return 1;
+#endif
+    }
+    return 0;
+}
+
+int coli_xdna_linux_device_node(char *out, size_t cap){
+#ifdef _WIN32
+    (void)out; (void)cap;
+    return 0;
+#else
+    if(!out || cap < 2) return 0;
+    DIR *dir = opendir("/sys/class/accel");
+    if(!dir) return 0;
+    struct dirent *ent;
+    int found = 0;
+    while((ent = readdir(dir)) != NULL){
+        const char *name = ent->d_name;
+        if(name[0] == '.' || strchr(name, '/')) continue;
+        char linkpath[PATH_MAX];
+        int nw = snprintf(linkpath, sizeof linkpath,
+                          "/sys/class/accel/%s/device/driver", name);
+        if(nw <= 0 || (size_t)nw >= sizeof linkpath) continue;
+        char target[PATH_MAX];
+        ssize_t tn = readlink(linkpath, target, sizeof target - 1);
+        if(tn <= 0) continue;
+        target[tn] = '\0';
+        const char *base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+        if(strcmp(base, "amdxdna") != 0) continue;
+        nw = snprintf(out, cap, "/dev/accel/%s", name);
+        if(nw <= 0 || (size_t)nw >= cap) continue;
+        if(access(out, F_OK) != 0) continue;
+        found = 1;
+        break;
+    }
+    closedir(dir);
+    if(!found) out[0] = '\0';
+    return found;
+#endif
 }
 
 /* ======================================================================
@@ -400,8 +595,29 @@ int coli_xdna_sha256_file(const char *path, unsigned char out[32]){
  * eligibility table, not from "it compiled". Filenames are LOGICAL: they are
  * resolved under a caller-supplied root, and no build path appears here.
  *
- * The artifacts themselves are not shipped by this build. A row describing an
- * absent file is the intended state and yields ARTIFACT_UNAVAILABLE. */
+ * The GLM shared-expert files are not shipped by this build. A row describing
+ * an absent file yields ARTIFACT_UNAVAILABLE. Those two rows are not a program
+ * for Kimi, Qwen, DeepSeek, Laya, or the image model.
+ *
+ * The roster rows below are a different operation: M=K=N=64, int16 in, int32
+ * out, the public IRON npu2 single-core matmul. The bytes live under
+ * c/xdna/kernels and are checked by hash. The weight argument for that
+ * program is a host-only buffer on group 4. The four qualification bits on
+ * these rows record that this program was the one executed and compared.
+ * They do not record a token generate, and they do not make the absent
+ * K=6144 files appear.
+ */
+#define COLI_XDNA_I16_64_ROW(fam) \
+    { fam, "NPU2_I16_64", \
+      64, 64, 64, \
+      COLI_XDNA_DT_I16, COLI_XDNA_DT_I16, COLI_XDNA_DT_I32, \
+      COLI_XDNA_TARGET_XDNA2, \
+      "mlir_aie_single_core_matmul_npu2.xclbin", \
+      "8a96c4cb5e01656c74b21d727e660472d05904f2d98dac1677da99355ffbee52", \
+      "mlir_aie_single_core_matmul_npu2.insts.bin", \
+      "34baaff69260033c0092dce3a5d90fd936206e0dba309a810e02b21b7ee0a3de", \
+      1, 1, 1, 1 }
+
 static const ColiXdnaArtifact g_xdna_production_rows[] = {
     {
         COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, "F3",
@@ -424,8 +640,22 @@ static const ColiXdnaArtifact g_xdna_production_rows[] = {
         "wa_F3_M256_K6144_N2048_insts.bin",
         "1a17753ce2516d8ccd7b992b61e1aa7c6b7a9fb655c4c0c0179eff075130d4b1",
         1, 1, 1, 1
-    }
+    },
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_GLM),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_GLM53),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_INKLING),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_KIMI),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_DEEPSEEK_V4),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_OLMOE),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_QWEN_IMAGE),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_QWEN36),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_QWEN38),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_DEEPSEEK_V41),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_MIMO),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_LAYA),
+    COLI_XDNA_I16_64_ROW(COLI_XDNA_FAMILY_ROSTER_GLINER_DECIDE)
 };
+#undef COLI_XDNA_I16_64_ROW
 static const int g_xdna_production_count =
     (int)(sizeof g_xdna_production_rows / sizeof g_xdna_production_rows[0]);
 
@@ -454,7 +684,8 @@ const char *coli_xdna_static_text(ColiXdnaStatic s){
 }
 
 static int coli_xdna_dtype_ok(ColiXdnaDtype d){
-    return d == COLI_XDNA_DT_BF16 || d == COLI_XDNA_DT_F32;
+    return d == COLI_XDNA_DT_BF16 || d == COLI_XDNA_DT_F32
+        || d == COLI_XDNA_DT_I16 || d == COLI_XDNA_DT_I32;
 }
 
 static int coli_xdna_sha_text_ok(const char *s){
@@ -998,6 +1229,8 @@ static int          g_xdna_force;                 /* internal test control only 
 /* Explicit PRODUCT policy (W2-N7-P1), deliberately distinct from g_xdna_force.
  * Set only from a parsed user request; never from discovery, never by default. */
 static int          g_xdna_explicit;
+/* Last try_matmul shape decline. Empty until a shape would not run. */
+static char         g_xdna_decline[128];
 static char         g_xdna_root[1024];            /* artifact root; empty = none */
 /* Set only by the test seam. When 0, the root is the PRODUCT one derived from
  * the executable directory. Kept as a separate flag rather than inferred from
@@ -1185,8 +1418,10 @@ int coli_xdna_product_artifact_root(char *out, size_t cap){
     int written = snprintf(out, cap, "%s\\%s", exe, COLI_XDNA_ARTIFACT_DIR);
     return written > 0 && (size_t)written < cap;
 #else
-    (void)out; (void)cap;
-    return 0;
+    char dir[PATH_MAX];
+    if(!coli_xdna_exe_dir(dir, sizeof dir)) return 0;
+    int written = snprintf(out, cap, "%s/%s", dir, COLI_XDNA_ARTIFACT_DIR);
+    return written > 0 && (size_t)written < cap;
 #endif
 }
 
@@ -1582,6 +1817,13 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
                          int I, int O, int gs, int planar,
                          float *y, const float *x, int S)
 {
+    /* Record a shape decline. This does not submit the 64 program and does
+     * not write y from a 64 result. Expert GEMM stays on the gates below. */
+    {
+        char shape_reason[128];
+        if(!coli_xdna_shape_would_run(I, O, shape_reason, sizeof shape_reason))
+            snprintf(g_xdna_decline, sizeof g_xdna_decline, "%s", shape_reason);
+    }
     /* Gate 0: PERMISSION. Without it this function is inert, which is what keeps
      * the lane from being an automatic scheduler.
      *
@@ -1653,4 +1895,402 @@ void coli_xdna_execution_shutdown(void){
     g_xdna_lane_health = COLI_XDNA_LANE_UNINITIALIZED;
     free(g_lane.act); g_lane.act = NULL; g_lane.act_cap = 0;
     free(g_lane.out); g_lane.out = NULL; g_lane.out_cap = 0;
+}
+
+/* ======================================================================
+ * Linux roster synthetic op
+ *
+ * The production GLM rows stay the K=6144 N=2048 shared-expert buckets.
+ * A roster family with no row of its own declines here with
+ * ARTIFACT_UNAVAILABLE. A row, when one is installed, names one program.
+ * The program this machine can feed without a downloaded weight is the
+ * public IRON npu2 single-core matmul: M=K=N=64, int16 in, int32 out.
+ * Running it is one matmul of synthetic buffers. It is not a generate.
+ * ====================================================================== */
+
+static void coli_xdna_reason(char *reason, size_t cap, const char *s){
+    if(!reason || cap == 0) return;
+    if(!s) s = "";
+    size_t j = 0;
+    for(size_t i = 0; s[i] && j + 1 < cap; i++){
+        char c = s[i];
+        if(c == '\n' || c == '\r') c = ' ';
+        reason[j++] = c;
+    }
+    reason[j] = '\0';
+}
+
+static int coli_xdna_env_on(void){
+    const char *s = getenv("COLI_XDNA");
+    if(!s) return 0;
+    while(*s == ' ' || *s == '\t') s++;
+    if(*s == '+') s++;
+    if(*s < '1' || *s > '9') return 0;
+    while(*s >= '0' && *s <= '9') s++;
+    while(*s == ' ' || *s == '\t') s++;
+    return *s == '\0';
+}
+
+static ColiXdnaFamily coli_xdna_roster_family_enum(const char *family){
+    if(!family) return COLI_XDNA_FAMILY_NONE;
+    if(strcmp(family, "glm") == 0) return COLI_XDNA_FAMILY_ROSTER_GLM;
+    if(strcmp(family, "glm53") == 0) return COLI_XDNA_FAMILY_ROSTER_GLM53;
+    if(strcmp(family, "inkling") == 0) return COLI_XDNA_FAMILY_ROSTER_INKLING;
+    if(strcmp(family, "kimi") == 0) return COLI_XDNA_FAMILY_ROSTER_KIMI;
+    if(strcmp(family, "deepseek_v4") == 0) return COLI_XDNA_FAMILY_ROSTER_DEEPSEEK_V4;
+    if(strcmp(family, "olmoe") == 0) return COLI_XDNA_FAMILY_ROSTER_OLMOE;
+    if(strcmp(family, "qwen_image") == 0) return COLI_XDNA_FAMILY_ROSTER_QWEN_IMAGE;
+    if(strcmp(family, "qwen36") == 0) return COLI_XDNA_FAMILY_ROSTER_QWEN36;
+    if(strcmp(family, "qwen38") == 0) return COLI_XDNA_FAMILY_ROSTER_QWEN38;
+    if(strcmp(family, "deepseek_v41") == 0) return COLI_XDNA_FAMILY_ROSTER_DEEPSEEK_V41;
+    if(strcmp(family, "mimo") == 0) return COLI_XDNA_FAMILY_ROSTER_MIMO;
+    if(strcmp(family, "laya") == 0) return COLI_XDNA_FAMILY_ROSTER_LAYA;
+    if(strcmp(family, "gliner_decide") == 0) return COLI_XDNA_FAMILY_ROSTER_GLINER_DECIDE;
+    return COLI_XDNA_FAMILY_NONE;
+}
+
+static const char *coli_xdna_roster_family_of(const char *model_id){
+    if(!model_id || !model_id[0]) return NULL;
+    size_t n = sizeof g_xdna_roster / sizeof g_xdna_roster[0];
+    for(size_t i = 0; i < n; i++){
+        if(strcmp(g_xdna_roster[i].id, model_id) == 0) return g_xdna_roster[i].family;
+    }
+    return NULL;
+}
+
+const char *coli_xdna_decline_reason(void){
+    return g_xdna_decline;
+}
+
+const char *coli_xdna_engine_roster_id(const char *engine_name){
+    if(!engine_name) return NULL;
+    if(strcmp(engine_name, "colibri") == 0) return "glm-5.2-colibri";
+    if(strcmp(engine_name, "glm53") == 0) return "glm-5.3-flash-colibri";
+    if(strcmp(engine_name, "inkling") == 0) return "inkling-colibri";
+    if(strcmp(engine_name, "kimi_k3") == 0) return "kimi-k3-colibri";
+    if(strcmp(engine_name, "deepseek_v4") == 0) return "deepseek-v4-colibri";
+    if(strcmp(engine_name, "olmoe") == 0) return "olmoe-colibri";
+    if(strcmp(engine_name, "qwen36") == 0) return "qwen36-35b";
+    if(strcmp(engine_name, "qwen38") == 0) return "qwen38-flash-next";
+    if(strcmp(engine_name, "deepseek-v41") == 0) return "deepseek-v4.1-flash-colibri";
+    if(strcmp(engine_name, "mimo") == 0) return "mimo-v2.6-flash";
+    return NULL;
+}
+
+int coli_xdna_shape_would_run(int k, int n, char *reason, size_t reason_cap){
+    if(k == 64 && n == 64){
+        ColiXdnaRequest q;
+        char scratch[1024];
+        const char *root;
+        const ColiXdnaArtifact *row;
+        ColiXdnaStatic sx, si;
+        q.family = COLI_XDNA_FAMILY_ROSTER_KIMI;
+        q.m = 64; q.k = 64; q.n = 64;
+        q.in_dtype = COLI_XDNA_DT_I16;
+        q.weight_dtype = COLI_XDNA_DT_I16;
+        q.out_dtype = COLI_XDNA_DT_I32;
+        row = coli_xdna_registry_lookup(&q);
+        root = coli_xdna_effective_root(scratch, sizeof scratch);
+        if(!root || !row){
+            coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
+            return 0;
+        }
+        sx = coli_xdna_check_file(root, row->xclbin_name, row->xclbin_sha256);
+        si = coli_xdna_check_file(root, row->insts_name, row->insts_sha256);
+        if(sx == COLI_XDNA_STATIC_ARTIFACT_INTEGRITY_FAILED
+           || si == COLI_XDNA_STATIC_ARTIFACT_INTEGRITY_FAILED){
+            coli_xdna_reason(reason, reason_cap, "ARTIFACT_INTEGRITY_FAILED");
+            return 0;
+        }
+        if(sx != COLI_XDNA_STATIC_QUALIFIED || si != COLI_XDNA_STATIC_QUALIFIED){
+            coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
+            return 0;
+        }
+        coli_xdna_reason(reason, reason_cap, "PROGRAM_PRESENT");
+        return 1;
+    }
+    if(k == 6144 && n == 2048){
+        coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
+        return 0;
+    }
+    coli_xdna_reason(reason, reason_cap, "SHAPE_NO_PROGRAM");
+    return 0;
+}
+
+int coli_xdna_engine_qualified_submit(const char *engine_name,
+                                      int32_t *qualified_i32,
+                                      char *decline, size_t decline_cap){
+    static int once_ready = 0;
+    static int once_code = 0;
+    static int32_t once_i32[4096];
+    static char once_decline[256];
+    const char *model_id;
+    char helper_store[4096];
+    const char *helper = NULL;
+    char root_scratch[1024];
+    const char *root;
+    char node[128];
+    char roster_reason[256];
+    int matched = 0;
+    int rc;
+
+    if(once_ready){
+        coli_xdna_reason(decline, decline_cap, once_decline);
+        if(once_code == 1 && qualified_i32)
+            memcpy(qualified_i32, once_i32, sizeof once_i32);
+        return once_code;
+    }
+
+    /* Unset COLI_XDNA is a getenv check only. Roster lookup, helper path,
+     * artifact root, dlopen, and the device open stay on the set path.
+     * g_xdna_explicit is not a substitute for that variable. */
+    if(!coli_xdna_env_on()){
+        coli_xdna_reason(once_decline, sizeof once_decline, "ENGINE_LANE_NOT_CALLED");
+        coli_xdna_reason(decline, decline_cap, once_decline);
+        once_code = 0;
+        once_ready = 1;
+        return 0;
+    }
+
+    model_id = coli_xdna_engine_roster_id(engine_name);
+    if(!model_id){
+        coli_xdna_reason(once_decline, sizeof once_decline, "NOT_ON_ROSTER");
+        coli_xdna_reason(decline, decline_cap, once_decline);
+        once_code = 0;
+        once_ready = 1;
+        return 0;
+    }
+
+    /* Copy out of g_xdna.path. roster_op writes that buffer, so passing
+     * the pointer itself would overlap the snprintf inside the probe. */
+    if(g_xdna.path[0]){
+        snprintf(helper_store, sizeof helper_store, "%s", g_xdna.path);
+        helper = helper_store;
+    } else {
+#ifdef _WIN32
+        if(!coli_xdna_default_helper_path(helper_store, sizeof helper_store)){
+            coli_xdna_reason(once_decline, sizeof once_decline, "HELPER_UNAVAILABLE");
+            coli_xdna_reason(decline, decline_cap, once_decline);
+            once_code = 0;
+            once_ready = 1;
+            return 0;
+        }
+        helper = helper_store;
+#else
+        {
+            char candidate[4096];
+            if(!coli_xdna_default_helper_path(candidate, sizeof candidate)
+               || !coli_xdna_absolute_helper(candidate, helper_store, sizeof helper_store)){
+                coli_xdna_reason(once_decline, sizeof once_decline, "HELPER_UNAVAILABLE");
+                coli_xdna_reason(decline, decline_cap, once_decline);
+                once_code = 0;
+                once_ready = 1;
+                return 0;
+            }
+            helper = helper_store;
+        }
+#endif
+    }
+
+    root = coli_xdna_effective_root(root_scratch, sizeof root_scratch);
+    if(!root){
+        coli_xdna_reason(once_decline, sizeof once_decline, "ARTIFACT_UNAVAILABLE");
+        coli_xdna_reason(decline, decline_cap, once_decline);
+        once_code = 0;
+        once_ready = 1;
+        return 0;
+    }
+
+    node[0] = '\0';
+    roster_reason[0] = '\0';
+    rc = coli_xdna_linux_roster_op(model_id, helper, root,
+                                   roster_reason, sizeof roster_reason,
+                                   node, sizeof node,
+                                   &matched, once_i32);
+    (void)node;
+    (void)matched;
+    coli_xdna_reason(once_decline, sizeof once_decline, roster_reason);
+    coli_xdna_reason(decline, decline_cap, roster_reason);
+    if(rc == 1){
+        once_code = 1;
+        once_ready = 1;
+        if(qualified_i32)
+            memcpy(qualified_i32, once_i32, sizeof once_i32);
+        return 1;
+    }
+    once_code = 0;
+    once_ready = 1;
+    return 0;
+}
+
+int coli_xdna_linux_roster_op(const char *model_id,
+                              const char *helper_path,
+                              const char *artifact_root,
+                              char *reason, size_t reason_cap,
+                              char *node, size_t node_cap,
+                              int *matched,
+                              int32_t *out_i32){
+    if(matched) *matched = 0;
+    if(node && node_cap) node[0] = '\0';
+    coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
+#ifdef _WIN32
+    (void)model_id; (void)helper_path; (void)artifact_root;
+    (void)out_i32;
+    coli_xdna_reason(reason, reason_cap, "WINDOWS_GLM_LANE_ONLY");
+    return 0;
+#else
+    coli_xdna_linux_device_node(node, node_cap);
+
+    const char *fam_name = coli_xdna_roster_family_of(model_id);
+    if(!fam_name){
+        coli_xdna_reason(reason, reason_cap, "NOT_ON_ROSTER");
+        return 0;
+    }
+    ColiXdnaFamily fam = coli_xdna_roster_family_enum(fam_name);
+    if(fam == COLI_XDNA_FAMILY_NONE){
+        coli_xdna_reason(reason, reason_cap, "NOT_ON_ROSTER");
+        return 0;
+    }
+
+    /* The qualified shape. No other bucket is implied. */
+    const unsigned M = 64, K = 64, N = 64;
+    ColiXdnaRequest q;
+    q.family = fam;
+    q.m = M; q.k = K; q.n = N;
+    q.in_dtype = COLI_XDNA_DT_I16;
+    q.weight_dtype = COLI_XDNA_DT_I16;
+    q.out_dtype = COLI_XDNA_DT_I32;
+    const ColiXdnaArtifact *row = coli_xdna_registry_lookup(&q);
+    if(!row){
+        coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
+        return 0;
+    }
+
+    if(!coli_xdna_env_on()){
+        coli_xdna_reason(reason, reason_cap, "LANE_OFF");
+        return 0;
+    }
+
+    char xb[2048], ib[2048];
+    if(!artifact_root || !*artifact_root
+       || !coli_xdna_join(xb, sizeof xb, artifact_root, row->xclbin_name)
+       || !coli_xdna_join(ib, sizeof ib, artifact_root, row->insts_name)){
+        coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
+        return 0;
+    }
+    ColiXdnaStatic sx = coli_xdna_check_file(artifact_root, row->xclbin_name, row->xclbin_sha256);
+    if(sx != COLI_XDNA_STATIC_QUALIFIED){
+        coli_xdna_reason(reason, reason_cap, coli_xdna_static_text(sx));
+        return 0;
+    }
+    ColiXdnaStatic si = coli_xdna_check_file(artifact_root, row->insts_name, row->insts_sha256);
+    if(si != COLI_XDNA_STATIC_QUALIFIED){
+        coli_xdna_reason(reason, reason_cap, coli_xdna_static_text(si));
+        return 0;
+    }
+
+    if(!helper_path || helper_path[0] != '/'){
+        coli_xdna_reason(reason, reason_cap, "HELPER_UNAVAILABLE");
+        return 0;
+    }
+    coli_xdna_test_set_helper_path(helper_path);
+    if(coli_xdna_binding() != COLI_XDNA_AVAILABLE){
+        coli_xdna_reason(reason, reason_cap, "HELPER_UNAVAILABLE");
+        return 0;
+    }
+
+    const size_t abytes = (size_t)M * (size_t)K * 2u;
+    const size_t wbytes = (size_t)K * (size_t)N * 2u;
+    const size_t cbytes = (size_t)M * (size_t)N * 4u;
+    int16_t *A = NULL;
+    int16_t *B = NULL;
+    int32_t *C = NULL;
+    int32_t *R = NULL;
+    void *bmem = NULL;
+    int ok = 0;
+    unsigned tag = 1u;
+    for(const char *p = model_id; *p; p++) tag = tag * 33u + (unsigned char)*p;
+    tag = (tag % 5u) + 1u;
+
+    if(posix_memalign(&bmem, 4096, wbytes) != 0){
+        bmem = NULL;
+        coli_xdna_reason(reason, reason_cap, "ALLOC_FAILED");
+        goto done;
+    }
+    B = (int16_t *)bmem;
+    A = (int16_t *)malloc(abytes);
+    C = (int32_t *)malloc(cbytes);
+    R = (int32_t *)malloc(cbytes);
+    if(!A || !C || !R){
+        coli_xdna_reason(reason, reason_cap, "ALLOC_FAILED");
+        goto done;
+    }
+    for(unsigned i = 0; i < M; i++){
+        for(unsigned k = 0; k < K; k++)
+            A[(size_t)i * K + k] = (int16_t)((i + k + tag) % 7u);
+    }
+    for(unsigned k = 0; k < K; k++){
+        for(unsigned j = 0; j < N; j++)
+            B[(size_t)k * N + j] = (int16_t)((k + 2u * j + tag) % 5u);
+    }
+    for(unsigned i = 0; i < M; i++){
+        for(unsigned j = 0; j < N; j++){
+            int32_t acc = 0;
+            for(unsigned k = 0; k < K; k++)
+                acc += (int32_t)A[(size_t)i * K + k] * (int32_t)B[(size_t)k * N + j];
+            R[(size_t)i * N + j] = acc;
+        }
+    }
+    memset(C, 0x5a, cbytes);
+
+    {
+        int rc = coli_xdna_helper_open_call(xb, ib, M, K, N);
+        if(rc != 0){
+            const char *e = g_xdna.last_error ? g_xdna.last_error() : "";
+            char buf[256];
+            snprintf(buf, sizeof buf, "ARTIFACT_OPEN_FAILED %s", e);
+            coli_xdna_reason(reason, reason_cap, buf);
+            goto done;
+        }
+        rc = coli_xdna_helper_wrap_call(B, (uint64_t)wbytes);
+        if(rc != 0){
+            const char *e = g_xdna.last_error ? g_xdna.last_error() : "";
+            char buf[256];
+            snprintf(buf, sizeof buf, "WEIGHT_WRAP_FAILED %s", e);
+            coli_xdna_reason(reason, reason_cap, buf);
+            goto done;
+        }
+        rc = coli_xdna_helper_execute_call(A, (uint64_t)abytes, C, (uint64_t)cbytes);
+        if(rc != COLI_XDNA_H_OK){
+            const char *e = g_xdna.last_error ? g_xdna.last_error() : "";
+            char buf[256];
+            snprintf(buf, sizeof buf, "%s %s",
+                     rc == COLI_XDNA_H_E_COMPLETION ? "COMPLETION_FAILED" : "EXECUTE_FAILED",
+                     e);
+            coli_xdna_reason(reason, reason_cap, buf);
+            goto done;
+        }
+    }
+    for(size_t i = 0; i < (size_t)M * (size_t)N; i++){
+        if(C[i] != R[i]){
+            char buf[128];
+            snprintf(buf, sizeof buf, "OUTPUT_MISMATCH at %zu got %d want %d",
+                     i, (int)C[i], (int)R[i]);
+            coli_xdna_reason(reason, reason_cap, buf);
+            goto done;
+        }
+    }
+    if(matched) *matched = 1;
+    coli_xdna_reason(reason, reason_cap, "COMPLETED");
+    if(out_i32) memcpy(out_i32, C, cbytes);
+    ok = 1;
+done:
+    coli_xdna_helper_release_weight_call();
+    coli_xdna_helper_shutdown_call();
+    free(A);
+    free(B);
+    free(C);
+    free(R);
+    return ok;
+#endif
 }

@@ -910,6 +910,9 @@ static void st_destroy(shards *S) {
     memset(S, 0, sizeof(*S));
 }
 
+/* FFI name for st_destroy. Safe on a zeroed shards. */
+static void st_close(shards *S) { st_destroy(S); }
+
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {
         uint64_t h = st_hash(name) & (S->hcap - 1);

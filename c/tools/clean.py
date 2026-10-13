@@ -29,7 +29,7 @@ FILES = [
     # VK=1, XDNA=1 and METAL=1 (qwen36's qpack) objects. Left behind once
     # their .d is cleaned, an object would sit in the tree with no record of
     # the headers it read.
-    "backend_vulkan.o", "vk_tier.o", "vk_chain.o", "backend_xdna.o", "qwen36_qpack.o", "qpack.o",
+    "backend_vulkan.o", "vk_tier.o", "vk_chain.o", "backend_xdna.o", "libbackend_xdna.a", "qwen36_qpack.o", "qpack.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -73,8 +73,8 @@ FILES = [
 # (#1741). A stale one only adds prerequisites, but clean should leave nothing
 # the build made, and removing it forces the rebuild that writes a fresh one.
 # They land wherever an output does: c/ and tests/ for the engines and tests,
-# tools/ for the ctypes library; build/segment/ and build/ownership/ go as
-# whole directories below.
+# tools/ for the ctypes library; build/segment/, build/ownership/, and
+# build/v4test/ go as whole directories below.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
                   "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
                   "tools/*.d",
@@ -85,7 +85,7 @@ KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
 # Directories to remove. build/segment/ holds only build output (the
 # segment-library objects, their .d and the archive); an object left there
 # without its .d would be a built target whose headers are untracked (#1741).
-DIRS = ["tests/__pycache__", "build/ownership", "build/segment"]
+DIRS = ["tests/__pycache__", "build/ownership", "build/segment", "build/v4test"]
 
 def clean():
     """Remove everything above, relative to the current directory."""

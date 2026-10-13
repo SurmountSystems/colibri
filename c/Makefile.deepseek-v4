@@ -297,9 +297,27 @@ $(V4_CUDA_FLAGS_STAMP): FORCE
 		echo "$$flags" > $@; \
 	fi
 
+# Static library for in-process embed (colibri-sys feature `ffi`).
+# Separate *.lib.o objects so the CLI binary keeps its main. Library objects
+# compile with -DCOLI_V4_SKIP_GENERATE_MAIN (no CLI main) and -fPIC.
+# LTO objects are awkward to consume from rustc; default the library off LTO.
+# Vulkan objects, shaders, and the Windows loader stay on the CLI link only.
+# The runtime unit calls coli_expert_store_backend_open_selected, so the
+# archive also packs a PIC registry object that is not the CLI
+# expert_store_registry.o (that object keeps the CLI's non-PIC flags).
+LIB_V4_NAME ?= libdeepseek_v4.a
+LIB_OBJS = $(addsuffix .lib.o,$(V4_TARGET_UNITS))
+LIB_REGISTRY_OBJ = expert_store_registry.lib.o
+LIB_LTO ?= 0
+LIB_CFLAGS = $(filter-out -flto,$(CFLAGS)) -fPIC -DCOLI_V4_SKIP_GENERATE_MAIN
+ifeq ($(LIB_LTO),1)
+LIB_CFLAGS += -flto
+endif
+
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
-	deepseek-v4-test-registry print-v4-objs FORCE
+	deepseek-v4-test-registry print-v4-objs libdeepseek-v4 FORCE
 deepseek-v4: $(V4_BINARY)
+libdeepseek-v4: $(LIB_V4_NAME)
 
 # Build just the amalgamation unit + registry objects (no link). External
 # trees (e.g. a downstream integration) reuse these .o's to link an
@@ -311,8 +329,16 @@ deepseek-v4-objs: $(V4_OBJS)
 print-v4-objs:
 	@echo $(V4_OBJS)
 
-$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
-	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+# CLI main calls coli_xdna_engine_qualified_submit. Same archive as the parent
+# Makefile: the member is the real function, pulled only for that symbol.
+libbackend_xdna.a: backend_xdna.o
+	$(RM) $@
+	$(AR) rcs $@ backend_xdna.o
+backend_xdna.o: backend_xdna.c
+	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
+
+$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV) libbackend_xdna.a
+	$(CC) $(V4_OBJS) libbackend_xdna.a -o $@ $(LDFLAGS)
 
 # VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
 backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
@@ -342,6 +368,43 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+# A parent recipe that must not share the cwd unit objects (two parallel
+# `make -j` recipes writing COLI_V4_UNIT_PROMPT.o is the wild linker race)
+# passes V4_OBJDIR. -D is the unit stem. A path-qualified goal on the rule
+# above would define the directory as well.
+V4_OBJDIR ?=
+ifneq ($(V4_OBJDIR),)
+$(V4_OBJDIR):
+	mkdir -p $@
+
+$(V4_OBJDIR)/%.o: deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP) | $(V4_OBJDIR)
+	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+$(V4_OBJDIR)/backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h \
+	$(V4_FLAGS_STAMP) | $(V4_OBJDIR)
+	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
+endif
+
+# Library objects: same amalgamation units, no CLI main. -D$* matches %.o.
+$(LIB_OBJS): %.lib.o: deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
+	$(CC) $(LIB_CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+expert_store_registry.lib.o: expert_store_registry.c expert_store_registry.h expert_store.h \
+	$(V4_FLAGS_STAMP)
+	$(CC) $(LIB_CFLAGS) -c expert_store_registry.c -o $@
+
+$(LIB_V4_NAME): $(LIB_OBJS) $(LIB_REGISTRY_OBJ)
+	$(RM) $@
+	$(AR) rcs $@ $(LIB_OBJS) $(LIB_REGISTRY_OBJ)
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
 		st.h json.h compat.h tensor.h quant.h fp8_format.h route_trace.h sse41_kernels.h \
@@ -390,4 +453,5 @@ deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
-		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
+		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o \
+		$(LIB_OBJS) $(LIB_REGISTRY_OBJ) $(LIB_V4_NAME)

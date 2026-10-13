@@ -2477,8 +2477,11 @@ static int is_dir(const char *path) {
     return stat(path, &sb) == 0 && S_ISDIR(sb.st_mode);
 }
 
+#ifndef MIMO_NO_MAIN
+#include "backend_xdna.h"
 int main(int argc, char **argv) {
     coli_omp_tune_threads("mimo");
+    coli_xdna_engine_qualified_submit("mimo", NULL, NULL, 0);
     /* Two ways in. The gateway: SNAP=<dir> mimo <cap>, SERVE=1. By hand and in
      * the tests: mimo <dir> [--ids "..." | --prompt "..."] [--ngen N] [--cap N]. */
     const char *dir = getenv("SNAP");
@@ -2666,3 +2669,219 @@ int main(int argc, char **argv) {
     vk_report(m);
     return 0;
 }
+#endif /* MIMO_NO_MAIN */
+
+#ifdef MIMO_NO_MAIN
+/* ---- Public embed API (libmimo.a) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiMimoEngine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+};
+
+static void coli_mimo_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+static uint64_t coli_mimo_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+COLI_FFI_EXPORT int coli_mimo_engine_open(ColiMimoEngine **engine,
+                                          const ColiMimoOpenOptions *options,
+                                          char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_mimo_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_mimo_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_mimo_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiMimoEngine *e = (ColiMimoEngine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_mimo_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir);
+    e->disk_bytes = disk;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    coli_omp_tune_threads("mimo");
+    /* CLI: cap <= 0 means 64 experts resident per MoE layer. */
+    int cap = options->cap > 0 ? options->cap : 64;
+    model_load(&e->m, e->model_dir, cap);
+    {
+        const char *seed = getenv("SEED");
+        srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
+    }
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+COLI_FFI_EXPORT void coli_mimo_engine_destroy(ColiMimoEngine *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+COLI_FFI_EXPORT void coli_mimo_engine_size(const ColiMimoEngine *engine, ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "mimo");
+    snprintf(out->engine_id, sizeof(out->engine_id), "mimo");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+COLI_FFI_EXPORT int coli_mimo_generate(ColiMimoEngine *engine, const char *prompt,
+                                       size_t prompt_len,
+                                       const ColiMimoGenerateOptions *options,
+                                       ColiTokenFn on_token, void *user_data,
+                                       char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_mimo_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_mimo_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    Model *m = &engine->m;
+    char tp[2048];
+    snprintf(tp, sizeof(tp), "%s/tokenizer.json", engine->model_dir);
+    FILE *tf = fopen(tp, "rb");
+    if (!tf) {
+        coli_mimo_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    fclose(tf);
+    Tok T;
+    tok_load(&T, tp);
+    int *ids = (int *)malloc(((size_t)m->ctx + 1) * sizeof(int));
+    if (!ids) {
+        tok_free(&T);
+        coli_mimo_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    int text_len = prompt_len > (size_t)0x7fffffff ? 0x7fffffff : (int)prompt_len;
+    int np = tok_encode(&T, prompt, text_len, ids, m->ctx);
+    if (np < 1) {
+        free(ids);
+        tok_free(&T);
+        coli_mimo_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    for (int i = 0; i < np; i++) {
+        if (ids[i] < 0 || ids[i] >= m->c.vocab) {
+            free(ids);
+            tok_free(&T);
+            coli_mimo_set_err(error, error_size, "token id out of range");
+            return -1;
+        }
+    }
+    /* forward exits if pos + n exceeds ctx. Refuse before that. */
+    if (np > m->ctx || ngen > m->ctx - np) {
+        free(ids);
+        tok_free(&T);
+        coli_mimo_set_err(error, error_size, "prompt exceeds context");
+        return -1;
+    }
+    float *logits = (float *)malloc((size_t)m->c.vocab * sizeof(float));
+    if (!logits) {
+        free(ids);
+        tok_free(&T);
+        coli_mimo_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    model_reset(m);
+    int img_used = 0;
+    int chunk = env_int("MIMO_CHUNK", 64);
+    if (chunk < 1) chunk = 1;
+    for (int b = 0; b < np; b += chunk) {
+        int nb = np - b < chunk ? np - b : chunk;
+        forward(m, ids + b, nb, b + nb == np ? logits : NULL, 0, NULL, &img_used);
+    }
+    free(ids);
+    float temperature = getenv("COLI_TEMP") ? (float)atof(getenv("COLI_TEMP")) : 0.0f;
+    int eos[8];
+    int n_eos = coli_load_stop_ids(engine->model_dir, eos, 8, NULL);
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        int token = sample(logits, m->c.vocab, temperature, 1.0f);
+        int is_eos = 0;
+        for (int e = 0; e < n_eos; e++) if (token == eos[e]) is_eos = 1;
+        if (on_token && on_token(user_data, token, 0.f, ordinal, ordinal)) break;
+        ordinal++;
+        if (is_eos) break;
+        if (s + 1 >= ngen) break;
+        if (m->pos + 1 > m->ctx) break;
+        forward(m, &token, 1, logits, 0, NULL, &img_used);
+    }
+    free(logits);
+    tok_free(&T);
+    return 0;
+}
+
+/* Visual poll stub: empty success until MiMo telemetry fill lands. */
+COLI_FFI_EXPORT int coli_mimo_visual_poll(ColiMimoEngine *engine, uint32_t want,
+                                          ColiHwinfoSnap *hwinfo, ColiTiersSnap *tiers,
+                                          ColiExpertGridDims *emap_dims, uint8_t *emap_cells,
+                                          size_t emap_cells_cap, size_t *emap_cells_len,
+                                          ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                                          size_t hits_bits_cap, size_t *hits_bits_len,
+                                          uint64_t *hits_seq, ColiProfSnap *prof,
+                                          char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_mimo_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* MIMO_NO_MAIN */

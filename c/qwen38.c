@@ -2240,6 +2240,7 @@ static void q38_dho_start(Model *m) {
 #endif
 
 #ifndef QWEN38_TEST_SERVE
+#include "backend_xdna.h"
 int main(int argc, char **argv) {
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
@@ -2247,6 +2248,7 @@ int main(int argc, char **argv) {
      * per-expert region (#718 measured +2.3x from the sizing alone on a
      * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
     coli_omp_tune_threads("qwen38");
+    coli_xdna_engine_qualified_submit("qwen38", NULL, NULL, 0);
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
@@ -3534,3 +3536,228 @@ int coli_qwen38_edge_adapter_register(void) {
     return coli_edge_adapter_register(&qwen38_edge_adapter);
 }
 #endif /* COLI_EDGE_ADAPTER */
+
+#ifdef QWEN38_NO_MAIN
+/* ---- Public embed API (libqwen38.a) ---- */
+#include "colibri_api.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+struct ColiQwen38Engine {
+    Model m;
+    char model_dir[4096];
+    uint64_t disk_bytes;
+    int alive;
+    int tokenizer_loaded;
+};
+
+static void coli_qwen38_set_err(char *error, size_t error_size, const char *msg) {
+    if (error && error_size) snprintf(error, error_size, "%s", msg);
+}
+
+static uint64_t coli_qwen38_walk_disk(const char *model_dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(model_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    char path[4096];
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 12 || strcmp(ent->d_name + n - 12, ".safetensors") != 0) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", model_dir, ent->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+/* Chat turns end on <|im_end|>, base completions on <|endoftext|>, else config eos. */
+static int coli_qwen38_is_eos(const Model *m, int token) {
+    if (token == m->c.eos_id) return 1;
+    for (int k = 0; k < g_nspecial; k++) {
+        const char *s = g_sp_str ? g_sp_str[k] : NULL;
+        if (!s || !g_sp_id || g_sp_id[k] != token) continue;
+        if (!strcmp(s, "<|im_end|>") || !strcmp(s, "<|endoftext|>")) return 1;
+    }
+    return 0;
+}
+
+COLI_FFI_EXPORT int coli_qwen38_engine_open(ColiQwen38Engine **engine,
+                                            const ColiQwen38OpenOptions *options,
+                                            char *error, size_t error_size) {
+    if (!engine || !options || !options->model_dir || !options->model_dir[0]) {
+        coli_qwen38_set_err(error, error_size, "model_dir required");
+        return -1;
+    }
+    uint64_t disk = coli_qwen38_walk_disk(options->model_dir);
+    if (disk == 0) {
+        coli_qwen38_set_err(error, error_size, "no safetensors weights found");
+        return -1;
+    }
+    ColiQwen38Engine *e = (ColiQwen38Engine *)calloc(1, sizeof(*e));
+    if (!e) {
+        coli_qwen38_set_err(error, error_size, "OOM");
+        return -1;
+    }
+    if (snprintf(e->model_dir, sizeof(e->model_dir), "%s", options->model_dir) >=
+        (int)sizeof(e->model_dir)) {
+        free(e);
+        coli_qwen38_set_err(error, error_size, "model_dir too long");
+        return -1;
+    }
+    e->disk_bytes = disk;
+    /* Absent CLI arguments are cache/layer 1 and expert bits 8. */
+    int cap = options->cap == 0 ? 1 : options->cap;
+    int bits = options->bits == 0 ? 8 : options->bits;
+    setenv("COLI_NO_OMP_TUNE", "1", 0);
+    coli_omp_tune_threads("qwen38");
+    model_init(&e->m, e->model_dir, cap, bits);
+    e->alive = 1;
+    *engine = e;
+    return 0;
+}
+
+COLI_FFI_EXPORT void coli_qwen38_engine_destroy(ColiQwen38Engine *engine) {
+    if (!engine) return;
+    if (engine->tokenizer_loaded) free_tokenizer();
+    q38_model_free(&engine->m);
+    memset(engine, 0, sizeof(*engine));
+    free(engine);
+}
+
+COLI_FFI_EXPORT void coli_qwen38_engine_size(const ColiQwen38Engine *engine,
+                                             ColiModelSizeSummary *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->family, sizeof(out->family), "qwen38");
+    snprintf(out->engine_id, sizeof(out->engine_id), "qwen38");
+    if (!engine) return;
+    out->disk_bytes = engine->disk_bytes;
+}
+
+COLI_FFI_EXPORT int coli_qwen38_generate(ColiQwen38Engine *engine, const char *prompt,
+                                         size_t prompt_len,
+                                         const ColiQwen38GenerateOptions *options,
+                                         ColiTokenFn on_token, void *user_data,
+                                         char *error, size_t error_size) {
+    if (!engine || !engine->alive) {
+        coli_qwen38_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if (!prompt) {
+        coli_qwen38_set_err(error, error_size, "prompt required");
+        return -1;
+    }
+    int ngen = options && options->max_new_tokens > 0 ? options->max_new_tokens : 32;
+    char tp[4128];
+    int nw = snprintf(tp, sizeof(tp), "%s/tokenizer.json", engine->model_dir);
+    if (nw < 0 || nw >= (int)sizeof(tp) || load_tokenizer(tp) || !g_tok) {
+        engine->tokenizer_loaded = 0;
+        coli_qwen38_set_err(error, error_size, "tokenizer.json required");
+        return -1;
+    }
+    engine->tokenizer_loaded = 1;
+    if (prompt_len > (size_t)INT_MAX) {
+        coli_qwen38_set_err(error, error_size, "prompt too long");
+        return -1;
+    }
+    int *ids = NULL;
+    int np = 0;
+    encode_text_n(prompt, prompt_len, &ids, &np);
+    if (np < 1) {
+        free(ids);
+        coli_qwen38_set_err(error, error_size, "empty prompt after tokenize");
+        return -1;
+    }
+    Model *m = &engine->m;
+    for (int i = 0; i < np; i++) {
+        if (ids[i] < 0 || ids[i] >= m->c.vocab) {
+            free(ids);
+            coli_qwen38_set_err(error, error_size, "token id outside vocabulary");
+            return -1;
+        }
+    }
+    int limit = m->c.max_positions < QWEN38_ATTN_MAX_CTX ? m->c.max_positions
+                                                         : QWEN38_ATTN_MAX_CTX;
+    if (np > limit || ngen > limit - np) {
+        free(ids);
+        coli_qwen38_set_err(error, error_size, "prompt exceeds context");
+        return -1;
+    }
+    int max_t = np + ngen;
+    m->max_t = max_t;
+    reset_recurrent(m);
+    ensure_kv(m);
+    m->kv_len = 0;
+    float *lo = step(m, ids, np, 0);
+    if (!lo) {
+        free(ids);
+        coli_qwen38_set_err(error, error_size, "no logits after prefill");
+        return -1;
+    }
+    int ordinal = 0;
+    for (int s = 0; s < ngen; s++) {
+        int t = q38_argmax(lo, m->c.vocab);
+        float score = lo[t];
+        free(lo);
+        lo = NULL;
+        int is_eos = coli_qwen38_is_eos(m, t);
+        if (on_token && on_token(user_data, t, score, ordinal, ordinal)) break;
+        ordinal++;
+        if (is_eos) break;
+        if (np + ordinal >= max_t) break;
+        lo = step(m, &t, 1, np + ordinal - 1);
+        if (!lo) {
+            free(ids);
+            coli_qwen38_set_err(error, error_size, "no logits after step");
+            return -1;
+        }
+    }
+    if (lo) free(lo);
+    free(ids);
+    return 0;
+}
+
+/* Visual poll stub: empty success until Qwen3.8 telemetry fill lands. */
+COLI_FFI_EXPORT int coli_qwen38_visual_poll(ColiQwen38Engine *engine, uint32_t want,
+                                            ColiHwinfoSnap *hwinfo, ColiTiersSnap *tiers,
+                                            ColiExpertGridDims *emap_dims, uint8_t *emap_cells,
+                                            size_t emap_cells_cap, size_t *emap_cells_len,
+                                            ColiExpertGridDims *hits_dims, uint8_t *hits_bits,
+                                            size_t hits_bits_cap, size_t *hits_bits_len,
+                                            uint64_t *hits_seq, ColiProfSnap *prof,
+                                            char *error, size_t error_size) {
+    (void)emap_cells;
+    (void)emap_cells_cap;
+    (void)hits_bits;
+    (void)hits_bits_cap;
+    if (!engine || !engine->alive) {
+        coli_qwen38_set_err(error, error_size, "engine not open");
+        return -1;
+    }
+    if ((want & COLI_VISUAL_HWINFO) && hwinfo) memset(hwinfo, 0, sizeof(*hwinfo));
+    if ((want & COLI_VISUAL_TIERS) && tiers) memset(tiers, 0, sizeof(*tiers));
+    if (want & COLI_VISUAL_EMAP) {
+        if (emap_dims) {
+            emap_dims->rows = 0;
+            emap_dims->cols = 0;
+        }
+        if (emap_cells_len) *emap_cells_len = 0;
+    }
+    if (want & COLI_VISUAL_HITS) {
+        if (hits_dims) {
+            hits_dims->rows = 0;
+            hits_dims->cols = 0;
+        }
+        if (hits_bits_len) *hits_bits_len = 0;
+        if (hits_seq) *hits_seq = 0;
+    }
+    if ((want & COLI_VISUAL_PROF) && prof) {
+        memset(prof, 0, sizeof(*prof));
+        prof->valid = 0;
+    }
+    return 0;
+}
+#endif /* QWEN38_NO_MAIN */
