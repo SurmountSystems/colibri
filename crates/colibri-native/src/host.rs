@@ -29,8 +29,8 @@ use colibri_sys::{
     PlanOptions, ProbeOptions, ProfileTurn, ServerFrame, SupportedModel, TiersSnap, VisualSnapshot,
     default_model_store_path, ensure_model_directory, environment_for_plan, expand_user_path,
     force_process_from_env, format_engine_start_log, format_generate_log, locate_engine,
-    model_arch, plan_cannot_hold_one_expert_slot, ram_overcommit_from_env, render_chat, run_doctor,
-    set_current_thread_nice, supported_model_by_id, supported_models,
+    model_arch, ram_overcommit_from_env, render_chat, run_doctor, set_current_thread_nice,
+    supported_model_by_id, supported_models,
 };
 
 use crate::prefs;
@@ -409,6 +409,40 @@ fn record_ffi_open_attempt() {
     FFI_OPEN_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Bytes that must fit to start with dense weights and one expert slot.
+///
+/// Plan `runtime_bytes` includes `64 * typical_expert_bytes`, the full
+/// expert working-set slab. That slab is not one slot. The UMA warm-cache
+/// warning is also not this floor: the hot tier already spends the same RAM.
+pub fn one_expert_slot_start_bytes(
+    dense_bytes: u64,
+    runtime_bytes: u64,
+    typical_expert_bytes: u64,
+    per_cap_bytes: u64,
+) -> u64 {
+    let full_expert_cache = typical_expert_bytes.saturating_mul(64);
+    let runtime_without_full_cache = runtime_bytes.saturating_sub(full_expert_cache);
+    dense_bytes
+        .saturating_add(runtime_without_full_cache)
+        .saturating_add(per_cap_bytes)
+}
+
+/// Refuse Start only when one expert slot plus the dense working set does not
+/// fit in `available` bytes. Overcommit skips the check. The error names both
+/// byte counts. Does not open an engine.
+pub fn engine_start_ram_refusal(
+    required: u64,
+    available: u64,
+    overcommit: bool,
+) -> Result<(), String> {
+    if overcommit || required <= available {
+        return Ok(());
+    }
+    Err(format!(
+        "{ENGINE_START_RAM_TOO_SMALL} This start needs {required} bytes and {available} bytes are available."
+    ))
+}
+
 /// RAM vs one-slot floor. Doctor stays warn; Start is the gate.
 ///
 /// `available_memory` injects a fixture (tests). `None` probes the machine.
@@ -430,16 +464,13 @@ pub fn preflight_ram_for_engine_start(
         Err(_) => return Err(ENGINE_START_RAM_UNMEASURABLE.into()),
     };
     let available = available_memory.unwrap_or(plan.tiers.ram.available_bytes);
-    let floor = plan
-        .tiers
-        .ram
-        .dense_bytes
-        .saturating_add(plan.tiers.ram.runtime_bytes)
-        .saturating_add(plan.model.per_cap_bytes.max(1));
-    if plan_cannot_hold_one_expert_slot(&plan) || (available > 0 && floor > available) {
-        return Err(ENGINE_START_RAM_TOO_SMALL.into());
-    }
-    Ok(())
+    let required = one_expert_slot_start_bytes(
+        plan.tiers.ram.dense_bytes,
+        plan.tiers.ram.runtime_bytes,
+        plan.model.typical_expert_bytes,
+        plan.model.per_cap_bytes,
+    );
+    engine_start_ram_refusal(required, available, false)
 }
 
 /// Same order as Start: leaf check, then RAM gate. Does not open the engine.
@@ -3012,6 +3043,31 @@ pub fn catalog_is_installed<'a>(
     None
 }
 
+/// Folder the text engine should open for one catalog row.
+///
+/// `Ok` is the Present leaf [`catalog_is_installed`] already accepts.
+/// Does not launch an engine, open weights, or open a window.
+pub fn start_path_for_catalog(catalog_id: &str, entries: &[ModelEntry]) -> Result<PathBuf, String> {
+    let Some(model) = supported_model_by_id(catalog_id) else {
+        return Err(format!(
+            "Unknown catalog id {catalog_id}. This row cannot start."
+        ));
+    };
+    if !model.offers_text_load() {
+        return Err(format!(
+            "This row cannot start. {} is not a text model.",
+            model.display_name
+        ));
+    }
+    match catalog_is_installed(model, entries) {
+        Some(entry) => Ok(entry.path.clone()),
+        None => Err(format!(
+            "The model folder for {} is missing.",
+            model.display_name
+        )),
+    }
+}
+
 /// Paint roles for one supported-catalog row (pure; GPUI-free).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogRowStyle {
@@ -3739,7 +3795,8 @@ mod tests {
         let leaf = write_tiny_glm_leaf(dir.path());
         // Tiny available RAM: plan runtime reserve alone exceeds 64 MiB.
         let err = preflight_then_maybe_open(&leaf, Some(64 * 1024 * 1024), false).unwrap_err();
-        assert_eq!(err, ENGINE_START_RAM_TOO_SMALL);
+        assert!(err.starts_with(ENGINE_START_RAM_TOO_SMALL), "{err}");
+        assert!(err.contains("67108864 bytes are available"), "{err}");
         assert!(
             !err.contains("—") && !err.contains("--"),
             "plain English, no dash theater: {err}"
@@ -3756,7 +3813,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let leaf = write_tiny_glm_leaf(dir.path());
         let err = preflight_then_maybe_open(&leaf, Some(64 * 1024 * 1024), false).unwrap_err();
-        assert_eq!(err, ENGINE_START_RAM_TOO_SMALL);
+        assert!(err.starts_with(ENGINE_START_RAM_TOO_SMALL), "{err}");
+        assert!(err.contains("67108864 bytes are available"), "{err}");
+    }
+
+    #[test]
+    fn one_expert_slot_start_allows_glm_when_full_cache_would_refuse() {
+        // Header sums for GLM-5.2-colibri-int4-g64-with-int8-mtp, and
+        // MemAvailable 29253708 kB converted to bytes. runtime includes
+        // 64 * 21233664. The old floor is dense + that runtime + one slot.
+        let dense = 11_880_937_728u64;
+        let runtime = 6_274_254_080u64;
+        let typical = 21_233_664u64;
+        let per_cap = 1_630_314_496u64;
+        let required = one_expert_slot_start_bytes(dense, runtime, typical, per_cap);
+        assert_eq!(required, 18_426_551_808);
+        let old_floor = dense + runtime + per_cap;
+        assert_eq!(old_floor, 19_785_506_304);
+        let mem_available = 29_955_796_992u64;
+        assert!(
+            engine_start_ram_refusal(required, mem_available, false).is_ok(),
+            "one slot plus dense fits in MemAvailable"
+        );
+        assert!(required <= 19_000_000_000);
+        assert!(old_floor > 19_000_000_000);
+        assert!(
+            engine_start_ram_refusal(required, 19_000_000_000, false).is_ok(),
+            "a 64-expert slab must not refuse a slot that fits"
+        );
+    }
+
+    #[test]
+    fn one_expert_slot_start_refuses_with_required_and_available_bytes() {
+        let required = one_expert_slot_start_bytes(
+            40_000_000_000,
+            3_700_000_000 + 64 * 1_000_000,
+            1_000_000,
+            2_000_000_000,
+        );
+        assert_eq!(required, 45_700_000_000);
+        let err = engine_start_ram_refusal(required, 30_000_000_000, false).unwrap_err();
+        assert!(err.starts_with(ENGINE_START_RAM_TOO_SMALL), "{err}");
+        assert!(err.contains("45700000000"), "{err}");
+        assert!(err.contains("30000000000 bytes are available"), "{err}");
+        assert!(engine_start_ram_refusal(required, 30_000_000_000, true).is_ok());
     }
 
     #[test]
@@ -5512,6 +5612,89 @@ mod tests {
             ModelFamily::Olmoe,
         )];
         assert!(catalog_is_installed(m, &entries).is_none());
+    }
+
+    #[test]
+    fn start_path_for_catalog_returns_present_glm_leaf_not_store_root() {
+        let leaf = "/home/user/.local/share/colibri/models/GLM-5.2-colibri-int4-g64-with-int8-mtp";
+        let entries = [
+            test_entry(
+                "/home/user/.local/share/colibri/models",
+                ModelStatus::Present,
+                ModelFamily::Glm,
+            ),
+            test_entry(leaf, ModelStatus::Present, ModelFamily::Glm),
+        ];
+        let got = start_path_for_catalog("glm-5.2-colibri", &entries)
+            .expect("installed GLM text row opens the leaf, not the models root");
+        assert_eq!(got, PathBuf::from(leaf));
+    }
+
+    #[test]
+    fn start_path_for_catalog_returns_owner_double_underscore_leaf() {
+        let leaf = "/store/mastouri__GLM-5.2-colibri-int4-g64-with-int8-mtp";
+        let entries = [test_entry(leaf, ModelStatus::Present, ModelFamily::Glm)];
+        let got = start_path_for_catalog("glm-5.2-colibri", &entries).expect("owner__name leaf");
+        assert_eq!(got, PathBuf::from(leaf));
+    }
+
+    #[test]
+    fn start_path_for_catalog_unknown_row_cannot_start() {
+        let err = start_path_for_catalog("no-such-model", &[]).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("this row cannot start"),
+            "{err}"
+        );
+        assert!(err.contains("no-such-model"), "{err}");
+    }
+
+    #[test]
+    fn start_path_for_catalog_non_text_cannot_start_even_when_present() {
+        let entries = [
+            test_entry(
+                "/store/Qwen-Image-2.1",
+                ModelStatus::Present,
+                ModelFamily::Glm,
+            ),
+            test_entry(
+                "/store/qwen36-35b-a3b-colibri-i4-gs64",
+                ModelStatus::Present,
+                ModelFamily::Glm,
+            ),
+        ];
+        for id in [
+            "qwen-image-2.1-colibri",
+            "laya",
+            "gliner2.5-decide",
+            "qwen36-35b",
+        ] {
+            let err = start_path_for_catalog(id, &entries).unwrap_err();
+            assert!(
+                err.to_lowercase().contains("this row cannot start"),
+                "{id}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_path_for_catalog_missing_or_incomplete_says_model_folder() {
+        let incomplete = [test_entry(
+            "/store/GLM-5.2-colibri-int4-g64-with-int8-mtp",
+            ModelStatus::Incomplete,
+            ModelFamily::Glm,
+        )];
+        let missing = start_path_for_catalog("glm-5.2-colibri", &[]).unwrap_err();
+        assert!(missing.to_lowercase().contains("model folder"), "{missing}");
+        let not_ready = start_path_for_catalog("glm-5.2-colibri", &incomplete).unwrap_err();
+        assert!(
+            not_ready.to_lowercase().contains("model folder"),
+            "{not_ready}"
+        );
+        let convert_only = start_path_for_catalog("olmoe-colibri", &[]).unwrap_err();
+        assert!(
+            convert_only.to_lowercase().contains("model folder"),
+            "{convert_only}"
+        );
     }
 
     #[test]

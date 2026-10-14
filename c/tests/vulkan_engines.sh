@@ -615,7 +615,7 @@ EOF
 
   # olmoe: f32 residents (fmt 10), the oracle and the CPU's ids (the trunk on the
   # device, as above)
-  $PY tools/make_olmoe_tiny.py --output olmoe_tiny
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
   SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > cpu.log 2>&1
   COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > vk.log 2>&1
@@ -1389,7 +1389,7 @@ family_mimo_chain() {
   # the prefix-reuse contract and Brio photos (the rings restored into the device's
   # mirrors), compared bit for bit with a cold engine: the per-row GEMV and no tier, so
   # a resumed prompt's rows get the bits of the same rows computed cold
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 $PY -m unittest tests.test_mimo_prefix_serve
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 $PY -m unittest tests.test_mimo_prefix_serve
   # a serve session against the CPU's, frame for frame, in both modes and with the
   # device lost mid-session. The fixture's logits run to 300 (its head is scaled for wide
   # greedy margins), so its logprobs compare within 1e-3: about 3e-6 of the largest logit
@@ -2086,9 +2086,9 @@ family_inkling_olmoe_chain() {
   # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
   # experts between the device and the CPU alike. Use per-row attention on both:
   # a cold prefill and a short suffix must share a reduction order for exact bits.)
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 INKLING_TINY=tiny_inkling \
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 OLMOE_TINY=olmoe_tiny_c \
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 OLMOE_TINY=olmoe_tiny_c \
     $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
 }
 

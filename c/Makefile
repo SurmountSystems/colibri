@@ -2314,7 +2314,7 @@ fuzz-rans: tests/fuzz_rans.c rans.h
 	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
 	  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
 	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
-	./tests/fuzz_rans
+	. ./tools/asan-preload.sh && ./tests/fuzz_rans
 
 tests/test_int3$(EXE): tests/test_int3.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -3028,7 +3028,8 @@ ASAN_ENV     = ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN
 # target re-runs binaries built with the NORMAL flags and reports them clean.
 test-asan:
 	@$(MAKE) clean
-	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
+	@$(MAKE) $(TEST_BINS) EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
+	@. ./tools/asan-preload.sh && $(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
 	@echo "test-asan: suite clean under ASan + UBSan"
 
 # Local validation: one portable CPU build and dependency-free tests.

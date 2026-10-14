@@ -274,7 +274,7 @@ ptl_inkling() {
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_CHAIN_LAYERS=6
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
     $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_CHAIN_LAYERS=6 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=4 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 \
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=4 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 \
     INKLING_TINY=tiny_inkling $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
 
   # ---- nothing forced, everything fits: the full chain, as before
@@ -416,7 +416,7 @@ ptl_mimo_all() {
     $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_FAULT=30
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_TOL=1e-3 \
     $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_CHAIN_LAYERS=4 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=3 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 \
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=3 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 \
     $PY -m unittest tests.test_mimo_prefix_serve
 
   # ---- nothing forced, everything fits: the full chain, as before

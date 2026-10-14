@@ -1,4 +1,4 @@
-//! Native UI preferences: first-run gate, theme, locale, last model path.
+//! Native UI preferences: first-run gate, theme, locale, last model path, XDNA switch.
 //!
 //! Primary file is TOML at `~/.config/colibri/native-ui.toml` (XDG config home),
 //! or `%LOCALAPPDATA%\colibri\native-ui.toml` on Windows (same colibri folder
@@ -118,6 +118,8 @@ pub struct NativePrefs {
     pub locale: LocalePref,
     /// Optional absolute model path; empty means unset.
     pub last_model_path: String,
+    /// XDNA switch. Missing or absent on disk loads as false.
+    pub xdna: bool,
 }
 
 impl Default for NativePrefs {
@@ -128,6 +130,7 @@ impl Default for NativePrefs {
             theme: ThemePref::Doge,
             locale: LocalePref::En,
             last_model_path: String::new(),
+            xdna: false,
         }
     }
 }
@@ -141,6 +144,7 @@ struct RawNativePrefs {
     theme: Option<String>,
     locale: Option<String>,
     last_model_path: Option<String>,
+    xdna: Option<bool>,
 }
 
 impl From<RawNativePrefs> for NativePrefs {
@@ -159,6 +163,7 @@ impl From<RawNativePrefs> for NativePrefs {
                 .map(LocalePref::parse)
                 .unwrap_or_default(),
             last_model_path: raw.last_model_path.unwrap_or_default(),
+            xdna: raw.xdna.unwrap_or(false),
         }
     }
 }
@@ -339,6 +344,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xdna_true_round_trips_through_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PREFS_FILE_NAME);
+        let original = NativePrefs {
+            xdna: true,
+            ..NativePrefs::default()
+        };
+        original.save_to_path(&path).unwrap();
+        let loaded = load_from_path(&path);
+        assert!(loaded.xdna);
+    }
+
+    #[test]
+    fn toml_without_xdna_key_loads_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PREFS_FILE_NAME);
+        fs::write(
+            &path,
+            "version = 1\nfirst_run_done = true\ntheme = \"doge\"\nlocale = \"en\"\nlast_model_path = \"\"\n",
+        )
+        .unwrap();
+        let prefs = load_from_path(&path);
+        assert!(!prefs.xdna);
+    }
+
+    #[test]
     fn defaults_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no-such-native-ui.toml");
@@ -370,6 +401,7 @@ mod tests {
             theme: ThemePref::Mint,
             locale: LocalePref::It,
             last_model_path: "/models/demo".into(),
+            xdna: false,
         };
         original.save_to_path(&path).unwrap();
         assert!(path.is_file());

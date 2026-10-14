@@ -197,3 +197,36 @@ c/mimo_tiny/image.json
 c/mimo_tiny/patches.f32
 c/mimo
 c/mimo.exe
+
+# Vulkan model checks (c/tests/vulkan_engines.sh, c/tests/vulkan_partial_*.sh,
+# c/tests/vulkan_layers_dev2.sh) leave float dumps, token dumps, stderr,
+# COLI_USAGE captures, and scratch text directly in c/. c/*.txt matches
+# only that directory, not c/tests or c/tools.
+c/*.f32
+c/*.tok
+c/*.err
+c/*.usage
+c/*.hist
+c/*.txt
+c/*.png
+c/vk_test
+
+# Tiny fixtures those checks write with tools/make_*_tiny.py and
+# tools/convert_*.py. c/qwen36_tiny_bad/ is a committed fixture; only
+# the converted child is generated.
+c/qwenimage_tiny/
+c/qwenimage_vae_tiny/
+c/qwen36_tiny64/
+c/qwen36_tiny64_*/
+c/qwen36_tiny_i4r/
+c/qwen36_tiny_c4/
+c/qwen36_tiny_bad/qwen36_tiny_c/
+c/qwen3_coder_tiny/
+c/qwen3_coder_tiny_c/
+c/olmoe_tiny/
+c/olmoe_tiny_c/
+c/dsv41_long/
+c/dsv41_split_meta/
+c/qwen38_27b_*/
+c/qwen38_tiny_bad/
+c/tiny_inkling_*/

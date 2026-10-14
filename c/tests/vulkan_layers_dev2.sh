@@ -155,7 +155,7 @@ ld2_qwen38() {
 }
 
 ld2_olmoe() {
-  [ -d olmoe_tiny_c ] || { $PY tools/make_olmoe_tiny.py --output olmoe_tiny; $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c; }
+  [ -d olmoe_tiny_c ] || { $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force; $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c; }
   [ -f olmoe_tiny/ref_olmoe_long.json ] || kv_olmoe_fixtures
   local OR=olmoe_tiny/ref_olmoe.json T=SNAP=olmoe_tiny_c cap
   ld2_gate olmoe "ld2 olmoe 2 + 2, the head on the second device" 2 2 $T -- 8 8 $OR

@@ -306,6 +306,7 @@ pub fn shell_prefs_snapshot(
         theme,
         locale,
         last_model_path: last_model_path.into(),
+        xdna: false,
     }
 }
 
@@ -545,6 +546,7 @@ mod tests {
             theme: ThemePref::Doge,
             locale: LocalePref::En,
             last_model_path: String::new(),
+            xdna: false,
         };
         initial.save_to_path(&path).unwrap();
 

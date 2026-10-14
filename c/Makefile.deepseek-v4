@@ -329,16 +329,18 @@ deepseek-v4-objs: $(V4_OBJS)
 print-v4-objs:
 	@echo $(V4_OBJS)
 
-# CLI main calls coli_xdna_engine_qualified_submit. Same archive as the parent
-# Makefile: the member is the real function, pulled only for that symbol.
-libbackend_xdna.a: backend_xdna.o
+# CLI main calls coli_xdna_engine_qualified_submit. The parent Makefile and
+# test-asan also write backend_xdna.o, so a timestamp cannot tell an ASan
+# member from this engine's (#1702). Compile a private member. Do not replace
+# the parent's libbackend_xdna.a.
+libbackend_xdna.v4.a: backend_xdna.v4.o
 	$(RM) $@
-	$(AR) rcs $@ backend_xdna.o
-backend_xdna.o: backend_xdna.c
+	$(AR) rcs $@ backend_xdna.v4.o
+backend_xdna.v4.o: backend_xdna.c $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
 
-$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV) libbackend_xdna.a
-	$(CC) $(V4_OBJS) libbackend_xdna.a -o $@ $(LDFLAGS)
+$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV) libbackend_xdna.v4.a
+	$(CC) $(V4_OBJS) libbackend_xdna.v4.a -o $@ $(LDFLAGS)
 
 # VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
 backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
@@ -454,4 +456,5 @@ deepseek-v4-clean:
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o \
+		backend_xdna.v4.o libbackend_xdna.v4.a \
 		$(LIB_OBJS) $(LIB_REGISTRY_OBJ) $(LIB_V4_NAME)

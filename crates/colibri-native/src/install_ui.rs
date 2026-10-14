@@ -261,6 +261,42 @@ pub fn clear_checkpoint_default() -> std::io::Result<()> {
     clear_checkpoint(&default_checkpoint_path())
 }
 
+/// What the Supported models screen should offer for the selected row.
+///
+/// `installed` is a Present registry match. `installable` means a Hugging
+/// Face snapshot can fill the download form. Installed wins, so a Present
+/// text model starts the engine instead of downloading again. Both false
+/// matches rows this window cannot start (no snapshot, no install fields).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogNextStep {
+    Install,
+    StartEngine,
+    Unavailable,
+}
+
+/// Installed beats installable. Both false is [`CatalogNextStep::Unavailable`].
+pub fn catalog_next_step(installed: bool, installable: bool) -> CatalogNextStep {
+    if installed {
+        CatalogNextStep::StartEngine
+    } else if installable {
+        CatalogNextStep::Install
+    } else {
+        CatalogNextStep::Unavailable
+    }
+}
+
+/// Existing i18n key for that step. Does not add keys.
+///
+/// Unavailable reuses `catalog.supportedHelp`. Unstartable rows already
+/// say they are not started from this window; there is no separate key.
+pub fn catalog_next_step_key(step: CatalogNextStep) -> &'static str {
+    match step {
+        CatalogNextStep::Install => "rail.installBtn",
+        CatalogNextStep::StartEngine => "rail.startEngine",
+        CatalogNextStep::Unavailable => "catalog.supportedHelp",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +523,25 @@ mod tests {
         let cp = default_checkpoint_path();
         assert_eq!(prefs.parent(), cp.parent());
         assert!(cp.ends_with(CHECKPOINT_FILE_NAME), "{}", cp.display());
+    }
+
+    /// Installed text row starts the engine. A missing snapshot that this
+    /// window can download offers Install. A row with no snapshot and no
+    /// Present leaf (host `catalog_selection_unstartable_does_not_fill_install`)
+    /// stays Unavailable and reuses `catalog.supportedHelp`.
+    #[test]
+    fn catalog_next_step_installed_starts_else_install_or_unavailable() {
+        let start = catalog_next_step(true, true);
+        assert_eq!(start, CatalogNextStep::StartEngine);
+        assert_eq!(catalog_next_step_key(start), "rail.startEngine");
+        assert_eq!(catalog_next_step(true, false), CatalogNextStep::StartEngine);
+
+        let install = catalog_next_step(false, true);
+        assert_eq!(install, CatalogNextStep::Install);
+        assert_eq!(catalog_next_step_key(install), "rail.installBtn");
+
+        let unavailable = catalog_next_step(false, false);
+        assert_eq!(unavailable, CatalogNextStep::Unavailable);
+        assert_eq!(catalog_next_step_key(unavailable), "catalog.supportedHelp");
     }
 }

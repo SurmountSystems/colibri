@@ -5,6 +5,7 @@
 //! Engine path stays colibri-sys in-process (no REST). Image chat uses `qwenimage`, not that path.
 
 mod atlas;
+mod cortex_view;
 mod host;
 mod i18n;
 mod image_chat;
@@ -20,6 +21,8 @@ mod stderr_tee;
 mod text_input;
 mod theme;
 mod wizard;
+mod xdna_memory;
+mod xdna_row;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +38,10 @@ use gpui::{
 };
 
 use crate::atlas::{ExpertAtlas, format_brain_tooltip, load_experts_atlas};
+use crate::cortex_view::{
+    CORTEX_VIEW_H, CORTEX_VIEW_W, CortexCamera, cortex_apply_drag, cortex_apply_key,
+    cortex_apply_zoom, project_cells,
+};
 use crate::host::{
     BrainView, EngineSession, GenEvent, LiveHwinfoIdle, LiveTiersIdle, MissingPathScanOutcome,
     StartEngineBlock, StartEngineSource, apply_brain_pulse_decay, brain_cell_rgb,
@@ -60,11 +67,11 @@ use crate::host::{
 use crate::i18n::{Locale, t, t_fmt};
 #[cfg(feature = "install")]
 use crate::install_ui::{
-    InstallCheckpoint, InstallUiAction, InstallUiPhase, cancelling_status_line,
-    clear_checkpoint_default, exclusive_status_for_phase, is_busy as install_is_busy,
-    load_checkpoint_default, paused_status_line, pausing_status_line, save_checkpoint_default,
-    show_active_progress_line, show_cancel_active, show_pause, show_resume,
-    transition as install_ui_transition, transition_job_paused,
+    CatalogNextStep, InstallCheckpoint, InstallUiAction, InstallUiPhase, cancelling_status_line,
+    catalog_next_step, catalog_next_step_key, clear_checkpoint_default, exclusive_status_for_phase,
+    is_busy as install_is_busy, load_checkpoint_default, paused_status_line, pausing_status_line,
+    save_checkpoint_default, show_active_progress_line, show_cancel_active, show_pause,
+    show_resume, transition as install_ui_transition, transition_job_paused,
 };
 #[cfg(feature = "install")]
 use crate::notify_os::notify_install_complete;
@@ -90,6 +97,8 @@ use crate::wizard::{
     readiness_clock_now, readiness_running_status, shell_prefs_snapshot,
     wizard_complete_success_status, wizard_may_set_success_status,
 };
+use crate::xdna_memory::xdna_memory_sentence;
+use crate::xdna_row::xdna_row_note;
 #[cfg(feature = "install")]
 use colibri_sys::install::{InstallCancel, InstallLiveProgress};
 use colibri_sys::{ModelEntry, ProfileTurn, TiersSnap};
@@ -276,6 +285,14 @@ struct DesktopApp {
     brain_full: bool,
     /// Hover tip text under the grid (empty when not hovering).
     brain_tip: SharedString,
+    /// Orbit camera for the Brain cortex scene.
+    cortex_camera: CortexCamera,
+    /// Last pointer position while dragging the cortex scene.
+    cortex_drag_last: Option<(f32, f32)>,
+    /// Focus target so Brain page keys reach the cortex camera.
+    brain_focus: gpui::FocusHandle,
+    /// Config part of the Setup surface draws a primary border when true.
+    setup_config_focused: bool,
 }
 
 impl DesktopApp {
@@ -418,7 +435,7 @@ impl DesktopApp {
             cache_slot: 0,
             kv_slots: 1,
             enable_thinking: false,
-            xdna: false,
+            xdna: prefs.xdna,
             image_mode: false,
             image_model_dir: String::new(),
             image_width,
@@ -501,6 +518,10 @@ impl DesktopApp {
             experts_atlas: load_experts_atlas(),
             brain_full: env_brain_full(),
             brain_tip: SharedString::default(),
+            cortex_camera: CortexCamera::default(),
+            cortex_drag_last: None,
+            brain_focus: cx.focus_handle(),
+            setup_config_focused: false,
         }
     }
 
@@ -543,6 +564,10 @@ impl DesktopApp {
     }
 
     fn set_view(&mut self, view: MainView, cx: &mut Context<Self>) {
+        if view == MainView::Tools {
+            self.open_setup_surface(self.setup_config_focused, cx);
+            return;
+        }
         self.active_view = view;
         cx.notify();
     }
@@ -582,12 +607,14 @@ impl DesktopApp {
 
     fn persist_prefs(&self, cx: &App) {
         let path = self.model_input.read(cx).text().trim().to_string();
-        let snap = shell_prefs_snapshot(
+        let mut snap = shell_prefs_snapshot(
             self.first_run_done,
             self.theme_id.to_pref(),
             self.locale_pref(),
             path,
         );
+        // shell_prefs_snapshot hardcodes xdna false. Keep the live switch.
+        snap.xdna = self.xdna;
         if let Err(e) = snap.save() {
             // Surface via status on next notify caller; avoid panic on prefs I/O.
             let _ = e;
@@ -598,12 +625,14 @@ impl DesktopApp {
     /// On failure sets status to the save-error message (do not overwrite).
     fn persist_prefs_status(&mut self, cx: &mut Context<Self>) -> bool {
         let path = self.model_input.read(cx).text().trim().to_string();
-        let snap = shell_prefs_snapshot(
+        let mut snap = shell_prefs_snapshot(
             self.first_run_done,
             self.theme_id.to_pref(),
             self.locale_pref(),
             path,
         );
+        // shell_prefs_snapshot hardcodes xdna false. Keep the live switch.
+        snap.xdna = self.xdna;
         match snap.save() {
             Ok(()) => true,
             Err(e) => {
@@ -652,6 +681,8 @@ impl DesktopApp {
             self.locale_pref(),
             path,
         );
+        // Same snapshot default. A theme save must not clear the XDNA switch.
+        snap.xdna = self.xdna;
         apply_theme(&mut snap, id.to_pref());
         match snap.save() {
             Ok(()) => {
@@ -673,6 +704,15 @@ impl DesktopApp {
 
     fn open_setup_wizard(&mut self, cx: &mut Context<Self>) {
         self.wizard = WizardState::open_at_start();
+        self.status = self.tr("setup.open").into();
+        cx.notify();
+    }
+
+    /// Setup and Tools are one surface. Does not mark first run finished.
+    fn open_setup_surface(&mut self, focus_config: bool, cx: &mut Context<Self>) {
+        self.wizard.open = false;
+        self.active_view = MainView::Tools;
+        self.setup_config_focused = focus_config;
         self.status = self.tr("setup.open").into();
         cx.notify();
     }
@@ -710,6 +750,7 @@ impl DesktopApp {
             theme: self.theme_id.to_pref(),
             locale: self.locale_pref(),
             last_model_path: self.model_input.read(cx).text().trim().to_string(),
+            xdna: self.xdna,
         };
         complete_wizard(&mut prefs, &mut self.wizard);
         self.first_run_done = prefs.first_run_done;
@@ -727,6 +768,7 @@ impl DesktopApp {
             theme: self.theme_id.to_pref(),
             locale: self.locale_pref(),
             last_model_path: self.model_input.read(cx).text().trim().to_string(),
+            xdna: self.xdna,
         };
         complete_wizard(&mut prefs, &mut self.wizard);
         self.first_run_done = prefs.first_run_done;
@@ -1269,6 +1311,7 @@ impl DesktopApp {
 
     fn toggle_xdna(&mut self, cx: &mut Context<Self>) {
         self.xdna = !self.xdna;
+        self.persist_prefs(cx);
         self.status = if self.xdna {
             "XDNA requested for the next engine start. Experimental. Output may diverge.".into()
         } else {
@@ -1302,17 +1345,33 @@ impl DesktopApp {
             )
             .child(
                 div()
-                    .id("tools-btn-xdna")
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(if on { p.primary } else { p.chip }))
-                    .text_xs()
-                    .text_color(rgb(if on { p.primary_fg } else { p.text }))
-                    .cursor_pointer()
-                    .child(if on { "On" } else { "Off" })
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.toggle_xdna(cx)),
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("tools-btn-xdna")
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(if on { p.primary } else { p.chip }))
+                            .text_xs()
+                            .text_color(rgb(if on { p.primary_fg } else { p.text }))
+                            .cursor_pointer()
+                            .child(if on { "On" } else { "Off" })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.toggle_xdna(cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(xdna_memory_sentence(on, None)),
                     ),
             )
     }
@@ -2159,7 +2218,16 @@ impl DesktopApp {
                             .text_xs()
                             .text_color(rgb(style.fg))
                             .cursor_pointer()
-                            .child(div().min_w_0().flex_1().overflow_hidden().child(label));
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .flex()
+                                    .flex_col()
+                                    .child(label)
+                                    .child(div().text_xs().child(xdna_row_note(id))),
+                            );
                         if style.show_installed {
                             row = row.child(
                                 div()
@@ -2796,7 +2864,12 @@ impl DesktopApp {
             .child(label)
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.set_view(view, cx)),
+                cx.listener(move |this, _, window, cx| {
+                    this.set_view(view, cx);
+                    if view == MainView::Brain {
+                        window.focus(&this.brain_focus);
+                    }
+                }),
             )
     }
 
@@ -2833,69 +2906,78 @@ impl DesktopApp {
             };
             format!("{} · {} · {}", self.brain.note, sample_bit, atlas_status)
         };
-        let cell_px = if self.brain.disp_cols > 128 {
-            2.0_f32
-        } else if self.brain.disp_cols > 64 {
-            3.0
-        } else if self.brain.disp_cols > 32 {
-            4.0
-        } else {
-            6.0
-        };
         let cols = self.brain.disp_cols.max(1) as usize;
         let row_stride = self.brain.row_stride.max(1);
         let col_stride = self.brain.col_stride.max(1);
         let src_rows = self.brain.src_rows;
         let atlas = self.experts_atlas.clone();
-        let cells = &self.brain.cells;
-        // Build rows with for-loops so each `cx.listener` borrows sequentially.
-        let mut row_els: Vec<AnyElement> = Vec::new();
-        let n_rows = if cols == 0 {
-            0
-        } else {
-            cells.len().div_ceil(cols)
-        };
-        for ri in 0..n_rows {
-            let start = ri * cols;
-            let end = (start + cols).min(cells.len());
-            let mut cell_els: Vec<AnyElement> = Vec::new();
-            for (ci, (tier, heat, pulse)) in cells[start..end].iter().enumerate() {
-                let color = brain_cell_rgb(self.theme_id, *tier, *heat, *pulse);
-                let tier_c = *tier;
-                let heat_c = *heat;
-                let atlas_cell = atlas.clone();
-                let (src_r, src_c) =
-                    display_to_source(ri as u32, ci as u32, row_stride, col_stride);
-                cell_els.push(
-                    div()
-                        .id(SharedString::from(format!("bc-{ri}-{ci}")))
-                        .w(px(cell_px))
-                        .h(px(cell_px))
-                        .bg(rgb(color))
-                        .on_hover(cx.listener(move |this, hovered, _, cx| {
-                            if *hovered {
-                                let tip = format_brain_tooltip(
-                                    src_r,
-                                    src_c,
-                                    src_rows,
-                                    tier_c,
-                                    heat_c,
-                                    &atlas_cell,
-                                );
-                                this.set_brain_tip(tip.into(), cx);
-                            } else {
-                                this.clear_brain_tip(cx);
-                            }
-                        }))
-                        .into_any_element(),
-                );
+        let theme_id = self.theme_id;
+        // Display row is layer, display column is expert. Orbit math stays in cortex_view.
+        let (triples, tips) = {
+            let cells = &self.brain.cells;
+            let n_rows = if cols == 0 {
+                0
+            } else {
+                cells.len().div_ceil(cols)
+            };
+            let mut triples: Vec<(u16, u16, u32)> = Vec::new();
+            let mut tips: Vec<(u8, u8, u32, u32)> = Vec::new();
+            for ri in 0..n_rows {
+                let start = ri * cols;
+                let end = (start + cols).min(cells.len());
+                for (ci, (tier, heat, pulse)) in cells[start..end].iter().enumerate() {
+                    let color = brain_cell_rgb(theme_id, *tier, *heat, *pulse);
+                    let (src_r, src_c) =
+                        display_to_source(ri as u32, ci as u32, row_stride, col_stride);
+                    let layer = u16::try_from(ri).unwrap_or(u16::MAX);
+                    let expert = u16::try_from(ci).unwrap_or(u16::MAX);
+                    triples.push((layer, expert, color));
+                    tips.push((*tier, *heat, src_r, src_c));
+                }
             }
-            row_els.push(
+            (triples, tips)
+        };
+        let projected = project_cells(&self.cortex_camera, &triples);
+        let mut cell_els: Vec<AnyElement> = Vec::new();
+        let mut pi = 0;
+        for (i, triple) in triples.iter().enumerate() {
+            if pi >= projected.len() {
+                break;
+            }
+            let cell = projected[pi];
+            if cell.layer != triple.0 || cell.expert != triple.1 {
+                continue;
+            }
+            pi += 1;
+            let (tier_c, heat_c, src_r, src_c) = tips[i];
+            let atlas_cell = atlas.clone();
+            cell_els.push(
                 div()
-                    .id(SharedString::from(format!("brain-row-{ri}")))
-                    .flex()
-                    .flex_row()
-                    .children(cell_els)
+                    .id(SharedString::from(format!(
+                        "bc-{}-{}",
+                        cell.layer, cell.expert
+                    )))
+                    .absolute()
+                    .left(px(cell.x - 4.0))
+                    .top(px(cell.y - 4.0))
+                    .w(px(8.))
+                    .h(px(8.))
+                    .bg(rgb(cell.rgb))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        if *hovered {
+                            let tip = format_brain_tooltip(
+                                src_r,
+                                src_c,
+                                src_rows,
+                                tier_c,
+                                heat_c,
+                                &atlas_cell,
+                            );
+                            this.set_brain_tip(tip.into(), cx);
+                        } else {
+                            this.clear_brain_tip(cx);
+                        }
+                    }))
                     .into_any_element(),
             );
         }
@@ -2910,6 +2992,57 @@ impl DesktopApp {
 
         div()
             .id("brain-page")
+            .track_focus(&self.brain_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, _cx| {
+                    window.focus(&this.brain_focus);
+                    this.cortex_drag_last =
+                        Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| {
+                if !ev.dragging() {
+                    this.cortex_drag_last = None;
+                    return;
+                }
+                let x = f32::from(ev.position.x);
+                let y = f32::from(ev.position.y);
+                if let Some((px0, py0)) = this.cortex_drag_last {
+                    let dx = x - px0;
+                    let dy = y - py0;
+                    if dx != 0.0 || dy != 0.0 {
+                        this.cortex_camera = cortex_apply_drag(this.cortex_camera, dx, dy);
+                        cx.notify();
+                    }
+                }
+                this.cortex_drag_last = Some((x, y));
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _cx| {
+                    this.cortex_drag_last = None;
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                let dy = f32::from(ev.delta.pixel_delta(px(16.)).y);
+                if dy != 0.0 {
+                    this.cortex_camera = cortex_apply_zoom(this.cortex_camera, dy / 80.0);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if let Some(name) = cortex_key_token(&ev.keystroke) {
+                    this.cortex_camera = match name {
+                        "+" => cortex_apply_zoom(this.cortex_camera, -0.15),
+                        "-" => cortex_apply_zoom(this.cortex_camera, 0.15),
+                        other => cortex_apply_key(this.cortex_camera, other),
+                    };
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .flex()
             .flex_col()
             .flex_1()
@@ -2967,18 +3100,23 @@ impl DesktopApp {
             .child(div().text_xs().text_color(rgb(p.muted)).child(note))
             .child(
                 div()
-                    .id("brain-grid")
+                    .id("brain-grid-scroll")
                     .flex_1()
                     .min_h(px(280.))
                     .max_h(px(grid_max_h))
                     .overflow_scroll()
-                    .p_2()
-                    .border_1()
-                    .border_color(rgb(p.border))
-                    .bg(rgb(p.bg))
-                    .flex()
-                    .flex_col()
-                    .children(row_els),
+                    .child(
+                        div()
+                            .id("brain-grid")
+                            .relative()
+                            .w(px(CORTEX_VIEW_W))
+                            .h(px(CORTEX_VIEW_H))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .bg(rgb(p.bg))
+                            .children(cell_els),
+                    ),
             )
             .when(!tip.is_empty(), |col| {
                 col.child(
@@ -3274,10 +3412,11 @@ impl DesktopApp {
             .into_any_element()
     }
 
-    /// Slim rail: temperature + max tokens only.
+    /// Slim rail: sampling fields, unless the Setup surface is showing them.
     fn rail_inference_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette();
-        div()
+        let on_setup = inference_inputs_on_setup(self.wizard.open, self.active_view);
+        let mut col = div()
             .flex()
             .flex_col()
             .gap(px(RAIL_CARD_GAP))
@@ -3290,21 +3429,32 @@ impl DesktopApp {
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(self.tr("rail.inference")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(p.muted))
-                    .child(self.tr("sidebar.temperature")),
-            )
-            .child(self.temperature_input.clone())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(p.muted))
-                    .child(self.tr("sidebar.maxTokens")),
-            )
-            .child(self.max_tokens_input.clone())
+            );
+        if !on_setup {
+            col = col
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(self.tr("sidebar.temperature")),
+                )
+                .child(self.temperature_input.clone())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(self.tr("sidebar.maxTokens")),
+                )
+                .child(self.max_tokens_input.clone())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(self.tr("sidebar.grammar")),
+                )
+                .child(self.grammar_input.clone());
+        }
+        col
     }
 
     /// Tools: reasoning, session slots, optional grammar.
@@ -3409,13 +3559,18 @@ impl DesktopApp {
                         .child(self.tr("sidebar.sessionHelp")),
                 )
             })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(p.muted))
-                    .child(self.tr("sidebar.grammar")),
+            .when(
+                inference_inputs_on_setup(self.wizard.open, self.active_view),
+                |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(self.tr("sidebar.grammar")),
+                    )
+                    .child(self.grammar_input.clone())
+                },
             )
-            .child(self.grammar_input.clone())
     }
 
     fn theme_picker_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3638,9 +3793,13 @@ impl DesktopApp {
                     )
             })
             .child(self.rail_inference_panel(cx))
-            // Status + first-run Setup slab (hidden after Finish/Skip)
+            // Setup stays on the rail. Primary fill is first-run only.
             .child({
                 let setup_fill = rail_setup_primary_fill(&p, self.first_run_done);
+                let (fill, fg) = match setup_fill {
+                    Some(fill) => (fill, p.primary_fg),
+                    None => (p.secondary, p.text),
+                };
                 div()
                     .mt_auto()
                     .flex()
@@ -3649,24 +3808,22 @@ impl DesktopApp {
                     .pt(px(RAIL_CARD_PAD))
                     .border_t_1()
                     .border_color(rgb(p.border))
-                    .when_some(setup_fill, |col, fill| {
-                        col.child(
-                            div()
-                                .id("btn-setup")
-                                .px(px(BTN_PAD_X + 4.0))
-                                .py(px(BTN_PAD_Y + 2.0))
-                                .bg(rgb(fill))
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.primary_fg))
-                                .cursor_pointer()
-                                .child(self.tr("rail.setup"))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.open_setup_wizard(cx)),
-                                ),
-                        )
-                    })
+                    .child(
+                        div()
+                            .id("btn-setup")
+                            .px(px(BTN_PAD_X + 4.0))
+                            .py(px(BTN_PAD_Y + 2.0))
+                            .bg(rgb(fill))
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(fg))
+                            .cursor_pointer()
+                            .child(self.tr("rail.setup"))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.open_setup_surface(false, cx)),
+                            ),
+                    )
                     .child(div().text_xs().text_color(rgb(p.label)).child(format!(
                         "{} · {}",
                         self.tr("brand.native"),
@@ -3840,21 +3997,29 @@ impl DesktopApp {
             )
     }
 
+    /// Tools control. Loops [`tools_control_section_ids`] (empty: no settings).
+    fn tools_control_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut sections: Vec<AnyElement> = Vec::new();
+        for id in tools_control_section_ids() {
+            sections.push(self.paint_setup_section(id, cx));
+        }
+        div().id("tools-control").children(sections)
+    }
+
+    /// Setup surface. Tools opens this same screen. Loops [`setup_surface_section_ids`].
     fn tools_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette();
-        let details_label = if self.machine_expanded {
-            self.tr("rail.hideDetails")
-        } else {
-            self.tr("rail.details")
-        };
+        let mut sections: Vec<AnyElement> = Vec::new();
+        for id in setup_surface_section_ids() {
+            sections.push(self.paint_setup_section(id, cx));
+        }
         let about_label = if self.show_about {
             self.tr("rail.hideAbout")
         } else {
             self.tr("rail.about")
         };
-
         div()
-            .id("tools-view")
+            .id("setup-surface")
             .flex()
             .flex_col()
             .flex_1()
@@ -3864,316 +4029,529 @@ impl DesktopApp {
             .overflow_scroll()
             .child(
                 div()
+                    .text_xl()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(self.tr("rail.setup")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(self.tr("setup.reopen")),
+            )
+            .child(
+                div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(self.tr("tools.title")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(self.tr("tools.subtitle")),
+                    .flex_row()
+                    .gap_2()
+                    .child(self.setup_part_button(
+                        "btn-setup-models",
+                        self.tr("setup.models"),
+                        !self.setup_config_focused,
+                        false,
+                        cx,
+                    ))
+                    .child(self.setup_part_button(
+                        "btn-setup-config",
+                        self.tr("setup.config"),
+                        self.setup_config_focused,
+                        true,
+                        cx,
+                    )),
+            )
+            .children(sections)
+            .child(
+                div()
+                    .id("tools-btn-about")
+                    .text_sm()
+                    .text_color(rgb(p.primary))
+                    .cursor_pointer()
+                    .child(about_label)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.toggle_about(cx)),
                     ),
             )
-            .child(Self::panel(
-                &p,
-                self.tr("tools.machine"),
-                self.machine_text.clone(),
+    }
+
+    fn setup_part_button(
+        &self,
+        id: &'static str,
+        label: String,
+        on: bool,
+        focus_config: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let p = self.palette();
+        div()
+            .id(id)
+            .px_3()
+            .py_1()
+            .bg(rgb(if on { p.primary } else { p.chip }))
+            .text_sm()
+            .text_color(rgb(if on { p.primary_fg } else { p.text }))
+            .cursor_pointer()
+            .child(label)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.setup_config_focused = focus_config;
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// One Setup section. Banned ids paint only when a list names them.
+    fn paint_setup_section(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        match id {
+            "models" => self.setup_models_section(cx),
+            "config" => self.setup_config_section(cx),
+            "machine" => self.setup_machine_section(cx),
+            "plan" => self.setup_plan_section(cx),
+            "model-path" => self.setup_model_folder_block(cx).into_any_element(),
+            "runtime" => self.setup_runtime_block().into_any_element(),
+            "xdna" => self.xdna_panel(cx).into_any_element(),
+            "language" => self.setup_language_row(cx).into_any_element(),
+            "theme" => self.theme_picker_row(cx).into_any_element(),
+            "log" => self.setup_log_row().into_any_element(),
+            _ => div().into_any_element(),
+        }
+    }
+
+    fn setup_models_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .id("setup-section-models")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(self.supported_catalog_panel(cx, "setup"));
+        #[cfg(feature = "install")]
+        {
+            col = col
+                .child(self.catalog_next_control(cx))
+                .child(self.install_form_panel(cx, "setup"));
+        }
+        col.into_any_element()
+    }
+
+    #[cfg(feature = "install")]
+    fn catalog_next_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        let Some(catalog_id) = self.selected_catalog_id.clone() else {
+            return div().id("catalog-next-none").into_any_element();
+        };
+        let id = catalog_id.to_string();
+        let installed = list_supported_models()
+            .iter()
+            .find(|model| model.id == id)
+            .and_then(|model| catalog_is_installed(model, &self.registry_entries))
+            .is_some();
+        let installable = catalog_selection_by_id(&id).is_some_and(|sel| sel.installable);
+        let step = catalog_next_step(installed, installable);
+        let key = catalog_next_step_key(step);
+        let owned = id.clone();
+        let fill = if matches!(step, CatalogNextStep::Unavailable) {
+            p.chip
+        } else {
+            p.primary
+        };
+        let fg = if matches!(step, CatalogNextStep::Unavailable) {
+            p.text
+        } else {
+            p.primary_fg
+        };
+        div()
+            .id("catalog-next-step")
+            .px_2()
+            .py_1()
+            .bg(rgb(fill))
+            .text_xs()
+            .text_color(rgb(fg))
+            .cursor_pointer()
+            .child(self.tr(key))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.activate_catalog_next(step, &owned, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    #[cfg(feature = "install")]
+    fn activate_catalog_next(
+        &mut self,
+        step: CatalogNextStep,
+        catalog_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match step {
+            CatalogNextStep::Install => {
+                self.select_supported_model(catalog_id, cx);
+                self.start_install(cx);
+            }
+            CatalogNextStep::StartEngine => {
+                match crate::host::start_path_for_catalog(catalog_id, &self.registry_entries) {
+                    Ok(path) => {
+                        let text = path.display().to_string();
+                        self.model_input
+                            .update(cx, |input, cx| input.set_text(text, cx));
+                        self.start_engine_from(StartEngineSource::Rail, cx);
+                    }
+                    Err(msg) => {
+                        self.status = msg.into();
+                        cx.notify();
+                    }
+                }
+            }
+            CatalogNextStep::Unavailable => {}
+        }
+    }
+
+    fn setup_config_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        let border = if self.setup_config_focused {
+            p.primary
+        } else {
+            p.border
+        };
+        div()
+            .id("setup-section-config")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .bg(rgb(p.bg))
+            .border_1()
+            .border_color(rgb(border))
+            .child(self.setup_model_folder_block(cx))
+            .child(self.setup_runtime_block())
+            .child(self.setup_sampling_block())
+            .child(self.tools_advanced_panel(cx))
+            .child(self.setup_language_row(cx))
+            .child(self.theme_picker_row(cx))
+            .child(self.setup_log_row())
+            .child(self.setup_doctor_block(cx))
+            .child(self.xdna_panel(cx))
+            .into_any_element()
+    }
+
+    fn setup_model_folder_block(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette();
+        let mut col = div().flex().flex_col().gap_1().child(
+            div()
+                .text_xs()
+                .text_color(rgb(p.muted))
+                .child(self.tr("tools.modelPath")),
+        );
+        if model_input_site(&self.wizard, self.active_view) == ModelInputSite::Tools {
+            col = col.child(self.model_input.clone());
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.text))
+                    .child(self.model_path_text(cx)),
+            );
+        }
+        col
+    }
+
+    fn model_path_text(&self, cx: &mut Context<Self>) -> String {
+        let path = self.model_input.read(cx).text();
+        if path.trim().is_empty() {
+            self.tr("rail.modelUnset")
+        } else {
+            path
+        }
+    }
+
+    fn setup_runtime_block(&self) -> impl IntoElement {
+        let p = self.palette();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(self.tr("sidebar.runtime")),
+            )
+            .child(self.tier_bar_el())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(self.live_hwinfo_text.clone()),
+            )
+    }
+
+    fn setup_sampling_block(&self) -> impl IntoElement {
+        let p = self.palette();
+        let mut col = div().flex().flex_col().gap_1();
+        if inference_inputs_on_setup(self.wizard.open, self.active_view) {
+            col = col
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(self.tr("sidebar.temperature")),
+                )
+                .child(self.temperature_input.clone())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(self.tr("sidebar.maxTokens")),
+                )
+                .child(self.max_tokens_input.clone());
+        }
+        col
+    }
+
+    fn setup_language_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(div().text_sm().child(format!(
+                "{} · {}",
+                self.tr("tools.language"),
+                self.locale.label()
+            )))
+            .child(
+                div()
+                    .id("tools-btn-locale")
+                    .px_2()
+                    .py_1()
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .cursor_pointer()
+                    .child(self.locale.code().to_uppercase())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.cycle_locale(cx)),
+                    ),
+            )
+    }
+
+    fn setup_log_row(&self) -> impl IntoElement {
+        let p = self.palette();
+        div()
+            .id("setup-log")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(self.tr("setup.log")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(colibri_sys::default_native_log_path().display().to_string()),
+            )
+    }
+
+    fn setup_doctor_block(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        Self::panel(
+            &p,
+            self.tr("tools.doctor"),
+            self.doctor_text.clone(),
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id("tools-btn-doctor")
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(p.primary))
+                        .text_xs()
+                        .text_color(rgb(p.primary_fg))
+                        .cursor_pointer()
+                        .child(self.tr("rail.runChecks"))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.run_doctor(cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("tools-btn-doctor-deep")
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(p.primary_wash))
+                        .text_xs()
+                        .text_color(rgb(p.text))
+                        .cursor_pointer()
+                        .child(self.tr("rail.deepCheck"))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.run_deep_doctor(cx)),
+                        ),
+                ),
+        )
+        .into_any_element()
+    }
+
+    fn setup_machine_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        let details_label = if self.machine_expanded {
+            self.tr("rail.hideDetails")
+        } else {
+            self.tr("rail.details")
+        };
+        Self::panel(
+            &p,
+            self.tr("tools.machine"),
+            self.machine_text.clone(),
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id("tools-btn-machine-details")
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(p.chip))
+                        .text_xs()
+                        .text_color(rgb(p.text))
+                        .cursor_pointer()
+                        .child(details_label)
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.toggle_machine_details(cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("tools-btn-reprobe")
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(p.primary))
+                        .text_xs()
+                        .text_color(rgb(p.primary_fg))
+                        .cursor_pointer()
+                        .child(self.tr("rail.refresh"))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.refresh_probe(cx)),
+                        ),
+                ),
+        )
+        .into_any_element()
+    }
+
+    fn setup_plan_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(rgb(p.panel))
+            .border_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(self.tr("tools.plan")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(self.tr("tools.modelPath")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.text))
+                    .child(self.model_path_text(cx)),
+            )
+            .child(
                 div()
                     .flex()
                     .gap_2()
+                    .flex_wrap()
                     .child(
                         div()
-                            .id("tools-btn-machine-details")
+                            .id("tools-btn-plan")
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(p.primary))
+                            .text_xs()
+                            .text_color(rgb(p.primary_fg))
+                            .cursor_pointer()
+                            .child(self.tr("rail.planBtn"))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.run_plan(cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("tools-btn-scan-registry")
                             .px_2()
                             .py_1()
                             .bg(rgb(p.chip))
                             .text_xs()
                             .text_color(rgb(p.text))
                             .cursor_pointer()
-                            .child(details_label)
+                            .child(self.tr("rail.scanModels"))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.toggle_machine_details(cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("tools-btn-reprobe")
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(p.primary))
-                            .text_xs()
-                            .text_color(rgb(p.primary_fg))
-                            .cursor_pointer()
-                            .child(self.tr("rail.refresh"))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.refresh_probe(cx)),
-                            ),
-                    ),
-            ))
-            .child(Self::panel(
-                &p,
-                self.tr("tools.doctor"),
-                self.doctor_text.clone(),
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("tools-btn-doctor")
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(p.primary))
-                            .text_xs()
-                            .text_color(rgb(p.primary_fg))
-                            .cursor_pointer()
-                            .child(self.tr("rail.runChecks"))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.run_doctor(cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("tools-btn-doctor-deep")
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(p.primary_wash))
-                            .text_xs()
-                            .text_color(rgb(p.text))
-                            .cursor_pointer()
-                            .child(self.tr("rail.deepCheck"))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.run_deep_doctor(cx)),
-                            ),
-                    ),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .bg(rgb(p.panel))
-                    .border_1()
-                    .border_color(rgb(p.border))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(self.tr("tools.plan")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(self.tr("tools.modelPath")),
-                    )
-                    .when(
-                        model_input_site(&self.wizard, self.active_view) == ModelInputSite::Tools,
-                        |col| col.child(self.model_input.clone()),
-                    )
-                    .when(
-                        model_input_site(&self.wizard, self.active_view) != ModelInputSite::Tools,
-                        |col| {
-                            let path = self.model_input.read(cx).text();
-                            let path = if path.trim().is_empty() {
-                                "(path editor open in Setup)".to_string()
-                            } else {
-                                path
-                            };
-                            col.child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(p.text))
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(path),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(
-                                div()
-                                    .id("tools-btn-plan")
-                                    .px_2()
-                                    .py_1()
-                                    .bg(rgb(p.primary))
-                                    .text_xs()
-                                    .text_color(rgb(p.primary_fg))
-                                    .cursor_pointer()
-                                    .child(self.tr("rail.planBtn"))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.run_plan(cx)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("tools-btn-scan-registry")
-                                    .px_2()
-                                    .py_1()
-                                    .bg(rgb(p.chip))
-                                    .text_xs()
-                                    .text_color(rgb(p.text))
-                                    .cursor_pointer()
-                                    .child(self.tr("rail.scanModels"))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.scan_registry(cx)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("tools-plan-body")
-                            .max_h(px(140.))
-                            .overflow_scroll()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(self.plan_text.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(self.registry_status.clone()),
-                    )
-                    .children(self.registry_entries.iter().enumerate().map(|(i, entry)| {
-                        let label = format_registry_entry(entry);
-                        div()
-                            .id(SharedString::from(format!("tools-reg-entry-{i}")))
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(p.secondary))
-                            .border_1()
-                            .border_color(rgb(p.border))
-                            .text_xs()
-                            .text_color(rgb(p.text))
-                            .cursor_pointer()
-                            .child(label)
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.select_registry_entry(i, cx)
-                                }),
-                            )
-                    })),
-            )
-            .child(self.supported_catalog_panel(cx, "tools"))
-            .when(cfg!(feature = "install"), |col| {
-                #[cfg(feature = "install")]
-                {
-                    col.child(self.install_form_panel(cx, "tools"))
-                }
-                #[cfg(not(feature = "install"))]
-                {
-                    col
-                }
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .bg(rgb(p.panel))
-                    .border_1()
-                    .border_color(rgb(p.border))
-                    .child(self.theme_picker_row(cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .p_3()
-                    .bg(rgb(p.panel))
-                    .border_1()
-                    .border_color(rgb(p.border))
-                    .child(div().text_sm().child(format!(
-                        "{} · {}",
-                        self.tr("tools.language"),
-                        self.locale.label()
-                    )))
-                    .child(
-                        div()
-                            .id("tools-btn-locale")
-                            .px_2()
-                            .py_1()
-                            .border_1()
-                            .border_color(rgb(p.border))
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .cursor_pointer()
-                            .child(self.locale.code().to_uppercase())
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.cycle_locale(cx)),
+                                cx.listener(|this, _, _, cx| this.scan_registry(cx)),
                             ),
                     ),
             )
-            .child(self.xdna_panel(cx))
-            .child(self.tools_advanced_panel(cx))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_3()
-                    .bg(rgb(p.panel))
+                    .id("tools-plan-body")
+                    .max_h(px(140.))
+                    .overflow_scroll()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(self.plan_text.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(self.registry_status.clone()),
+            )
+            .children(self.registry_entries.iter().enumerate().map(|(i, entry)| {
+                let label = format_registry_entry(entry);
+                div()
+                    .id(SharedString::from(format!("tools-reg-entry-{i}")))
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(p.secondary))
                     .border_1()
                     .border_color(rgb(p.border))
-                    .child(
-                        div()
-                            .id("tools-btn-about")
-                            .text_sm()
-                            .text_color(rgb(p.primary))
-                            .cursor_pointer()
-                            .child(about_label)
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.toggle_about(cx)),
-                            ),
+                    .text_xs()
+                    .text_color(rgb(p.text))
+                    .cursor_pointer()
+                    .child(label)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.select_registry_entry(i, cx)),
                     )
-                    .when(self.show_about, |c| {
-                        c.child(div().text_xs().text_color(rgb(p.muted)).child(ABOUT_NOTE))
-                    })
-                    .child(
-                        div()
-                            .id("tools-btn-setup")
-                            .text_sm()
-                            .text_color(rgb(p.muted))
-                            .cursor_pointer()
-                            .child(self.tr("setup.open"))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.open_setup_wizard(cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(self.tr("setup.reopen")),
-                    ),
-            )
+            }))
+            .into_any_element()
     }
 
     fn wizard_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5326,19 +5704,20 @@ fn start_button_paint(p: &ThemePalette, engine_live: bool, starting: bool) -> St
 
 /// Whether the empty-chat hero shows the first-run Setup CTA (hint + green button).
 ///
-/// Same gate the wizard uses: when `first_run_done` is true, never push Setup again
-/// from the center hero. Re-open Setup lives on Tools, not a primary rail slab.
+/// When `first_run_done` is true, the center hero does not push Setup. The left
+/// rail still paints Setup.
 fn show_first_run_setup_cta(first_run_done: bool) -> bool {
     !first_run_done
 }
 
-/// Giant green primary Setup slab on the left rail (`btn-setup` + `p.primary`).
-/// Hidden after Finish/Skip. Re-open lives on Tools.
+/// First-run green fill for the left-rail Setup button (`btn-setup` + `p.primary`).
+/// After Finish/Skip the same button stays, without this fill.
 fn show_rail_setup_primary_cta(first_run_done: bool) -> bool {
     !first_run_done
 }
 
-/// Fill for that rail slab when it is shown. `None` means do not paint it.
+/// Primary fill for the rail Setup button on first run. `None` after Finish/Skip.
+/// The button still paints; the caller uses secondary or chip fill.
 fn rail_setup_primary_fill(p: &ThemePalette, first_run_done: bool) -> Option<u32> {
     if show_rail_setup_primary_cta(first_run_done) {
         Some(p.primary)
@@ -5397,6 +5776,43 @@ enum ModelInputSite {
     Rail,
     Tools,
     Wizard,
+}
+
+/// Sampling and grammar entities live on the Setup surface, or on the rail.
+fn inference_inputs_on_setup(wizard_open: bool, view: MainView) -> bool {
+    !wizard_open && view == MainView::Tools
+}
+
+/// Tools control section ids. Empty: that control paints no settings.
+fn tools_control_section_ids() -> &'static [&'static str] {
+    &[]
+}
+
+/// Setup surface section ids. Render loops this list. Extra arms stay unmatched
+/// until a list names them.
+fn setup_surface_section_ids() -> &'static [&'static str] {
+    &["models", "config", "machine", "plan"]
+}
+
+/// Map one cortex keystroke onto [`cortex_apply_key`].
+fn cortex_key_token(keystroke: &gpui::Keystroke) -> Option<&'static str> {
+    let ch = keystroke.key_char.as_deref();
+    match keystroke.key.as_str() {
+        "left" => Some("left"),
+        "right" => Some("right"),
+        "up" => Some("up"),
+        "down" => Some("down"),
+        "enter" | "return" => Some("enter"),
+        "escape" | "esc" => Some("escape"),
+        "+" | "plus" => Some("+"),
+        "-" | "minus" | "_" => Some("-"),
+        "=" if ch == Some("+") => Some("+"),
+        _ => match ch {
+            Some("+") => Some("+"),
+            Some("-") => Some("-"),
+            _ => None,
+        },
+    }
 }
 
 /// At most one of rail / Tools / wizard mounts `model_input` per frame.
@@ -5763,6 +6179,7 @@ impl Render for DesktopApp {
                                                 ),
                                         ),
                                 )
+                                .child(self.tools_control_menu(cx))
                                 .when(active_view == MainView::Chat, |col| {
                                     col.child(self.chat_view(cx))
                                 })
@@ -6048,6 +6465,21 @@ mod chrome_tests {
         let p = doge_palette();
         assert_eq!(rail_setup_primary_fill(&p, false), Some(p.primary));
         assert_eq!(rail_setup_primary_fill(&p, true), None);
+    }
+
+    /// Same lists `Render` and the Setup surface loop. Tools is not a settings drawer.
+    #[test]
+    fn tools_control_list_omits_settings_setup_list_has_models_and_config() {
+        let tools = tools_control_section_ids();
+        let setup = setup_surface_section_ids();
+        for banned in ["model-path", "runtime", "xdna", "language", "theme", "log"] {
+            assert!(
+                !tools.contains(&banned),
+                "tools control must not paint {banned}"
+            );
+        }
+        assert!(setup.contains(&"models"), "setup surface must list models");
+        assert!(setup.contains(&"config"), "setup surface must list config");
     }
 
     #[test]

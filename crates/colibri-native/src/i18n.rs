@@ -332,8 +332,15 @@ const EN: &[(&str, &str)] = &[
     ("theme.dogeHelp", "High-contrast pure colors (default)."),
     ("theme.mintHelp", "Softer green dashboard look."),
     // Setup / wizard
+    // native-only operational (setup surface; these keys are not in the web table)
     ("setup.open", "Setup"),
-    ("setup.reopen", "Open setup again anytime from Tools."),
+    (
+        "setup.reopen",
+        "Setup stays on the left rail. Tools opens this same screen.",
+    ),
+    ("setup.config", "Config"),
+    ("setup.models", "Models"),
+    ("setup.log", "Log"),
     ("wizard.back", "Back"),
     ("wizard.next", "Next"),
     ("wizard.skip", "Skip"),
@@ -582,11 +589,15 @@ const IT: &[(&str, &str)] = &[
         "Colori puri ad alto contrasto (predefinito).",
     ),
     ("theme.mintHelp", "Aspetto dashboard più morbido e verde."),
+    // native-only operational (setup surface; these keys are not in the web table)
     ("setup.open", "Configura"),
     (
         "setup.reopen",
-        "Puoi riaprire la configurazione in qualsiasi momento da Strumenti.",
+        "La configurazione resta sulla barra sinistra. Strumenti apre la stessa schermata.",
     ),
+    ("setup.config", "Config"),
+    ("setup.models", "Modelli"),
+    ("setup.log", "Log"),
     ("wizard.back", "Indietro"),
     ("wizard.next", "Avanti"),
     ("wizard.skip", "Salta"),
@@ -732,16 +743,26 @@ mod tests {
         let it = t(Locale::It, "setup.reopen");
         let en_l = en.to_ascii_lowercase();
         assert!(
-            en_l.contains("tools"),
-            "native reopen hint must name Tools: {en}"
+            !en_l.contains("from tools"),
+            "reopen hint must not say setup is opened from tools: {en}"
         );
         assert!(
-            !en_l.contains("left rail"),
-            "left rail is no longer the reopen path: {en}"
+            en_l.contains("rail") || en_l.contains("setup"),
+            "reopen hint must mention the rail or Setup: {en}"
         );
         assert!(
-            it.to_ascii_lowercase().contains("strumenti"),
-            "Italian reopen hint must name Strumenti: {it}"
+            !en_l.contains("only"),
+            "reopen hint must not say only: {en}"
+        );
+        let it_l = it.to_ascii_lowercase();
+        let strumenti_is_only_door = it_l.contains("strumenti")
+            && (it_l.contains("solo")
+                || it_l.contains("soltanto")
+                || it_l.contains("unica")
+                || it_l.contains("unico"));
+        assert!(
+            !strumenti_is_only_door,
+            "Italian must not say Strumenti is the only door: {it}"
         );
     }
 
