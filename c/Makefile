@@ -2801,6 +2801,9 @@ tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c
 tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_layer_progress$(EXE): tests/test_layer_progress.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 

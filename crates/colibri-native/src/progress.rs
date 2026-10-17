@@ -97,6 +97,10 @@ pub fn install_percent(done: u64, total: u64) -> Option<u8> {
 /// (e.g. "about 1445 hours left"). Hide as unknown instead.
 pub const MAX_ETA_SECS: u64 = 7 * 24 * 3600;
 
+/// First generated token is TTFT/prefill, not steady decode throughput.
+/// Remaining-time needs at least one decode token (`generated >= 2`).
+const MIN_GENERATED_FOR_GENERATE_ETA: u32 = 2;
+
 /// Seconds remaining given `remaining` work units and `rate_per_sec` (units/sec).
 ///
 /// Returns `None` when rate is not positive or not finite, or when the estimate
@@ -189,7 +193,13 @@ pub fn format_install_chrome_status(file: Option<&str>, percent: Option<u8>) -> 
 
 /// Generate / inference progress against configured max output tokens.
 ///
-/// Percent is `generated / max_output` (capped). ETA uses remaining tokens / tok/s.
+/// Percent is `generated / max_output` (capped). ETA uses remaining tokens /
+/// decode tok/s once at least one decode token exists (`generated >= 2`).
+/// The first generated token is time-to-first-token (prefill), not steady
+/// decode throughput: remaining-time is omitted after only that token so a
+/// slow TTFT cannot paint a multi-hour leftover (e.g. 255 / (1/85s) ≈ 6 hours).
+/// Callers must pass decode tok/s after the first token, not wall tokens /
+/// elapsed including prefill.
 /// When `tok_per_sec <= 0`, ETA is `None` (omitted from the line).
 /// When `max_output == 0`, percent is `None` (no trustworthy fraction).
 pub fn generate_progress(
@@ -204,8 +214,45 @@ pub fn generate_progress(
     // max_output > 0: token counts are trustworthy even at 0 generated.
     let percent = Some(percent_done(generated as u64, max_output as u64));
     let remaining = max_output.saturating_sub(generated) as u64;
+    if remaining == 0 {
+        // Complete: zero leftover is a real ETA only when a token has landed.
+        return (percent, if generated > 0 { Some(0) } else { None });
+    }
+    if generated < MIN_GENERATED_FOR_GENERATE_ETA {
+        // No decode sample yet (0 tokens, or TTFT-only). Omit remaining-time.
+        return (percent, None);
+    }
     let eta = eta_secs(remaining, tok_per_sec);
     (percent, eta)
+}
+
+/// Decode tok/s after the first token, from wall elapsed and TTFT.
+///
+/// The first generated token is prefill/TTFT. Remaining-time must use this
+/// rate, not `generated / elapsed` (wall including prefill).
+/// `None` when `generated < 2` or the decode window is not positive.
+#[allow(dead_code)] // host still passes live tok/s; tests encode the decode-rate contract
+pub fn decode_tok_per_sec_after_ttft(
+    generated: u32,
+    elapsed_secs: f64,
+    ttft_secs: f64,
+) -> Option<f64> {
+    if generated < MIN_GENERATED_FOR_GENERATE_ETA {
+        return None;
+    }
+    if !elapsed_secs.is_finite() || !ttft_secs.is_finite() {
+        return None;
+    }
+    let decode_secs = elapsed_secs - ttft_secs;
+    if decode_secs <= 0.0 {
+        return None;
+    }
+    let decode_tokens = f64::from(generated.saturating_sub(1));
+    let rate = decode_tokens / decode_secs;
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    Some(rate)
 }
 
 /// Install / download progress from optional byte and file counters.
@@ -561,6 +608,12 @@ mod tests {
             "0 generated / N max is honest 0%, not a fake floor"
         );
         assert_eq!(eta, None);
+        let (p2, eta2) = generate_progress(0, 256, 10.0);
+        assert_eq!(p2, Some(0));
+        assert_eq!(
+            eta2, None,
+            "no tokens yet; do not ETA from a pre-stream rate"
+        );
     }
 
     #[test]
@@ -590,6 +643,85 @@ mod tests {
         let (p, eta) = generate_progress(7, 10, 2.0);
         assert_eq!(p, Some(70));
         assert_eq!(eta, Some(2));
+    }
+
+    #[test]
+    fn generate_remaining_time_after_only_ttft_does_not_paint_hours() {
+        // Operator 2026-10-16: 256 max-token completion, 1 generated token after
+        // ~85s TTFT (prefill). Wall tok/s = 1/85 is not decode throughput.
+        // Remaining 255 / (1/85) ≈ 6 hours must not appear as remaining-time.
+        let generated = 1_u32;
+        let max_output = 256_u32;
+        let ttft_secs = 84.793;
+        let wall_tok_per_sec = f64::from(generated) / ttft_secs;
+        let remaining = u64::from(max_output.saturating_sub(generated));
+        let naive = eta_secs(remaining, wall_tok_per_sec);
+        assert_eq!(
+            format_eta(naive).as_deref(),
+            Some("about 6 hours left"),
+            "naive TTFT wall rate is the operator 6-hour guess, got {naive:?}"
+        );
+        assert_eq!(
+            decode_tok_per_sec_after_ttft(generated, ttft_secs, ttft_secs),
+            None,
+            "no decode sample after only TTFT"
+        );
+        let (percent, eta) = generate_progress(generated, max_output, wall_tok_per_sec);
+        assert_eq!(
+            eta, None,
+            "TTFT-only must not guess remaining-time from prefill wall rate"
+        );
+        let line = format_progress_line("Generating...", percent, eta);
+        assert!(
+            !line.contains("hours left"),
+            "must not paint a multi-hour decode guess after only TTFT: {line}"
+        );
+        assert!(
+            !line.contains("about 6 hours"),
+            "must not paint about 6 hours left after only TTFT: {line}"
+        );
+        let view = generate_progress_view("Generating...", generated, max_output, wall_tok_per_sec);
+        assert_eq!(view.eta_secs, None);
+        assert!(
+            !view.line().contains("hours left"),
+            "view line must omit remaining-time after only TTFT: {}",
+            view.line()
+        );
+    }
+
+    #[test]
+    fn generate_remaining_time_uses_decode_tok_s_after_first_token() {
+        // After TTFT, 5 decode tokens in 2s → 2.5 tok/s, not wall 6 / 86.793.
+        let generated = 6_u32;
+        let max_output = 256_u32;
+        let ttft_secs = 84.793;
+        let decode_secs = 2.0;
+        let elapsed_secs = ttft_secs + decode_secs;
+        let wall_tok_per_sec = f64::from(generated) / elapsed_secs;
+        let decode_tok_per_sec =
+            decode_tok_per_sec_after_ttft(generated, elapsed_secs, ttft_secs).expect("decode rate");
+        assert!(
+            (decode_tok_per_sec - 2.5).abs() < 1e-9,
+            "{decode_tok_per_sec}"
+        );
+        let remaining = u64::from(max_output.saturating_sub(generated));
+        let wall_eta = eta_secs(remaining, wall_tok_per_sec);
+        assert!(
+            wall_eta.is_some_and(|s| s >= 3600),
+            "prefill wall rate would still paint hours, got {wall_eta:?}"
+        );
+        let (percent, eta) = generate_progress(generated, max_output, decode_tok_per_sec);
+        assert_eq!(percent, Some(2)); // 6/256
+        assert_eq!(eta, Some(100)); // 250 remaining / 2.5 tok/s
+        let line = format_progress_line("Generating...", percent, eta);
+        assert!(
+            !line.contains("hours left"),
+            "decode ETA must not paint hours: {line}"
+        );
+        assert!(
+            line.contains("about ") && line.contains("left"),
+            "decode sample may show remaining-time: {line}"
+        );
     }
 
     // --- install_progress ---------------------------------------------------

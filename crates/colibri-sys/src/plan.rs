@@ -37,6 +37,9 @@ pub struct PlanOptions {
     pub vram_gb: f64,
     /// Injected fixtures (tests / hosts that already probed).
     pub available_memory: Option<u64>,
+    /// Injected MemTotal (tests). When `None`, [`memory_total`] is probed.
+    /// Host-class RAM budget is 88% of max(available, total) when `ram_gb` is 0.
+    pub total_memory: Option<u64>,
     pub available_disk: Option<u64>,
     pub gpus: Option<Vec<GpuDevice>>,
     pub physical_cpus: Option<u32>,
@@ -52,6 +55,7 @@ impl Default for PlanOptions {
             gpu_indices: None,
             vram_gb: 0.0,
             available_memory: None,
+            total_memory: None,
             available_disk: None,
             gpus: None,
             physical_cpus: None,
@@ -203,6 +207,23 @@ fn policy_flags(name: &str) -> Result<(bool, bool, bool)> {
     }
 }
 
+/// System RAM bytes the placement plan budgets.
+///
+/// Same host-class policy as native `ram_gb_for_engine`: explicit `ram_gb > 0`
+/// wins; otherwise 88% of max(available, total). Below 4 GB becomes 8 GB.
+pub fn ram_budget_bytes(available_bytes: u64, total_bytes: u64, ram_gb: f64) -> u64 {
+    let bytes = if ram_gb > 0.0 {
+        (ram_gb * GB as f64) as u64
+    } else {
+        let avail = available_bytes as f64 / GB as f64;
+        let total = total_bytes as f64 / GB as f64;
+        let budget = avail.max(total) * 0.88;
+        let gb = if budget < 4.0 { 8.0 } else { budget };
+        (gb * GB as f64) as u64
+    };
+    if bytes < 4 * GB { 8 * GB } else { bytes }
+}
+
 impl PlacementPlan {
     /// Build a plan from an already-inspected model + options.
     pub fn build_from_info(info: &ModelInfo, opts: &PlanOptions) -> Result<Self> {
@@ -212,6 +233,7 @@ impl PlacementPlan {
         let physical_cpus = opts.physical_cpus.unwrap_or_else(physical_cpu_count);
         let cpu_sockets = opts.cpu_sockets.unwrap_or_else(cpu_socket_count);
         let available_memory = opts.available_memory.unwrap_or_else(memory_available);
+        let total_memory = opts.total_memory.unwrap_or_else(memory_total);
         let available_disk = match opts.available_disk {
             Some(d) => d,
             None => disk_free_bytes(&info.path).unwrap_or(500 * GB),
@@ -219,22 +241,13 @@ impl PlacementPlan {
         let mut gpus = opts.gpus.clone().unwrap_or_else(discover_gpus);
         // Re-apply override/heuristics so COLI_GPU_MEMORY wins even on fixtures,
         // and injected inventories without integrated flags still classify.
-        apply_gpu_memory_classification(&mut gpus, available_memory.max(memory_total()));
+        apply_gpu_memory_classification(&mut gpus, available_memory.max(total_memory));
         if let Some(ref indices) = opts.gpu_indices {
             let wanted: std::collections::HashSet<u32> = indices.iter().copied().collect();
             gpus.retain(|g| wanted.contains(&g.index));
         }
 
-        let ram_budget = if opts.ram_gb > 0.0 {
-            (opts.ram_gb * GB as f64) as u64
-        } else {
-            (available_memory as f64 * 0.88) as u64
-        };
-        let ram_budget = if ram_budget < 4 * GB {
-            8 * GB
-        } else {
-            ram_budget
-        };
+        let ram_budget = ram_budget_bytes(available_memory, total_memory, opts.ram_gb);
 
         let cfg = &info.config;
         let typical = info.typical_expert_bytes;
@@ -1065,6 +1078,72 @@ mod tests {
         assert!(env.get("RAM_GB").is_some());
         // no CUDA keys without devices
         assert!(env.get("COLI_CUDA").is_none());
+    }
+
+    /// Setup/Config Memory plan System RAM must use the engine host-class
+    /// budget (88% of max(MemAvailable, MemTotal)), not MemAvailable-only.
+    /// CPU-only fixtures must not invent GPU VRAM.
+    #[test]
+    fn memory_plan_system_ram_uses_host_class_not_memavailable_only() {
+        let available = ((64.0 / 0.88) * GB as f64) as u64;
+        let total = 90 * GB;
+        let plan = PlacementPlan::build_from_info(
+            &stub_info(),
+            &PlanOptions {
+                policy: "quality".into(),
+                available_memory: Some(available),
+                total_memory: Some(total),
+                available_disk: Some(500 * GB),
+                gpus: Some(vec![]),
+                physical_cpus: Some(8),
+                cpu_sockets: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gb = plan.tiers.ram.budget_bytes as f64 / GB as f64;
+        let avail_only = available as f64 * 0.88 / GB as f64;
+        let host_class = 90.0 * 0.88;
+        assert!(
+            (gb - host_class).abs() < 0.05,
+            "System RAM budget must match ram_gb_for_engine host class {host_class:.1} GB, got {gb:.1} (MemAvailable-only is {avail_only:.1})"
+        );
+        assert!(
+            (avail_only - 64.0).abs() < 0.05,
+            "fixture sanity: MemAvailable-only must be ~64.0 GB, got {avail_only:.1}"
+        );
+        let ui = format!("System RAM budget: {gb:.1} GB");
+        assert_eq!(ui, "System RAM budget: 79.2 GB");
+        assert_ne!(ui, "System RAM budget: 64.0 GB");
+        assert_eq!(
+            plan.tiers.vram.budget_bytes, 0,
+            "CPU-only ffi plan must not invent GPU VRAM"
+        );
+        assert!(plan.tiers.vram.devices.is_empty());
+    }
+
+    #[test]
+    fn memory_plan_explicit_ram_gb_wins_over_host_class() {
+        let plan = PlacementPlan::build_from_info(
+            &stub_info(),
+            &PlanOptions {
+                ram_gb: 32.0,
+                available_memory: Some(((64.0 / 0.88) * GB as f64) as u64),
+                total_memory: Some(90 * GB),
+                available_disk: Some(500 * GB),
+                gpus: Some(vec![]),
+                physical_cpus: Some(8),
+                cpu_sockets: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gb = plan.tiers.ram.budget_bytes as f64 / GB as f64;
+        assert!(
+            (gb - 32.0).abs() < 0.05,
+            "explicit ram_gb must win, got {gb}"
+        );
+        assert_eq!(plan.tiers.vram.budget_bytes, 0);
     }
 
     #[test]

@@ -297,6 +297,48 @@ pub fn catalog_next_step_key(step: CatalogNextStep) -> &'static str {
     }
 }
 
+/// Extra control on a catalog row besides [`catalog_next_step`].
+///
+/// Installed rows expose Delete. Not-installed installable rows expose Install
+/// next to the model name. Native-only operational labels: there is no
+/// delete/remove/uninstall key in `web/src/i18n/en.ts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogRowAction {
+    Install,
+    Delete,
+    None,
+}
+
+/// Installed rows expose Delete. Not-installed installable rows expose Install.
+pub fn catalog_row_action(installed: bool, installable: bool) -> CatalogRowAction {
+    if installed {
+        CatalogRowAction::Delete
+    } else if installable {
+        CatalogRowAction::Install
+    } else {
+        CatalogRowAction::None
+    }
+}
+
+/// Native-only operational label for Delete (no web i18n key).
+pub fn catalog_delete_label() -> &'static str {
+    "Delete"
+}
+
+/// Native-only operational label for the row control, or `None`.
+pub fn catalog_row_action_label(action: CatalogRowAction) -> Option<&'static str> {
+    match action {
+        CatalogRowAction::Install => Some("Install"),
+        CatalogRowAction::Delete => Some(catalog_delete_label()),
+        CatalogRowAction::None => None,
+    }
+}
+
+/// Shown when delete is refused because this folder is the live engine.
+pub fn catalog_delete_live_engine_sentence() -> &'static str {
+    crate::host::DELETE_CATALOG_LIVE_ENGINE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +585,46 @@ mod tests {
         let unavailable = catalog_next_step(false, false);
         assert_eq!(unavailable, CatalogNextStep::Unavailable);
         assert_eq!(catalog_next_step_key(unavailable), "catalog.supportedHelp");
+    }
+
+    /// Not-installed installable rows stay Install. The existing next-step key
+    /// is unchanged (`rail.installBtn`).
+    #[test]
+    fn catalog_not_installed_row_exposes_install() {
+        let step = catalog_next_step(false, true);
+        assert_eq!(step, CatalogNextStep::Install);
+        assert_eq!(catalog_next_step_key(step), "rail.installBtn");
+        assert_eq!(catalog_row_action(false, true), CatalogRowAction::Install);
+        assert_eq!(
+            catalog_row_action_label(CatalogRowAction::Install),
+            Some("Install")
+        );
+        assert_eq!(catalog_row_action(false, false), CatalogRowAction::None);
+    }
+
+    /// Installed rows expose Delete. After the Present leaf is gone, the same
+    /// installable row is Install again.
+    #[test]
+    fn catalog_installed_row_exposes_delete_then_install_after_delete() {
+        assert_eq!(catalog_row_action(true, true), CatalogRowAction::Delete);
+        assert_eq!(catalog_row_action(true, false), CatalogRowAction::Delete);
+        assert_eq!(catalog_delete_label(), "Delete");
+        assert_eq!(
+            catalog_row_action_label(CatalogRowAction::Delete),
+            Some("Delete")
+        );
+        assert_eq!(catalog_next_step(true, true), CatalogNextStep::StartEngine);
+
+        let after = catalog_next_step(false, true);
+        assert_eq!(after, CatalogNextStep::Install);
+        assert_eq!(catalog_row_action(false, true), CatalogRowAction::Install);
+        assert_eq!(catalog_next_step_key(after), "rail.installBtn");
+    }
+
+    #[test]
+    fn catalog_delete_live_engine_sentence_is_plain_operational() {
+        let s = catalog_delete_live_engine_sentence();
+        assert_eq!(s, "Stop the engine before deleting this model.");
+        assert!(!s.is_empty());
     }
 }

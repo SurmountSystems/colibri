@@ -29,8 +29,8 @@ use colibri_sys::{
     PlanOptions, ProbeOptions, ProfileTurn, ServerFrame, SupportedModel, TiersSnap, VisualSnapshot,
     default_model_store_path, ensure_model_directory, environment_for_plan, expand_user_path,
     force_process_from_env, format_engine_start_log, format_generate_log, locate_engine,
-    model_arch, ram_overcommit_from_env, render_chat, run_doctor, set_current_thread_nice,
-    supported_model_by_id, supported_models,
+    memory_available, memory_total, model_arch, ram_overcommit_from_env, render_chat, run_doctor,
+    set_current_thread_nice, supported_model_by_id, supported_models,
 };
 
 use crate::prefs;
@@ -484,8 +484,75 @@ pub fn preflight_then_maybe_open(
     Ok(model)
 }
 
+/// GB written as `RAM_GB` for the engine.
+///
+/// `explicit_ram_gb` is an operator value (`Some` and `> 0` wins). Otherwise the
+/// budget is 88% of the host class (`max(available, total)`), never a 64 GB
+/// default on a machine that reports more.
+pub fn ram_gb_for_engine(
+    available_bytes: u64,
+    total_bytes: u64,
+    explicit_ram_gb: Option<f64>,
+) -> f64 {
+    if let Some(g) = explicit_ram_gb {
+        if g > 0.0 {
+            return g;
+        }
+    }
+    let avail = available_bytes as f64 / GB as f64;
+    let total = total_bytes as f64 / GB as f64;
+    let host = avail.max(total);
+    let budget = host * 0.88;
+    if budget < 4.0 { 8.0 } else { budget }
+}
+
+/// Counts for [`live_tiers_from_counts`].
+#[derive(Debug, Clone, Copy)]
+pub struct LiveTiersCounts {
+    pub vram: u32,
+    pub ram_filled: u32,
+    pub disk: u32,
+    /// RAM expert-cache cap across sparse rows (`ecap * sparse_layers`).
+    pub ram_cap: u32,
+    /// CPU-only `ffi` build: do not invent GPU experts.
+    pub cpu_only: bool,
+    pub vram_gb: f64,
+    pub ram_gb: f64,
+}
+
+/// Live VRAM/RAM/Disk expert counts. RAM cap slots are RAM, not disk.
+pub fn live_tiers_from_counts(c: LiveTiersCounts) -> TiersSnap {
+    let total = c.vram.saturating_add(c.ram_filled).saturating_add(c.disk);
+    let vram = if c.cpu_only { 0 } else { c.vram };
+    let vram_gb = if c.cpu_only { 0.0 } else { c.vram_gb };
+    let mut ram = c.ram_filled.max(c.ram_cap);
+    if ram.saturating_add(vram) > total {
+        ram = total.saturating_sub(vram);
+    }
+    let disk = total.saturating_sub(vram).saturating_sub(ram);
+    TiersSnap {
+        vram,
+        ram,
+        disk,
+        vram_gb,
+        ram_gb: c.ram_gb,
+    }
+}
+
 fn apply_plan_env_for_ffi(model: &Path) {
-    let plan = match PlacementPlan::build(model, &PlanOptions::default()) {
+    let available = memory_available();
+    let total = memory_total();
+    let ram_gb = ram_gb_for_engine(available, total, None);
+    let cpu_only = cfg!(not(feature = "ffi-hip"));
+    let plan = match PlacementPlan::build(
+        model,
+        &PlanOptions {
+            ram_gb,
+            available_memory: Some(available),
+            gpus: if cpu_only { Some(Vec::new()) } else { None },
+            ..Default::default()
+        },
+    ) {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -499,7 +566,12 @@ fn apply_plan_env_for_ffi(model: &Path) {
             // Operator (or parent process) set this before we did. Leave it.
             continue;
         }
-        if let Some(v) = env.get(key) {
+        let value = if key == "RAM_GB" {
+            Some(format!("{ram_gb:.3}"))
+        } else {
+            env.get(key).map(str::to_string)
+        };
+        if let Some(v) = value {
             // Refresh values this function wrote so a later Start sees the new plan.
             unsafe {
                 std::env::set_var(key, v);
@@ -2557,6 +2629,12 @@ fn generate_process(
     }
 }
 
+/// Pulse Chat with a soft mark for one FFI token emit.
+/// Token ids only on the multi-family CPU API. Every emit sends Token.
+fn pulse_ffi_generate_emit(_count: u64, tx: &mpsc::Sender<GenEvent>) {
+    let _ = tx.send(GenEvent::Token("·".into()));
+}
+
 /// In-process generate (feature `ffi`). Streams token-count progress; V4 also
 /// appends detokenized text when the session API exposes it.
 #[cfg(feature = "ffi")]
@@ -2629,10 +2707,7 @@ fn generate_ffi(
             }
             count = count.saturating_add(1);
             let _ = ev;
-            // Token ids only on multi-family CPU API; pulse UI with a soft mark.
-            if count == 1 || count % 8 == 0 {
-                let _ = tx.send(GenEvent::Token("·".into()));
-            }
+            pulse_ffi_generate_emit(count, tx);
             Ok(())
         })
         .map_err(|e| e.to_string())?;
@@ -3068,6 +3143,104 @@ pub fn start_path_for_catalog(catalog_id: &str, entries: &[ModelEntry]) -> Resul
     }
 }
 
+/// Native-only operational refuse when the live engine is this folder.
+pub const DELETE_CATALOG_LIVE_ENGINE: &str = "Stop the engine before deleting this model.";
+
+/// Why [`delete_catalog_model`] did not remove a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteCatalogError {
+    UnknownId(String),
+    NotInstalled(String),
+    OutsideStore(String),
+    LiveEngine,
+    Io(String),
+}
+
+impl DeleteCatalogError {
+    pub fn as_message(&self) -> String {
+        match self {
+            Self::UnknownId(id) => {
+                format!("Unknown catalog id {id}. This row cannot delete.")
+            }
+            Self::NotInstalled(name) => {
+                format!("The model folder for {name} is missing.")
+            }
+            Self::OutsideStore(path) => {
+                format!("Refusing to delete {path}: it is not under the model store.")
+            }
+            Self::LiveEngine => DELETE_CATALOG_LIVE_ENGINE.to_string(),
+            Self::Io(e) => e.clone(),
+        }
+    }
+}
+
+/// True when `live` is the same folder as `installed`.
+pub fn catalog_folder_is_live_engine(installed: &Path, live: Option<&Path>) -> bool {
+    let Some(live) = live else {
+        return false;
+    };
+    if live.as_os_str().is_empty() {
+        return false;
+    }
+    if installed == live {
+        return true;
+    }
+    match (fs::canonicalize(installed), fs::canonicalize(live)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when `folder` is a real descendant of `store` (not the store root).
+fn catalog_delete_target_allowed(folder: &Path, store: &Path) -> bool {
+    if folder.as_os_str().is_empty() || store.as_os_str().is_empty() {
+        return false;
+    }
+    if folder == store {
+        return false;
+    }
+    if !path_is_under_store(folder, store) {
+        return false;
+    }
+    match (fs::canonicalize(folder), fs::canonicalize(store)) {
+        (Ok(folder_real), Ok(store_real)) => {
+            folder_real != store_real && path_is_under_store(&folder_real, &store_real)
+        }
+        _ => false,
+    }
+}
+
+/// Remove the Present catalog leaf under `model_store`.
+///
+/// Refuses when the live engine is that folder. Does not delete Hugging Face
+/// cache outside the product store.
+pub fn delete_catalog_model(
+    catalog_id: &str,
+    entries: &[ModelEntry],
+    model_store: &Path,
+    live_engine_path: Option<&Path>,
+) -> Result<PathBuf, DeleteCatalogError> {
+    let Some(model) = supported_model_by_id(catalog_id) else {
+        return Err(DeleteCatalogError::UnknownId(catalog_id.to_string()));
+    };
+    let Some(entry) = catalog_is_installed(model, entries) else {
+        return Err(DeleteCatalogError::NotInstalled(
+            model.display_name.to_string(),
+        ));
+    };
+    let folder = entry.path.clone();
+    if !catalog_delete_target_allowed(&folder, model_store) {
+        return Err(DeleteCatalogError::OutsideStore(
+            folder.display().to_string(),
+        ));
+    }
+    if catalog_folder_is_live_engine(&folder, live_engine_path) {
+        return Err(DeleteCatalogError::LiveEngine);
+    }
+    fs::remove_dir_all(&folder).map_err(|e| DeleteCatalogError::Io(e.to_string()))?;
+    Ok(folder)
+}
+
 /// Paint roles for one supported-catalog row (pure; GPUI-free).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogRowStyle {
@@ -3124,7 +3297,6 @@ pub fn catalog_row_style(
 ///
 /// Rejects `..` components in either path. Used so install dest cannot escape
 /// the model store before the path exists on disk (no canonicalize required).
-#[cfg(feature = "install")]
 fn path_is_under_store(path: &Path, root: &Path) -> bool {
     use std::path::Component;
     let has_parent = |p: &Path| p.components().any(|c| matches!(c, Component::ParentDir));
@@ -3936,6 +4108,70 @@ mod tests {
             second.parse::<f64>().ok().is_some_and(|g| g > 0.0),
             "refreshed RAM_GB must be a plan number, got {second}"
         );
+    }
+
+    #[test]
+    fn ram_gb_for_engine_64gb_default_must_not_win_on_90gb_host() {
+        // Operator APU: MemTotal ~90 GB, MemAvailable such that 88% is 64.0.
+        let available = ((64.0 / 0.88) * GB as f64) as u64;
+        let total = 90 * GB;
+        let g = ram_gb_for_engine(available, total, None);
+        assert!(
+            g > 64.0,
+            "90 GB host class must not land RAM_GB at the 64 GB default, got {g}"
+        );
+        assert!(
+            (g - 90.0 * 0.88).abs() < 0.05,
+            "budget is 88% of MemTotal (host class), got {g}"
+        );
+    }
+
+    #[test]
+    fn ram_gb_for_engine_operator_explicit_wins() {
+        let g = ram_gb_for_engine(90 * GB, 96 * GB, Some(32.0));
+        assert!((g - 32.0).abs() < 1e-9, "operator RAM_GB must win, got {g}");
+    }
+
+    #[test]
+    fn live_tiers_must_not_force_ram_zero_when_cap_allows_ram_experts() {
+        let t = live_tiers_from_counts(LiveTiersCounts {
+            vram: 0,
+            ram_filled: 0,
+            disk: 19456,
+            ram_cap: 27 * 76,
+            cpu_only: true,
+            vram_gb: 0.0,
+            ram_gb: 0.0,
+        });
+        assert_eq!(t.vram, 0, "CPU-only ffi must not invent GPU experts");
+        assert!(
+            t.ram > 0,
+            "cap 27 x 76 layers must not report RAM 0, got ram={} disk={}",
+            t.ram,
+            t.disk
+        );
+        assert!(
+            t.disk < 19456,
+            "must not park all 19456 experts on disk when cap allows RAM, disk={}",
+            t.disk
+        );
+        assert_eq!(t.vram + t.ram + t.disk, 19456);
+    }
+
+    #[test]
+    fn live_tiers_cpu_only_does_not_invent_gpu_experts() {
+        let t = live_tiers_from_counts(LiveTiersCounts {
+            vram: 100,
+            ram_filled: 50,
+            disk: 100,
+            ram_cap: 50,
+            cpu_only: true,
+            vram_gb: 4.0,
+            ram_gb: 1.0,
+        });
+        assert_eq!(t.vram, 0);
+        assert_eq!(t.vram_gb, 0.0);
+        assert_eq!(t.vram + t.ram + t.disk, 250);
     }
 
     #[test]
@@ -5157,6 +5393,28 @@ mod tests {
     }
 
     #[test]
+    fn ffi_token_event_on_every_emit() {
+        let (tx, rx) = mpsc::channel();
+        for count in 1u64..=8 {
+            pulse_ffi_generate_emit(count, &tx);
+        }
+        drop(tx);
+        let marks: Vec<String> = rx
+            .iter()
+            .filter_map(|e| match e {
+                GenEvent::Token(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marks.len(),
+            8,
+            "GenEvent::Token on every emit, not only token 1 then every 8th; got {marks:?}"
+        );
+        assert!(marks.iter().all(|s| s == "·"), "{marks:?}");
+    }
+
+    #[test]
     fn clamp_temperature_bounds() {
         assert_eq!(clamp_temperature(0.0), 0.0);
         assert_eq!(clamp_temperature(2.0), 2.0);
@@ -5695,6 +5953,104 @@ mod tests {
             convert_only.to_lowercase().contains("model folder"),
             "{convert_only}"
         );
+    }
+
+    fn deepseek_fixture_under(store: &Path) -> (PathBuf, ModelEntry) {
+        let folder = store.join("DeepSeek-V4-Flash-0731");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("config.json"),
+            br#"{"model_type":"deepseek_v4"}"#,
+        )
+        .unwrap();
+        fs::write(folder.join("weights.bin"), b"fixture").unwrap();
+        let entry = test_entry(
+            folder.to_str().expect("utf8 fixture path"),
+            ModelStatus::Present,
+            ModelFamily::DeepseekV4,
+        );
+        (folder, entry)
+    }
+
+    /// Deleting an installed fixture dir under a temp store makes
+    /// `catalog_next_step` Install. Does not touch the operator model store.
+    #[test]
+    fn delete_catalog_model_removes_fixture_then_next_step_is_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        let (folder, entry) = deepseek_fixture_under(store);
+        let entries = [entry];
+        let model = supported_model_by_id("deepseek-v4-colibri").expect("deepseek");
+        assert!(catalog_is_installed(model, &entries).is_some());
+        assert!(folder.is_dir());
+        #[cfg(feature = "install")]
+        {
+            assert_eq!(
+                crate::install_ui::catalog_next_step(true, true),
+                crate::install_ui::CatalogNextStep::StartEngine
+            );
+        }
+
+        let deleted = delete_catalog_model("deepseek-v4-colibri", &entries, store, None)
+            .expect("delete fixture");
+        assert_eq!(deleted, folder);
+        assert!(
+            !folder.exists(),
+            "fixture folder must be removed: {}",
+            folder.display()
+        );
+
+        let after: Vec<ModelEntry> = Vec::new();
+        assert!(catalog_is_installed(model, &after).is_none());
+        #[cfg(feature = "install")]
+        {
+            assert_eq!(
+                crate::install_ui::catalog_next_step(false, true),
+                crate::install_ui::CatalogNextStep::Install
+            );
+        }
+    }
+
+    #[test]
+    fn delete_catalog_model_refuses_when_live_engine_and_leaves_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        let (folder, entry) = deepseek_fixture_under(store);
+        let entries = [entry];
+        let err = delete_catalog_model(
+            "deepseek-v4-colibri",
+            &entries,
+            store,
+            Some(folder.as_path()),
+        )
+        .expect_err("live engine must refuse");
+        assert_eq!(err, DeleteCatalogError::LiveEngine);
+        assert_eq!(err.as_message(), DELETE_CATALOG_LIVE_ENGINE);
+        assert_eq!(
+            err.as_message(),
+            "Stop the engine before deleting this model."
+        );
+        assert!(
+            folder.is_dir(),
+            "refused delete must leave the fixture folder"
+        );
+        let model = supported_model_by_id("deepseek-v4-colibri").expect("deepseek");
+        assert!(catalog_is_installed(model, &entries).is_some());
+    }
+
+    #[test]
+    fn delete_catalog_model_refuses_path_outside_store() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let (folder, entry) = deepseek_fixture_under(other_dir.path());
+        let entries = [entry];
+        let err = delete_catalog_model("deepseek-v4-colibri", &entries, store_dir.path(), None)
+            .expect_err("outside store must refuse");
+        assert!(
+            matches!(err, DeleteCatalogError::OutsideStore(_)),
+            "{err:?}"
+        );
+        assert!(folder.is_dir(), "outside-store refuse must not delete");
     }
 
     #[test]

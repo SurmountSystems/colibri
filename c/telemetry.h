@@ -219,6 +219,18 @@ static void hwinfo_emit(Model *m){
     fflush(stdout);
 }
 
+/* Unused cap slots are the RAM tier, not disk. GPU stays 0 on CPU-only builds. */
+static int coli_tiers_ram_experts(int ram_filled, int vram, int ram_cap, int total){
+    int ram = ram_filled;
+    if(ram < ram_cap) ram = ram_cap;
+    if(ram < 0) ram = 0;
+    if(vram < 0) vram = 0;
+    if(total < 0) total = 0;
+    if(ram + vram > total) ram = total - vram;
+    if(ram < 0) ram = 0;
+    return ram;
+}
+
 static void tiers_fill(Model *m, int *vram_out, int *ram_out, int *disk_out,
                        double *vram_gb_out, double *ram_gb_out){
     Cfg *c=&m->c; int nsp=0;
@@ -239,7 +251,11 @@ static void tiers_fill(Model *m, int *vram_out, int *ram_out, int *disk_out,
     }
     vram_gb=(double)bytes/1e9;
 #endif
-    int ram=pinned-vram+lru; if(ram<0) ram=0;
+    int ram_cap=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) ram_cap += m->ecap;
+    if(m->has_mtp) ram_cap += m->ecap;
+    int filled=pinned-vram+lru; if(filled<0) filled=0;
+    int ram=coli_tiers_ram_experts(filled,vram,ram_cap,total);
     int disk=total-vram-ram; if(disk<0) disk=0;
     /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
      * box where Windows still showed 140 GB free, because every resident expert was
@@ -248,7 +264,11 @@ static void tiers_fill(Model *m, int *vram_out, int *ram_out, int *disk_out,
     double ram_b=0;
     for(int i=0;i<=c->n_layers;i++){
         int64_t w=expert_bytes_row(m,i,m->ebits);
-        ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
+        int nfill=(m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0);
+        int is_row=(i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && m->has_mtp);
+        int n=nfill;
+        if(is_row && n<m->ecap) n=m->ecap;
+        ram_b += (double)n*(double)w;
     }
     if(vram>0){                       /* the VRAM tier's host copies are not RAM-tier bytes */
         double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;

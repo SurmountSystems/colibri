@@ -12,11 +12,234 @@ default:
 # Install
 # ---------------------------------------------------------------------------
 
-# Install colibri-native into ~/.cargo/bin (default: install + ffi).
-# AMD/ROCm: `just install features=install,ffi-hip`
-# Process-only (no static FFI libs): `just install features=install`
-install features="install,ffi":
-    cargo install --path crates/colibri-native --locked --force --no-default-features --features '{{ features }}'
+# Install colibri-native into ~/.cargo/bin.
+# Default `auto`: HIP (`install,ffi-hip`) when hipcc is on PATH (same probe as
+# clippy), else CPU (`install,ffi`). Prints the flavor. Refuses a CPU-only
+# install when `c/libcolibri.a` already has HIP or CUDA objects, so that
+# archive is not rebuilt as CPU. Override: `just install install,ffi-hip`
+# (or `just install features=install,ffi-hip`). CPU: `just install install,ffi`.
+# Process-only: `just install install`.
+# Auto HIP when hipcc is on PATH, else CPU. Prints the flavor.
+install features="auto":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(just _install-native-features '{{ features }}')"
+    echo "just install: installing ${FLAVOR} (features ${FEATURES})"
+    if [[ "${FLAVOR}" == "HIP" ]]; then
+      export COLIBRI_REQUIRE_FFI_HIP=1
+    fi
+    cargo install --path crates/colibri-native --locked --force --no-default-features --features "${FEATURES}"
+    echo "just install: installed ${FLAVOR} (features ${FEATURES})"
+
+# Resolve cargo features for `just install`. stdout is FEATURES= and FLAVOR=
+# (eval-friendly). hip/cuda/archive: `live` probes this host; tests inject
+# 0|1 and cpu|hip|cuda|none. Do not rebuild a GPU archive as CPU-only.
+[private]
+_install-native-features features="auto" hip="live" cuda="live" archive="live":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    features='{{ features }}'
+    hip_probe='{{ hip }}'
+    cuda_probe='{{ cuda }}'
+    archive_probe='{{ archive }}'
+    # `just install features=install,ffi-hip` passes that whole token as the
+    # first argument. Strip the name prefix so the documented override works.
+    if [[ $features == features=* ]]; then
+      features=${features#features=}
+    fi
+    if [[ $hip_probe == hip=* ]]; then
+      hip_probe=${hip_probe#hip=}
+    fi
+    if [[ $cuda_probe == cuda=* ]]; then
+      cuda_probe=${cuda_probe#cuda=}
+    fi
+    if [[ $archive_probe == archive=* ]]; then
+      archive_probe=${archive_probe#archive=}
+    fi
+
+    archive_flavor() {
+      local path=$1
+      if [[ ! -s $path ]]; then
+        echo none
+        return
+      fi
+      if grep -a -q -F -e '__hipUnregisterFatBinary' -e '__hipRegisterFatBinary' "$path"; then
+        echo hip
+      elif grep -a -q -F -e '__cudaUnregisterFatBinary' -e '__cudaRegisterFatBinary' "$path"; then
+        echo cuda
+      else
+        echo none
+      fi
+    }
+
+    refuse_cpu_wipe() {
+      local kind=$1
+      echo "error: refusing CPU-only native install because a ${kind} engine archive is present. That path rebuilds c/libcolibri.a as CPU and wipes ${kind} objects. Use HIP (hipcc on PATH, or just install install,ffi-hip)." >&2
+      exit 1
+    }
+
+    case $archive_probe in
+      live) arch_flavor=$(archive_flavor c/libcolibri.a) ;;
+      hip|cuda|cpu|none) arch_flavor=$archive_probe ;;
+      *) echo "error: unknown archive probe ${archive_probe} (live|hip|cuda|cpu|none)" >&2; exit 1 ;;
+    esac
+    if [[ $arch_flavor == cpu ]]; then
+      arch_flavor=none
+    fi
+
+    run_hip=0
+    if [[ $hip_probe == live ]]; then
+      eval "$(just _gpu-ffi-compilers)"
+      run_hip=${HIP}
+    elif [[ $hip_probe == 1 ]]; then
+      run_hip=1
+    elif [[ $hip_probe == 0 ]]; then
+      run_hip=0
+    else
+      echo "error: unknown hip probe ${hip_probe} (live|0|1)" >&2
+      exit 1
+    fi
+    # Native has no ffi-cuda feature. cuda_probe is only for tests that inject
+    # a leftover CUDA archive (still refuse a CPU wipe).
+    if [[ $cuda_probe == live ]]; then
+      :
+    elif [[ $cuda_probe == 0 || $cuda_probe == 1 ]]; then
+      :
+    else
+      echo "error: unknown cuda probe ${cuda_probe} (live|0|1)" >&2
+      exit 1
+    fi
+
+    has_ffi=0
+    has_hip=0
+    if [[ $features == auto || -z $features ]]; then
+      if [[ $run_hip -eq 1 ]]; then
+        features=install,ffi-hip
+      else
+        features=install,ffi
+      fi
+    fi
+    IFS=',' read -ra parts <<< "$features"
+    for p in "${parts[@]}"; do
+      case $p in
+        ffi) has_ffi=1 ;;
+        ffi-hip) has_hip=1; has_ffi=1 ;;
+      esac
+    done
+
+    flavor=cpu
+    if [[ $has_hip -eq 1 ]]; then
+      flavor=HIP
+    elif [[ $has_ffi -eq 1 ]]; then
+      flavor=cpu
+    else
+      flavor=process
+    fi
+
+    if [[ $flavor == cpu && ( $arch_flavor == hip || $arch_flavor == cuda ) ]]; then
+      if [[ $arch_flavor == hip ]]; then
+        refuse_cpu_wipe HIP
+      else
+        refuse_cpu_wipe CUDA
+      fi
+    fi
+
+    printf 'FEATURES=%s\nFLAVOR=%s\n' "$features" "$flavor"
+
+# Recipe contract for install feature selection (no cargo install).
+# Injected probes: HIP when hipcc would be present, CPU otherwise, refuse when
+# a GPU archive would be wiped. Live probe must match `_gpu-ffi-compilers`.
+# Feature-selection contract for `just install` (does not run cargo install).
+test-install-native-features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail=0
+    expect_ok() {
+      local label=$1 features=$2 hip=$3 cuda=$4 archive=$5 want_features=$6 want_flavor=$7
+      local out rc
+      set +e
+      out=$(just _install-native-features "$features" "$hip" "$cuda" "$archive" 2>/dev/null)
+      rc=$?
+      set -e
+      if [[ $rc -ne 0 ]]; then
+        echo "FAIL ${label}: expected exit 0, got ${rc}" >&2
+        fail=1
+        return
+      fi
+      local got_features got_flavor
+      got_features=$(printf '%s\n' "$out" | sed -n 's/^FEATURES=//p' | tail -n1)
+      got_flavor=$(printf '%s\n' "$out" | sed -n 's/^FLAVOR=//p' | tail -n1)
+      if [[ $got_features != "$want_features" || $got_flavor != "$want_flavor" ]]; then
+        echo "FAIL ${label}: got FEATURES=${got_features} FLAVOR=${got_flavor}, want FEATURES=${want_features} FLAVOR=${want_flavor}" >&2
+        fail=1
+      else
+        echo "ok ${label}: FEATURES=${got_features} FLAVOR=${got_flavor}"
+      fi
+    }
+    expect_fail() {
+      local label=$1 features=$2 hip=$3 cuda=$4 archive=$5
+      local rc err
+      set +e
+      err=$(just _install-native-features "$features" "$hip" "$cuda" "$archive" 2>&1 >/dev/null)
+      rc=$?
+      set -e
+      if [[ $rc -eq 0 ]]; then
+        echo "FAIL ${label}: expected refuse, got exit 0" >&2
+        fail=1
+        return
+      fi
+      if [[ $err != *wipes* ]]; then
+        echo "FAIL ${label}: refuse exit ${rc} but stderr lacked wipe notice: ${err}" >&2
+        fail=1
+      else
+        echo "ok ${label}: refused CPU wipe (exit ${rc})"
+      fi
+    }
+
+    expect_ok "auto hipcc" auto 1 0 cpu install,ffi-hip HIP
+    expect_ok "auto hipcc keeps HIP archive" auto 1 0 hip install,ffi-hip HIP
+    expect_ok "auto no toolkit" auto 0 0 cpu install,ffi cpu
+    expect_ok "auto nvcc only is still CPU (native has no ffi-cuda)" auto 0 1 cpu install,ffi cpu
+    expect_ok "explicit HIP" install,ffi-hip 0 0 cpu install,ffi-hip HIP
+    expect_ok "features= prefix override" features=install,ffi-hip 0 0 cpu install,ffi-hip HIP
+    expect_ok "explicit CPU" install,ffi 1 0 cpu install,ffi cpu
+    expect_ok "process-only does not wipe" install 0 0 hip install process
+    expect_fail "auto HIP archive without hipcc" auto 0 0 hip
+    expect_fail "auto CUDA archive without GPU features" auto 0 0 cuda
+    expect_fail "explicit CPU would wipe HIP" install,ffi 1 0 hip
+
+    eval "$(just _gpu-ffi-compilers 2>/dev/null)"
+    live=$(just _install-native-features auto 2>/dev/null)
+    live_flavor=$(printf '%s\n' "$live" | sed -n 's/^FLAVOR=//p' | tail -n1)
+    live_features=$(printf '%s\n' "$live" | sed -n 's/^FEATURES=//p' | tail -n1)
+    if [[ ${HIP} -eq 1 ]]; then
+      if [[ $live_flavor != HIP || $live_features != install,ffi-hip ]]; then
+        echo "FAIL live: HIP=1 from _gpu-ffi-compilers but got FEATURES=${live_features} FLAVOR=${live_flavor}" >&2
+        fail=1
+      else
+        echo "ok live: hipcc present → FEATURES=${live_features} FLAVOR=${live_flavor}"
+      fi
+    else
+      if [[ $live_flavor == HIP ]]; then
+        echo "FAIL live: HIP=0 from _gpu-ffi-compilers but flavor is HIP" >&2
+        fail=1
+      else
+        echo "ok live: no hipcc → FEATURES=${live_features} FLAVOR=${live_flavor}"
+      fi
+    fi
+
+    if ! just --show install | grep -q _install-native-features; then
+      echo "FAIL just install recipe does not call _install-native-features" >&2
+      fail=1
+    else
+      echo "ok just install uses _install-native-features"
+    fi
+
+    if [[ $fail -ne 0 ]]; then
+      echo "test-install-native-features: FAILED" >&2
+      exit 1
+    fi
+    echo "test-install-native-features: passed"
 
 # ---------------------------------------------------------------------------
 # Comprehensive local CI: every Linux job in check.yml and ci.yml.
@@ -355,31 +578,37 @@ v4-tiny: (_venv "deepseek-v4-tiny" "c/tools/requirements-deepseek-v4-tiny.txt")
     make -C c {{ make_j }} deepseek-v4-tiny-check
 
 # check.yml glm53-oracle. Each CI step starts at the repo root.
+# Fixtures live under target/just-check-all/glm53, not /tmp. /tmp is a small
+# memory disk and still holds the previous run. The recipe removes that
+# directory before generating, so a second local run does not need --force.
+# CI still generates into a fresh /tmp and does not use this recipe body.
 glm53-oracle: (_venv "glm53-tiny" "c/tools/requirements-glm53-tiny.txt")
     #!/usr/bin/env bash
     set -euo pipefail
     root=$(pwd)
     export PATH="$root/target/just-check-all/venvs/glm53-tiny/bin:$PATH"
+    fix="$root/target/just-check-all/glm53"
+    rm -rf "$fix"
     (
     cd "$root"
-    python c/tools/make_glm53_tiny.py --output /tmp/glm53_tiny
-    python c/tools/check_glm53_checkpoint.py --model /tmp/glm53_tiny
+    python c/tools/make_glm53_tiny.py --output "$fix/glm53_tiny"
+    python c/tools/check_glm53_checkpoint.py --model "$fix/glm53_tiny"
     )
     (
     cd "$root"
     make -C c glm53
-    python c/tools/make_glm53_multimodal_tiny.py --output /tmp/glm53_mm
-    python c/tools/make_glm53_streaming_pair.py --fixture /tmp/glm53_mm --output /tmp/glm53_stream
-    python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
-    cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
-    COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
-    COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
-    COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
+    python c/tools/make_glm53_multimodal_tiny.py --output "$fix/glm53_mm"
+    python c/tools/make_glm53_streaming_pair.py --fixture "$fix/glm53_mm" --output "$fix/glm53_stream"
+    python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 "$fix/glm53_stream-i4"
+    cd c && COLI_GLM53_FIXTURE="$fix/glm53_stream-i4" python -m unittest -v tests.test_glm53_dashboard
+    COLI_GLM53_FIXTURE="$fix/glm53_stream-i4" python -m unittest -v tests.test_glm53_context_exceeded
+    COLI_GLM53_FIXTURE="$fix/glm53_stream-i4" python -m unittest -v tests.test_glm53_hostile_weights
+    COLI_GLM53_FIXTURE="$fix/glm53_mm" python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
     )
     (
     cd "$root"
-    cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
-    GLM53_TINY=/tmp/glm53_tiny COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefill_batch
+    cd c && GLM53_TINY="$fix/glm53_tiny" GLM53_MM_TINY="$fix/glm53_mm" python -m unittest -v tests.test_glm53_oracles
+    GLM53_TINY="$fix/glm53_tiny" COLI_GLM53_FIXTURE="$fix/glm53_stream-i4" python -m unittest -v tests.test_glm53_prefill_batch
     )
 
 # ci.yml laya-tiny-check.
@@ -412,11 +641,26 @@ jev-sdk-check: (_venv "jev-sdk" "c/tools/requirements-jev-sdk.txt" "numpy" "c/to
     make -C c jev-sdk-check
 
 # ci.yml olmoe-tiny-check. Shared oracle venv.
+# make_olmoe_tiny.py exits when its output directory already exists.
+# A second local run leaves c/olmoe_tiny and c/olmoe_tiny_c behind.
+# Remove each one before generating only when git ls-files lists no
+# tracked file under that path. Do not pass --force.
 olmoe-tiny-check: (_venv "oracle" "c/tools/oracle-requirements.txt")
     #!/usr/bin/env bash
     set -euo pipefail
     root=$(pwd)
     export PATH="$root/target/just-check-all/venvs/oracle/bin:$PATH"
+    for rel in c/olmoe_tiny c/olmoe_tiny_c; do
+      tracked=$(git -C "$root" ls-files -- "$rel")
+      if [[ -n "$tracked" ]]; then
+        echo "skip $rel: git ls-files shows a tracked file" >&2
+        continue
+      fi
+      if [[ -e "$root/$rel" ]]; then
+        echo "removing untracked $rel"
+        rm -rf "$root/$rel"
+      fi
+    done
     (
     cd "$root"
     cd c

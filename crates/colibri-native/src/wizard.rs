@@ -301,12 +301,11 @@ pub fn shell_prefs_snapshot(
     last_model_path: impl Into<String>,
 ) -> NativePrefs {
     NativePrefs {
-        version: crate::prefs::PREFS_VERSION,
         first_run_done,
         theme,
         locale,
         last_model_path: last_model_path.into(),
-        xdna: false,
+        ..NativePrefs::default()
     }
 }
 
@@ -524,6 +523,7 @@ mod tests {
         assert!(prefs.first_run_done);
         assert!(!w.open);
         assert_eq!(w.step, WizardStep::Welcome);
+        assert!(prefs.xdna);
     }
 
     #[test]
@@ -554,6 +554,7 @@ mod tests {
         let loaded = load_from_path(&path);
         assert_eq!(loaded.theme, ThemePref::Mint);
         assert!(loaded.first_run_done);
+        assert!(!loaded.xdna);
 
         save_theme_to_prefs_path(&path, ThemePref::Doge).unwrap();
         let loaded = load_from_path(&path);
@@ -567,6 +568,7 @@ mod tests {
         assert_eq!(p.theme, ThemePref::Mint);
         assert_eq!(p.locale, LocalePref::It);
         assert_eq!(p.last_model_path, "/m");
+        assert!(p.xdna);
     }
 
     #[test]
@@ -592,6 +594,7 @@ mod tests {
         assert!(loaded.first_run_done);
         assert!(!w.open);
         assert!(!loaded.should_show_wizard());
+        assert!(loaded.xdna);
     }
 
     #[test]

@@ -79,8 +79,11 @@ static engines). Process-only: `--no-default-features --features install`, or
 runtime kill-switch `COLIBRI_FORCE_PROCESS=1`. C static libs follow existing FFI
 docs (`colibri-sys` Phase D).
 
-**GPU in-process (opt-in):** default `ffi` is **CPU-only** for GPU kernels.
-On an AMD/ROCm machine, build with HIP embed:
+**GPU in-process:** Cargo default `ffi` is **CPU-only** for GPU kernels.
+On an AMD/ROCm machine, `just install` from the repository root selects HIP
+when `hipcc` is on PATH, otherwise CPU, and prints which flavor it installed.
+It refuses a CPU-only install when `c/libcolibri.a` already contains HIP or
+CUDA objects, so that archive is not rebuilt as CPU. To build HIP by hand:
 
 ```bash
 # Optional: ROCM_HOME=/opt/rocm HIP_ARCH=native (or gfxXXXX)

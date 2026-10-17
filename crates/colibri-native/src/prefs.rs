@@ -28,6 +28,13 @@ pub const PREFS_FILE_NAME: &str = "native-ui.toml";
 pub const PREFS_JSON_FILE_NAME: &str = "native-ui.json";
 /// Schema version written on save.
 pub const PREFS_VERSION: u32 = 1;
+
+/// Missing `xdna` key and [`NativePrefs::default`] are On.
+/// An explicit `false` on disk stays Off.
+fn default_xdna() -> bool {
+    true
+}
+
 /// Env key that overrides the theme preference.
 pub const THEME_ENV: &str = "COLIBRI_THEME";
 /// Env key that skips the first-run wizard when set truthy (`1` / `true` / `yes`).
@@ -118,7 +125,8 @@ pub struct NativePrefs {
     pub locale: LocalePref,
     /// Optional absolute model path; empty means unset.
     pub last_model_path: String,
-    /// XDNA switch. Missing or absent on disk loads as false.
+    /// XDNA switch. Missing key and [`NativePrefs::default`] are On.
+    /// An explicit saved `false` stays Off.
     pub xdna: bool,
 }
 
@@ -130,7 +138,7 @@ impl Default for NativePrefs {
             theme: ThemePref::Doge,
             locale: LocalePref::En,
             last_model_path: String::new(),
-            xdna: false,
+            xdna: default_xdna(),
         }
     }
 }
@@ -144,7 +152,9 @@ struct RawNativePrefs {
     theme: Option<String>,
     locale: Option<String>,
     last_model_path: Option<String>,
-    xdna: Option<bool>,
+    /// Missing key uses [`default_xdna`] (On). Explicit `false` stays Off.
+    #[serde(default = "default_xdna")]
+    xdna: bool,
 }
 
 impl From<RawNativePrefs> for NativePrefs {
@@ -163,7 +173,7 @@ impl From<RawNativePrefs> for NativePrefs {
                 .map(LocalePref::parse)
                 .unwrap_or_default(),
             last_model_path: raw.last_model_path.unwrap_or_default(),
-            xdna: raw.xdna.unwrap_or(false),
+            xdna: raw.xdna,
         }
     }
 }
@@ -344,6 +354,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_native_prefs_xdna_is_on() {
+        assert!(NativePrefs::default().xdna);
+        assert!(default_xdna());
+    }
+
+    #[test]
     fn xdna_true_round_trips_through_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PREFS_FILE_NAME);
@@ -357,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_without_xdna_key_loads_false() {
+    fn toml_without_xdna_key_loads_true() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PREFS_FILE_NAME);
         fs::write(
@@ -366,7 +382,64 @@ mod tests {
         )
         .unwrap();
         let prefs = load_from_path(&path);
-        assert!(!prefs.xdna);
+        assert!(prefs.xdna);
+    }
+
+    #[test]
+    fn json_without_xdna_field_loads_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join(PREFS_FILE_NAME);
+        let json_path = dir.path().join(PREFS_JSON_FILE_NAME);
+        fs::write(
+            &json_path,
+            r#"{
+  "version": 1,
+  "first_run_done": true,
+  "theme": "doge",
+  "locale": "en",
+  "last_model_path": "/models/legacy"
+}"#,
+        )
+        .unwrap();
+        let prefs = load_from_path(&toml_path);
+        assert!(prefs.xdna);
+        assert_eq!(prefs.last_model_path, "/models/legacy");
+        assert!(prefs.first_run_done);
+    }
+
+    #[test]
+    fn explicit_xdna_false_stays_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join(PREFS_FILE_NAME);
+        fs::write(
+            &toml_path,
+            "version = 1\nfirst_run_done = true\ntheme = \"doge\"\nlocale = \"en\"\nlast_model_path = \"\"\nxdna = false\n",
+        )
+        .unwrap();
+        let from_toml = load_from_path(&toml_path);
+        assert!(!from_toml.xdna);
+
+        let json_dir = dir.path().join("json-only");
+        fs::create_dir(&json_dir).unwrap();
+        let json_toml = json_dir.join(PREFS_FILE_NAME);
+        let json_path = json_dir.join(PREFS_JSON_FILE_NAME);
+        fs::write(
+            &json_path,
+            r#"{"version":1,"first_run_done":true,"theme":"doge","locale":"en","last_model_path":"","xdna":false}"#,
+        )
+        .unwrap();
+        let from_json = load_from_path(&json_toml);
+        assert!(!from_json.xdna);
+
+        let original = NativePrefs {
+            xdna: false,
+            ..NativePrefs::default()
+        };
+        let round = dir.path().join("round").join(PREFS_FILE_NAME);
+        original.save_to_path(&round).unwrap();
+        let loaded = load_from_path(&round);
+        assert!(!loaded.xdna);
+        assert_eq!(loaded, original);
     }
 
     #[test]
@@ -380,6 +453,7 @@ mod tests {
         assert_eq!(prefs.theme, ThemePref::Doge);
         assert_eq!(prefs.locale, LocalePref::En);
         assert!(prefs.last_model_path.is_empty());
+        assert!(prefs.xdna);
     }
 
     #[test]
@@ -503,6 +577,7 @@ last_model_path = "/x"
         assert!(prefs.first_run_done);
         assert_eq!(prefs.theme, ThemePref::Doge);
         assert_eq!(prefs.version, PREFS_VERSION);
+        assert!(prefs.xdna);
     }
 
     #[test]
@@ -528,6 +603,7 @@ last_model_path = "/x"
         assert_eq!(prefs.locale, LocalePref::It);
         assert_eq!(prefs.last_model_path, "/models/from-json");
         assert_eq!(prefs.version, PREFS_VERSION);
+        assert!(prefs.xdna);
     }
 
     #[test]

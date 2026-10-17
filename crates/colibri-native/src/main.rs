@@ -60,18 +60,20 @@ use crate::host::{
 };
 #[cfg(feature = "install")]
 use crate::host::{
-    DEFAULT_INSTALL_MIN_FREE_BYTES, InstallEvent, check_install_free_space,
-    format_install_bytes_pair, format_install_space_with_min, install_async, install_free_bytes,
-    parse_min_free_gb, progress_view_for_install, validate_install_form,
+    DEFAULT_INSTALL_MIN_FREE_BYTES, DeleteCatalogError, InstallEvent, check_install_free_space,
+    delete_catalog_model, format_install_bytes_pair, format_install_space_with_min, install_async,
+    install_free_bytes, parse_min_free_gb, progress_view_for_install, validate_install_form,
 };
 use crate::i18n::{Locale, t, t_fmt};
 #[cfg(feature = "install")]
 use crate::install_ui::{
-    CatalogNextStep, InstallCheckpoint, InstallUiAction, InstallUiPhase, cancelling_status_line,
-    catalog_next_step, catalog_next_step_key, clear_checkpoint_default, exclusive_status_for_phase,
-    is_busy as install_is_busy, load_checkpoint_default, paused_status_line, pausing_status_line,
-    save_checkpoint_default, show_active_progress_line, show_cancel_active, show_pause,
-    show_resume, transition as install_ui_transition, transition_job_paused,
+    CatalogNextStep, CatalogRowAction, InstallCheckpoint, InstallUiAction, InstallUiPhase,
+    cancelling_status_line, catalog_delete_live_engine_sentence, catalog_next_step,
+    catalog_next_step_key, catalog_row_action, catalog_row_action_label, clear_checkpoint_default,
+    exclusive_status_for_phase, is_busy as install_is_busy, load_checkpoint_default,
+    paused_status_line, pausing_status_line, save_checkpoint_default, show_active_progress_line,
+    show_cancel_active, show_pause, show_resume, transition as install_ui_transition,
+    transition_job_paused,
 };
 #[cfg(feature = "install")]
 use crate::notify_os::notify_install_complete;
@@ -97,7 +99,7 @@ use crate::wizard::{
     readiness_clock_now, readiness_running_status, shell_prefs_snapshot,
     wizard_complete_success_status, wizard_may_set_success_status,
 };
-use crate::xdna_memory::xdna_memory_sentence;
+use crate::xdna_memory::{record_session_start_probe, xdna_config_sentence};
 use crate::xdna_row::xdna_row_note;
 #[cfg(feature = "install")]
 use colibri_sys::install::{InstallCancel, InstallLiveProgress};
@@ -1265,6 +1267,7 @@ impl DesktopApp {
             "Engine ready".into()
         };
         *self.session.lock().unwrap() = Some(session);
+        record_session_start_probe(self.xdna);
         self.status = status.into();
         self.persist_prefs(cx);
         self.ensure_visual_pump(cx);
@@ -1371,7 +1374,7 @@ impl DesktopApp {
                             .min_w_0()
                             .text_xs()
                             .text_color(rgb(p.muted))
-                            .child(xdna_memory_sentence(on, None)),
+                            .child(xdna_config_sentence(on)),
                     ),
             )
     }
@@ -1891,12 +1894,17 @@ impl DesktopApp {
                         self.badge_tok_s = Some(self.live_token_count as f32 / since as f32);
                     }
                     self.badge_tokens = Some(self.live_token_count);
-                    let tok_s = self.badge_tok_s.map(|s| s as f64).unwrap_or(0.0);
-                    let view = progress_view_for_generate(
-                        self.live_token_count.min(u32::MAX as u64) as u32,
-                        self.gen_max_tokens,
-                        tok_s,
-                    );
+                    let generated = self.live_token_count.min(u32::MAX as u64) as u32;
+                    let elapsed_secs = self
+                        .stream_start
+                        .map(|s| s.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    let ttft_secs = match (self.stream_start, self.first_token_at) {
+                        (Some(start), Some(first)) => first.duration_since(start).as_secs_f64(),
+                        _ => 0.0,
+                    };
+                    let tok_s = generate_progress_tok_per_sec(generated, elapsed_secs, ttft_secs);
+                    let view = progress_view_for_generate(generated, self.gen_max_tokens, tok_s);
                     self.status = view.line().into();
                     self.gen_progress = Some(view);
                     if let Some(idx) = self.streaming_idx {
@@ -2236,6 +2244,48 @@ impl DesktopApp {
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(installed_label),
                             );
+                        }
+                        #[cfg(feature = "install")]
+                        {
+                            let action = catalog_row_action(installed, model.offers_install());
+                            if let Some(action_label) = catalog_row_action_label(action) {
+                                let action_id = catalog_id.clone();
+                                let btn_id = SharedString::from(format!(
+                                    "{id_prefix}-catalog-action-{}",
+                                    start + i
+                                ));
+                                row = row.child(
+                                    div()
+                                        .id(btn_id)
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(p.primary))
+                                        .text_xs()
+                                        .text_color(rgb(p.primary_fg))
+                                        .cursor_pointer()
+                                        .child(action_label)
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                match action {
+                                                    CatalogRowAction::Install => {
+                                                        this.activate_catalog_next(
+                                                            CatalogNextStep::Install,
+                                                            &action_id,
+                                                            cx,
+                                                        );
+                                                    }
+                                                    CatalogRowAction::Delete => {
+                                                        this.delete_catalog_row(&action_id, cx);
+                                                    }
+                                                    CatalogRowAction::None => {}
+                                                }
+                                            }),
+                                        ),
+                                );
+                            }
                         }
                         row.on_mouse_up(
                             MouseButton::Left,
@@ -4210,6 +4260,60 @@ impl DesktopApp {
         }
     }
 
+    #[cfg(feature = "install")]
+    fn delete_catalog_row(&mut self, catalog_id: &str, cx: &mut Context<Self>) {
+        let store = self
+            .machine
+            .as_ref()
+            .map(|m| m.model_store.path.clone())
+            .unwrap_or_else(colibri_sys::default_model_store_path);
+        let live_path = if self.engine_is_live() {
+            Some(self.model_path(cx))
+        } else {
+            None
+        };
+        match delete_catalog_model(
+            catalog_id,
+            &self.registry_entries,
+            &store,
+            live_path.as_deref(),
+        ) {
+            Ok(path) => {
+                self.scan_registry(cx);
+                self.status = format!("Deleted {}", path.display()).into();
+                cx.notify();
+            }
+            Err(DeleteCatalogError::LiveEngine) => {
+                if self.starting || self.generating {
+                    self.status = catalog_delete_live_engine_sentence().into();
+                    cx.notify();
+                    return;
+                }
+                self.stop_engine(cx);
+                if self.engine_is_live() {
+                    self.status = catalog_delete_live_engine_sentence().into();
+                    cx.notify();
+                    return;
+                }
+                match delete_catalog_model(catalog_id, &self.registry_entries, &store, None) {
+                    Ok(path) => {
+                        self.scan_registry(cx);
+                        self.status = format!("Deleted {}", path.display()).into();
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        self.status = e.as_message().into();
+                        cx.notify();
+                    }
+                }
+            }
+            Err(e) => {
+                self.status = e.as_message().into();
+                cx.notify();
+            }
+        }
+    }
+
     fn setup_config_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette();
         let border = if self.setup_config_focused {
@@ -5617,6 +5721,16 @@ impl DesktopApp {
     }
 }
 
+/// Tok/s passed into generate remaining-time from live stream counters.
+///
+/// Decode after TTFT (`(generated - 1) / (elapsed - ttft)`), not wall
+/// `generated / elapsed` including prefill. `0.0` when there is no decode
+/// sample yet (progress omits remaining-time).
+fn generate_progress_tok_per_sec(generated: u32, elapsed_secs: f64, ttft_secs: f64) -> f64 {
+    crate::progress::decode_tok_per_sec_after_ttft(generated, elapsed_secs, ttft_secs)
+        .unwrap_or(0.0)
+}
+
 /// Tab chrome fill: active uses primary; inactive uses panel (never bare black).
 fn tab_bg_color(p: &ThemePalette, active: bool) -> u32 {
     if active { p.primary } else { p.panel }
@@ -6234,6 +6348,80 @@ fn session_engine_kind(slot: &Arc<Mutex<Option<EngineSession>>>) -> Option<&'sta
     })
 }
 
+/// Native host argv. `--headless` skips the visible GPUI window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NativeCli {
+    headless: bool,
+}
+
+/// How the GPUI application starts. Default is the normal visible window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeStartKind {
+    VisibleWindow,
+    Headless,
+}
+
+fn native_cli_from_args<I, S>(args: I) -> NativeCli
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut cli = NativeCli::default();
+    for arg in args {
+        if arg.as_ref() == "--headless" {
+            cli.headless = true;
+        }
+    }
+    cli
+}
+
+fn native_start_kind(cli: NativeCli) -> NativeStartKind {
+    if cli.headless {
+        NativeStartKind::Headless
+    } else {
+        NativeStartKind::VisibleWindow
+    }
+}
+
+fn opens_visible_window(kind: NativeStartKind) -> bool {
+    matches!(kind, NativeStartKind::VisibleWindow)
+}
+
+fn on_headless_launch(cx: &mut App) {
+    bind_text_input_keys(cx);
+}
+
+fn on_visible_window_launch(cx: &mut App) {
+    bind_text_input_keys(cx);
+    open_desktop_window(cx);
+    cx.activate(true);
+}
+
+fn open_desktop_window(cx: &mut App) {
+    let restore = Bounds::centered(
+        None,
+        size(px(DEFAULT_WINDOW_SIZE.0), px(DEFAULT_WINDOW_SIZE.1)),
+        cx,
+    );
+    let mode = launch_window_mode_from_env(std::env::var("COLIBRI_WINDOWED").ok().as_deref());
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(initial_window_bounds(mode, restore)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("colibrì".into()),
+                ..Default::default()
+            }),
+            app_id: Some(crate::log_init::native_app_id().to_string()),
+            window_min_size: Some(size(px(900.), px(600.))),
+            focus: true,
+            show: true,
+            ..Default::default()
+        },
+        |_, cx| cx.new(DesktopApp::new),
+    )
+    .expect("open window");
+}
+
 fn main() {
     crate::stderr_tee::install_host_stderr_tee();
     match crate::log_init::init_native_logging() {
@@ -6246,39 +6434,63 @@ fn main() {
         }
         crate::log_init::NativeLogInit::Disabled => {}
     }
-    Application::new().run(|cx: &mut App| {
-        bind_text_input_keys(cx);
-
-        let restore = Bounds::centered(
-            None,
-            size(px(DEFAULT_WINDOW_SIZE.0), px(DEFAULT_WINDOW_SIZE.1)),
-            cx,
-        );
-        let mode = launch_window_mode_from_env(std::env::var("COLIBRI_WINDOWED").ok().as_deref());
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(initial_window_bounds(mode, restore)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("colibrì".into()),
-                    ..Default::default()
-                }),
-                app_id: Some(crate::log_init::native_app_id().to_string()),
-                window_min_size: Some(size(px(900.), px(600.))),
-                focus: true,
-                show: true,
-                ..Default::default()
-            },
-            |_, cx| cx.new(DesktopApp::new),
-        )
-        .expect("open window");
-        cx.activate(true);
-    });
+    let cli = native_cli_from_args(std::env::args().skip(1));
+    let kind = native_start_kind(cli);
+    if opens_visible_window(kind) {
+        Application::new().run(on_visible_window_launch);
+    } else {
+        Application::headless().run(on_headless_launch);
+    }
 }
 
 #[cfg(test)]
 mod chrome_tests {
     use super::*;
     use crate::theme::{doge_palette, mint_palette};
+
+    #[test]
+    fn generate_progress_tok_s_after_ttft_is_decode_not_wall() {
+        // After TTFT, 5 decode tokens in 2s → 2.5 tok/s, not wall 6 / 86.793.
+        // After token 2, remaining-time must not keep the prefill wall rate.
+        let generated = 6_u32;
+        let max_output = 256_u32;
+        let ttft_secs = 84.793;
+        let elapsed_secs = ttft_secs + 2.0;
+        let wall = f64::from(generated) / elapsed_secs;
+        let tok_s = generate_progress_tok_per_sec(generated, elapsed_secs, ttft_secs);
+        assert!(
+            (tok_s - 2.5).abs() < 1e-6,
+            "must pass decode tok/s after TTFT, not wall including prefill; got {tok_s} (wall {wall})"
+        );
+        let wall_view = progress_view_for_generate(generated, max_output, wall);
+        assert!(
+            wall_view.eta_secs.is_some_and(|s| s >= 3600),
+            "prefill wall rate would still paint hours, got {:?}",
+            wall_view.eta_secs
+        );
+        let view = progress_view_for_generate(generated, max_output, tok_s);
+        assert_eq!(view.eta_secs, Some(100)); // 250 remaining / 2.5 tok/s
+        assert!(
+            !view.line().contains("hours left"),
+            "decode ETA must not paint hours: {}",
+            view.line()
+        );
+    }
+
+    #[test]
+    fn generate_progress_tok_s_after_only_ttft_is_zero() {
+        let generated = 1_u32;
+        let ttft_secs = 84.793;
+        let tok_s = generate_progress_tok_per_sec(generated, ttft_secs, ttft_secs);
+        assert_eq!(tok_s, 0.0, "no decode sample after only TTFT");
+        let view = progress_view_for_generate(generated, 256, tok_s);
+        assert_eq!(view.eta_secs, None);
+        assert!(
+            !view.line().contains("hours left"),
+            "TTFT-only must not paint hours: {}",
+            view.line()
+        );
+    }
 
     #[test]
     fn session_heartbeat_interval_matches_log_init() {
@@ -6600,5 +6812,43 @@ mod chrome_tests {
             WindowBounds::Windowed(b) => assert_eq!(b, restore),
             other => panic!("expected Windowed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_recognizes_headless_flag() {
+        let cli = native_cli_from_args(["--headless"]);
+        assert!(cli.headless, "--headless must be recognized");
+        assert_eq!(native_start_kind(cli), NativeStartKind::Headless);
+        let among = native_cli_from_args(["--foo", "--headless", "bar"]);
+        assert!(
+            among.headless,
+            "--headless must be recognized among other args"
+        );
+    }
+
+    #[test]
+    fn cli_without_headless_is_windowed_product() {
+        for args in [Vec::<&str>::new(), vec!["--unknown"], vec!["foo", "bar"]] {
+            let cli = native_cli_from_args(args);
+            assert!(
+                !cli.headless,
+                "without --headless the product stays windowed"
+            );
+            assert_eq!(native_start_kind(cli), NativeStartKind::VisibleWindow);
+            assert!(
+                opens_visible_window(native_start_kind(cli)),
+                "default start must open the visible window"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_start_does_not_open_visible_window() {
+        let kind = native_start_kind(native_cli_from_args(["--headless"]));
+        assert_eq!(kind, NativeStartKind::Headless);
+        assert!(
+            !opens_visible_window(kind),
+            "headless must not call the visible window open path"
+        );
     }
 }

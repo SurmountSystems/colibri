@@ -7581,9 +7581,12 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
     for(int i=layer_begin;i<layer_end;i++){
         if(coli_decode_should_stop()) break;
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
-         * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
+         * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco.
+         * Decode (S>=1, S<8) uses the same cadence: first step_all is S=1 or 2. */
         if(S>=8 && (i%4==0 || i==layer_end-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token · +%.2fs\n", i+1, c->n_layers, S, now_s()-tl0);
+        else if(S>=1 && (i%4==0 || i==layer_end-1))
+            fprintf(stderr,"[decode] layer %d/%d · %d token · +%.2fs\n", i+1, c->n_layers, S, now_s()-tl0);
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
         if(pipe2 && l->sparse && i<c->n_layers &&
@@ -11419,6 +11422,8 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
 static double g_mem_avail_boot;   /* def. sotto (#653: corretta qui su GPU integrate) */
 static double coli_clamp_ram_gb(double ram_gb, double mem_avail_gb, int overcommit);  /* def. sotto (#759) */
+static double coli_ram_budget_gb(double ram_gb_explicit, double mem_avail_gb, double mem_total_gb);
+static double coli_resolve_ram_gb(double ram_gb_explicit, double mem_avail_gb, double mem_total_gb, int overcommit, int *auto_out);
 /* Admission test unchanged; it just runs from route_trace.h's reader now, so PIN=<file>
  * accepts every history layout an engine can write instead of only sparse text (#700). */
 typedef struct { Model *m; PinRec *r; int *n, cap; unsigned char *seen; } PinCollect;
@@ -11466,8 +11471,11 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
          * uncorrected boot value (#653 runs later in this function), so on
          * unified-memory hosts this only rejects budgets larger than physical
          * RAM at boot -- never smaller than what the tier will leave behind. */
-        ram_env=coli_clamp_ram_gb(ram_env,g_mem_avail_boot,
-            getenv("COLI_RAM_OVERCOMMIT")?atoi(getenv("COLI_RAM_OVERCOMMIT")):0);
+        { double total_gb=0, avail_now=0;
+          compat_meminfo_gb(&total_gb, &avail_now);
+          ram_env=coli_resolve_ram_gb(ram_env, g_mem_avail_boot>0?g_mem_avail_boot:avail_now, total_gb,
+              getenv("COLI_RAM_OVERCOMMIT")?atoi(getenv("COLI_RAM_OVERCOMMIT")):0, NULL);
+        }
         int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
         double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
         pin_budget_b=avail>0?avail:0.0;
@@ -11757,7 +11765,11 @@ static double kv_pool_bytes(Model *m, int max_ctx){
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
-    if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
+    if(ram_gb<=0){
+        double total_gb=0, avail_now=0;
+        compat_meminfo_gb(&total_gb, &avail_now);
+        ram_gb=coli_resolve_ram_gb(0.0, g_mem_avail_boot>0?g_mem_avail_boot:avail_now, total_gb, 0, NULL);
+    }
     double ws_b = (g_expert_budget>0 && g_expert_budget<64) ? (double)(g_expert_budget+4)*(double)eb : 64.0*(double)eb;
     double slack = 1.2e9 + 2.5e9 + ws_b
         + kv_pool_bytes(m,max_ctx)
@@ -11809,6 +11821,43 @@ static double coli_clamp_ram_gb(double ram_gb, double mem_avail_gb, int overcomm
     return ram_gb;
 }
 
+/* Host-class RAM budget in GB. explicit<=0 is auto: 88% of max(MemAvailable, MemTotal)
+ * so a ~90 GB APU does not inherit a 64 GB default. A 64-class inject (56..65 GB) on a
+ * larger host is that stale default and loses to auto. A clearly smaller operator
+ * budget (for example 32 GB) still wins. */
+static double coli_ram_budget_gb(double ram_gb_explicit, double mem_avail_gb, double mem_total_gb){
+    double host = mem_avail_gb;
+    if(mem_total_gb > host) host = mem_total_gb;
+    double auto_gb = host * 0.88;
+    if(auto_gb < 4) auto_gb = 8;
+    if(ram_gb_explicit <= 0) return auto_gb;
+    if(auto_gb > ram_gb_explicit + 1.0
+       && ram_gb_explicit >= 56.0 && ram_gb_explicit <= 65.0)
+        return auto_gb;
+    return ram_gb_explicit;
+}
+
+/* Resolve RAM_GB for cap_for_ram / expert_avail.
+ * Host-class auto (88% of max(MemAvailable, MemTotal)) must not be clamped
+ * back to MemAvailable: that is how a ~90 GB APU inherited a 64 GB default
+ * and parked experts on disk. An operator budget above host class still
+ * clamps (#759) unless COLI_RAM_OVERCOMMIT=1. */
+static double coli_resolve_ram_gb(double ram_gb_explicit, double mem_avail_gb,
+                                  double mem_total_gb, int overcommit, int *auto_out){
+    double auto_gb = coli_ram_budget_gb(0.0, mem_avail_gb, mem_total_gb);
+    int auto_b = ram_gb_explicit <= 0;
+    double ram_gb = coli_ram_budget_gb(auto_b?0.0:ram_gb_explicit, mem_avail_gb, mem_total_gb);
+    if(!auto_b && ram_gb > ram_gb_explicit) auto_b = 1; /* stale 64-class default raised */
+    if(ram_gb < 4) ram_gb = 8;
+    /* Host-class auto (and a rust-written copy of it) must keep 88% of MemTotal.
+     * Clamping that back to MemAvailable recreates the 64 GB default. An
+     * operator budget above host class still clamps to MemAvailable (#759). */
+    if(!auto_b && ram_gb > auto_gb + 1.0)
+        ram_gb = coli_clamp_ram_gb(ram_gb, mem_avail_gb, overcommit);
+    if(auto_out) *auto_out = auto_b;
+    return ram_gb;
+}
+
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
  * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
@@ -11822,21 +11871,25 @@ static int cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx, int embe
     int64_t eb=expert_bytes_probe(m,ebits);
     double row_b=expert_cache_row_bytes(m,ebits);
     int auto_b = ram_gb<=0;
-    if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
-                                                   * allocato viene sottratto sotto, non due volte */
-        if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); ram_gb=8; } }
-    else{
-        /* #759: an explicit budget larger than what is really available (the
-         * #653-corrected snapshot on unified memory) would only ever be caught
-         * by the OOM killer, after CAP_RAISE had scaled the LRU up against it. */
-        int oc = getenv("COLI_RAM_OVERCOMMIT")?atoi(getenv("COLI_RAM_OVERCOMMIT")):0;
-        double clamped = coli_clamp_ram_gb(ram_gb,g_mem_avail_boot,oc);
-        if(clamped<ram_gb){
-            fprintf(stderr,"[RAM_GB=%.1f] clamped to %.1f GB: that is the MemAvailable this run "
-                "can actually use (#653 snapshot; COLI_RAM_OVERCOMMIT=1 keeps the literal budget)\n",
-                ram_gb,clamped);
-            ram_gb=clamped;
-        }
+    { double total_gb=0, avail_now=0;
+      compat_meminfo_gb(&total_gb, &avail_now);
+      if(g_mem_avail_boot<=0 && avail_now>0) g_mem_avail_boot=avail_now;
+      int oc = getenv("COLI_RAM_OVERCOMMIT")?atoi(getenv("COLI_RAM_OVERCOMMIT")):0;
+      double orig = ram_gb;
+      int auto_out = auto_b;
+      double sampled = coli_resolve_ram_gb(auto_b?0.0:ram_gb, g_mem_avail_boot, total_gb, oc, &auto_out);
+      if(!auto_b && sampled>orig+0.05){
+          fprintf(stderr,"[RAM_GB=%.1f] raised to %.1f GB: host class is %.1f GB, not the 64 GB default\n",
+              orig, sampled, total_gb>g_mem_avail_boot?total_gb:g_mem_avail_boot);
+      }
+      if(sampled+0.05<orig && orig>0){
+          fprintf(stderr,"[RAM_GB=%.1f] clamped to %.1f GB: that is the MemAvailable this run "
+              "can actually use (#653 snapshot; COLI_RAM_OVERCOMMIT=1 keeps the literal budget)\n",
+              orig, sampled);
+      }
+      if(sampled<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); sampled=8; }
+      auto_b = auto_out;
+      ram_gb = sampled;
     }
     g_ram_budget_gb = ram_gb;                    /* #403: la RSS-guard usa il budget RISOLTO */
     /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):

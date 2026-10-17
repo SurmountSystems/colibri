@@ -147,7 +147,10 @@ imported_copies() { sed -n 's/.* MiB of them straight from host memory in \([0-9
 # tier's experts from the host image they are converted in, the trunk's rows from the
 # weights. The same tokens and logits as every copy through the staging buffer
 # (COLI_VK_UP_IMPORT=0); the exit report counts the imported copies; an import the driver
-# refuses (COLI_VK_STAGED_FAULT=import) is staged instead.
+# refuses (COLI_VK_STAGED_FAULT=import) is staged instead. COLI_VK_TIER_BALANCE=0: the
+# tier's split of the routed experts follows the timings, and with it which side's bits a
+# row gets (the CPU's expert kernel is not the device's bits). A loaded machine otherwise
+# hands rows back on one upload and not the other, and the logit bytes differ.
 staged_import() {
   make qwen36 VK=1
   [ -f qwen36_tiny/ref_full.json ] && [ -d qwen36_tiny_c ] || {
@@ -163,7 +166,7 @@ staged_import() {
   for i in 1 0; do
     rm -f imp.usage
     env COLI_USAGE=imp.usage COLI_VULKAN=1 COLI_VK_STAGED=1 COLI_VK_UP_IMPORT=$i COLI_VK_DENSE=1 COLI_VK_TIER_SYNC=1 \
-      COLI_DENSE_I8=0 DUMP=imp$i.f32 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > imp$i.log 2>&1 || true
+      COLI_VK_TIER_BALANCE=0 COLI_DENSE_I8=0 DUMP=imp$i.f32 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > imp$i.log 2>&1 || true
     same_tokens cpu.log imp$i.log "staged imports COLI_VK_UP_IMPORT=$i"
     staged_check imp$i.log "staged imports COLI_VK_UP_IMPORT=$i"
   done
@@ -173,7 +176,7 @@ staged_import() {
   echo "OK staged imports: tokens = CPU, logits = every copy staged, $n copies straight from host memory"
   rm -f imp.usage
   env COLI_USAGE=imp.usage COLI_VULKAN=1 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=import:1 COLI_VK_DENSE=1 COLI_VK_TIER_SYNC=1 \
-    COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > impf.log 2>&1 || true
+    COLI_VK_TIER_BALANCE=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > impf.log 2>&1 || true
   grep -q "COLI_VK_STAGED_FAULT: import #1 fails" impf.log || { cat impf.log; fail "staged imports: the import fault never fired"; }
   same_tokens cpu.log impf.log "staged imports, a refused import"
   f=$(sed -n 's/.* copies (\([0-9]*\) not imported).*/\1/p' impf.log | tail -1)
