@@ -787,8 +787,13 @@ all: colibri$(EXE)
 # code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
 # needs neither torch nor network.  kimi_k3 builds on every platform, so
 # unlike the V4 targets this needs no support gate.
+# make_kimi_k3_tiny.py --force overwrites model.safetensors and config.json
+# but leaves a leftover tokenizer.json (vulkan_engines.sh byte_tokenizer
+# writes that file). The check forbids it: raw-id stdout is the comparison
+# channel. config.json and ref.json are tracked, so do not rm -rf the dir.
 .PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
 kimi-k3-tiny-generate:
+	$(RM) ./kimi_k3_tiny/tokenizer.json
 	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
 
 kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)

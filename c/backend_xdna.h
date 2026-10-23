@@ -136,8 +136,22 @@ int coli_xdna_linux_roster_op(const char *model_id,
 
 /* Map an owned engine binary name to its 2.0 roster id. NULL if unknown. */
 const char *coli_xdna_engine_roster_id(const char *engine_name);
-/* 1 only for the on-disk 64x64 i16 program. Does not open a device. */
+/* 1 when the on-disk 64x64 i16 program is present and this (k,n) is that
+ * program, or tiles through it (remainders pad to 64). Does not open a device. */
 int coli_xdna_shape_would_run(int k, int n, char *reason, size_t reason_cap);
+
+#define COLI_XDNA_TILE64 64u
+
+/* Tile counts for GEMM M x K x N through the 64x64x64 program. Remainders
+ * pad to the next multiple of 64. Returns 1 when m, k, and n are positive. */
+int coli_xdna_tile64_plan(int m, int k, int n,
+                          unsigned *mt, unsigned *kt, unsigned *nt);
+
+/* Host-only i16 GEMM tiled as 64^3. Does not open a device. A is M*K, B is
+ * K*N, C is M*N, all row-major. Qualifies the tiling arithmetic without
+ * claiming live NPU generate. */
+int coli_xdna_tile64_host_i16(const int16_t *a, const int16_t *b, int32_t *c,
+                              int m, int k, int n);
 int coli_xdna_engine_qualified_submit(const char *engine_name,
                                       int32_t *qualified_i32,
                                       char *decline, size_t decline_cap);
@@ -554,7 +568,10 @@ const char *coli_xdna_exec_text(ColiXdnaExec e);
  *
  * y is written ONLY after the helper reports successful completion, so a failure
  * at any stage leaves the caller's output buffer untouched for matmul_qt to
- * overwrite. */
+ * overwrite.
+ *
+ * When the dedicated K=6144 N=2048 artifact bytes are absent, a present
+ * 64x64x64 program tiles that expert GEMM (remainders pad to 64). */
 int coli_xdna_try_matmul(ColiXdnaFamily family,
                          ColiXdnaPrepared **slot,
                          int fmt, const unsigned char *q4, const float *scale,

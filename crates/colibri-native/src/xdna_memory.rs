@@ -19,7 +19,8 @@ fn session_probe_slot() -> std::sync::MutexGuard<'static, Option<bool>> {
 
 /// Persist the session-start 64³ check for this running window.
 /// `Some(true)` completed, `Some(false)` declined or missing device,
-/// `None` has not run. The existing engine-start path calls this.
+/// `None` has not run. Process start and engine start call this through
+/// [`record_session_start_probe`].
 pub fn set_session_probe_completed(probe_completed: Option<bool>) {
     *session_probe_slot() = probe_completed;
 }
@@ -29,9 +30,9 @@ pub fn session_probe_completed() -> Option<bool> {
     *session_probe_slot()
 }
 
-/// After engine start: store the live check when XDNA was requested.
-/// Missing device or missing helper is a finished fail, not "has not run".
-/// XDNA off clears the stored check. Does not run expert GEMM.
+/// Store the live 64³ check when XDNA is requested at process start or engine
+/// start. Missing device or missing helper is a finished fail, not "has not
+/// run". XDNA off clears the stored check. Does not run expert GEMM.
 pub fn record_session_start_probe(xdna_requested: bool) {
     if !xdna_requested {
         set_session_probe_completed(None);
@@ -73,6 +74,13 @@ pub fn xdna_memory_sentence(on: bool, probe_completed: Option<bool>) -> String {
 /// Config sentence for the live XDNA row. Uses the stored session-start check.
 pub fn xdna_config_sentence(on: bool) -> String {
     xdna_memory_sentence(on, session_probe_completed())
+}
+
+#[cfg(test)]
+pub(crate) fn with_session_probe<R>(f: impl FnOnce() -> R) -> R {
+    static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    f()
 }
 
 #[cfg(test)]
@@ -145,13 +153,6 @@ mod tests {
         let s = xdna_memory_sentence(true, None);
         assert!(s.contains("has not run"), "{s}");
         assert!(!s.contains("generate on"), "{s}");
-    }
-
-    static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_session_probe<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        f()
     }
 
     #[test]

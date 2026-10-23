@@ -60,9 +60,10 @@ use crate::host::{
 };
 #[cfg(feature = "install")]
 use crate::host::{
-    DEFAULT_INSTALL_MIN_FREE_BYTES, DeleteCatalogError, InstallEvent, check_install_free_space,
-    delete_catalog_model, format_install_bytes_pair, format_install_space_with_min, install_async,
-    install_free_bytes, parse_min_free_gb, progress_view_for_install, validate_install_form,
+    DEFAULT_INSTALL_MIN_FREE_BYTES, DeleteCatalogError, InstallEvent,
+    catalog_live_engine_path_from_session, check_install_free_space, delete_catalog_model,
+    format_install_bytes_pair, format_install_space_with_min, install_async, install_free_bytes,
+    parse_min_free_gb, progress_view_for_install, validate_install_form,
 };
 use crate::i18n::{Locale, t, t_fmt};
 #[cfg(feature = "install")]
@@ -1888,11 +1889,6 @@ impl DesktopApp {
                         }
                     }
                     self.live_token_count = self.live_token_count.saturating_add(1);
-                    if let Some(start) = self.stream_start {
-                        // Live tok/s from stream start after first token.
-                        let since = start.elapsed().as_secs_f64().max(1e-6);
-                        self.badge_tok_s = Some(self.live_token_count as f32 / since as f32);
-                    }
                     self.badge_tokens = Some(self.live_token_count);
                     let generated = self.live_token_count.min(u32::MAX as u64) as u32;
                     let elapsed_secs = self
@@ -1903,6 +1899,7 @@ impl DesktopApp {
                         (Some(start), Some(first)) => first.duration_since(start).as_secs_f64(),
                         _ => 0.0,
                     };
+                    self.badge_tok_s = live_badge_tok_s(generated, elapsed_secs, ttft_secs);
                     let tok_s = generate_progress_tok_per_sec(generated, elapsed_secs, ttft_secs);
                     let view = progress_view_for_generate(generated, self.gen_max_tokens, tok_s);
                     self.status = view.line().into();
@@ -4267,16 +4264,20 @@ impl DesktopApp {
             .as_ref()
             .map(|m| m.model_store.path.clone())
             .unwrap_or_else(colibri_sys::default_model_store_path);
-        let live_path = if self.engine_is_live() {
-            Some(self.model_path(cx))
-        } else {
-            None
+        let selected = self.model_path(cx);
+        let live_owned = {
+            let guard = self.session.lock().ok();
+            catalog_live_engine_path_from_session(
+                guard.as_ref().and_then(|g| g.as_ref()),
+                Some(selected.as_path()),
+            )
+            .map(Path::to_path_buf)
         };
         match delete_catalog_model(
             catalog_id,
             &self.registry_entries,
             &store,
-            live_path.as_deref(),
+            live_owned.as_deref(),
         ) {
             Ok(path) => {
                 self.scan_registry(cx);
@@ -5731,6 +5732,20 @@ fn generate_progress_tok_per_sec(generated: u32, elapsed_secs: f64, ttft_secs: f
         .unwrap_or(0.0)
 }
 
+/// Live topbar tok/s from stream counters.
+///
+/// Decode after TTFT, same rate as remaining-time
+/// (`generate_progress_tok_per_sec`). Not wall `generated / elapsed`
+/// including prefill. `None` before the first generated token (badge stays
+/// blank). After the first token this is the live number painted as
+/// `topbar.tokPerSec` (`0.0` until a decode sample exists).
+fn live_badge_tok_s(generated: u32, elapsed_secs: f64, ttft_secs: f64) -> Option<f32> {
+    if generated == 0 {
+        return None;
+    }
+    Some(generate_progress_tok_per_sec(generated, elapsed_secs, ttft_secs) as f32)
+}
+
 /// Tab chrome fill: active uses primary; inactive uses panel (never bare black).
 fn tab_bg_color(p: &ThemePalette, active: bool) -> u32 {
     if active { p.primary } else { p.panel }
@@ -6349,9 +6364,12 @@ fn session_engine_kind(slot: &Arc<Mutex<Option<EngineSession>>>) -> Option<&'sta
 }
 
 /// Native host argv. `--headless` skips the visible GPUI window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `--screenshot` (optional path) is the headless first-frame driver.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct NativeCli {
     headless: bool,
+    screenshot: bool,
+    screenshot_path: Option<String>,
 }
 
 /// How the GPUI application starts. Default is the normal visible window.
@@ -6359,6 +6377,8 @@ struct NativeCli {
 enum NativeStartKind {
     VisibleWindow,
     Headless,
+    /// Capture the first frame without `open_desktop_window`.
+    HeadlessScreenshot,
 }
 
 fn native_cli_from_args<I, S>(args: I) -> NativeCli
@@ -6367,24 +6387,77 @@ where
     S: AsRef<str>,
 {
     let mut cli = NativeCli::default();
-    for arg in args {
-        if arg.as_ref() == "--headless" {
+    let mut args = args.into_iter().peekable();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        if arg == "--headless" {
             cli.headless = true;
+        } else if let Some(path) = arg.strip_prefix("--screenshot=") {
+            cli.screenshot = true;
+            if !path.is_empty() {
+                cli.screenshot_path = Some(path.to_string());
+            }
+        } else if arg == "--screenshot" {
+            cli.screenshot = true;
+            let take_path = args
+                .peek()
+                .is_some_and(|next| !next.as_ref().starts_with('-'));
+            if take_path {
+                cli.screenshot_path = args.next().map(|s| s.as_ref().to_string());
+            }
         }
     }
     cli
 }
 
 fn native_start_kind(cli: NativeCli) -> NativeStartKind {
-    if cli.headless {
+    if cli.screenshot {
+        NativeStartKind::HeadlessScreenshot
+    } else if cli.headless {
         NativeStartKind::Headless
     } else {
         NativeStartKind::VisibleWindow
     }
 }
 
+/// Whether this start kind opens the visible GPUI window. Test assertion helper.
+#[cfg(test)]
 fn opens_visible_window(kind: NativeStartKind) -> bool {
     matches!(kind, NativeStartKind::VisibleWindow)
+}
+
+/// Why gpui 0.2.2 Linux cannot produce a headless PNG.
+const HEADLESS_CAPTURE_UNAVAILABLE: &str = "Headless screenshot cannot capture a frame. GPUI Linux headless refuses windows, and this GPUI has no offscreen screenshot API.";
+
+struct HeadlessCaptureError {
+    message: &'static str,
+}
+
+impl std::fmt::Display for HeadlessCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+/// First-frame capture for the headless e2e driver.
+///
+/// Not `open_desktop_window`. gpui 0.2.2 Linux `HeadlessClient::open_window`
+/// always fails, and this crate's GPUI has no `render_to_image` / screenshot
+/// API, so this hook fails loud instead of opening a window.
+fn capture_headless_first_frame() -> Result<Vec<u8>, HeadlessCaptureError> {
+    Err(HeadlessCaptureError {
+        message: HEADLESS_CAPTURE_UNAVAILABLE,
+    })
+}
+
+/// CLI driver for `--headless --screenshot`. Never opens a visible window.
+fn run_headless_screenshot(cli: &NativeCli) -> Result<(), String> {
+    let png = capture_headless_first_frame().map_err(|e| e.to_string())?;
+    if let Some(path) = cli.screenshot_path.as_deref() {
+        std::fs::write(path, png)
+            .map_err(|e| format!("Could not write headless screenshot to {path}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn on_headless_launch(cx: &mut App) {
@@ -6435,11 +6508,21 @@ fn main() {
         crate::log_init::NativeLogInit::Disabled => {}
     }
     let cli = native_cli_from_args(std::env::args().skip(1));
-    let kind = native_start_kind(cli);
-    if opens_visible_window(kind) {
-        Application::new().run(on_visible_window_launch);
-    } else {
-        Application::headless().run(on_headless_launch);
+    let kind = native_start_kind(cli.clone());
+    match kind {
+        NativeStartKind::VisibleWindow => {
+            Application::new().run(on_visible_window_launch);
+        }
+        NativeStartKind::Headless => {
+            Application::headless().run(on_headless_launch);
+        }
+        NativeStartKind::HeadlessScreenshot => match run_headless_screenshot(&cli) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -6447,6 +6530,44 @@ fn main() {
 mod chrome_tests {
     use super::*;
     use crate::theme::{doge_palette, mint_palette};
+
+    #[test]
+    fn topbar_badge_tok_s_after_first_token_is_decode_not_wall() {
+        // After TTFT, 5 decode tokens in 2s → 2.5 tok/s, not wall 6 / 86.793.
+        let generated = 6_u32;
+        let ttft_secs = 84.793;
+        let elapsed_secs = ttft_secs + 2.0;
+        let wall = f64::from(generated) / elapsed_secs;
+        let decode = generate_progress_tok_per_sec(generated, elapsed_secs, ttft_secs);
+        let badge = live_badge_tok_s(generated, elapsed_secs, ttft_secs)
+            .expect("badge tok/s after decode tokens");
+        assert!(
+            (f64::from(badge) - decode).abs() < 1e-5,
+            "topbar tok/s must match decode after TTFT, got {badge} (decode {decode}, wall {wall})"
+        );
+        assert!(
+            (f64::from(badge) - 2.5).abs() < 1e-4,
+            "decode tok/s after TTFT must be 2.5, got {badge}"
+        );
+        assert!(
+            (f64::from(badge) - wall).abs() > 0.1,
+            "must not be wall including prefill; badge {badge} wall {wall}"
+        );
+        let before = live_badge_tok_s(0, elapsed_secs, 0.0);
+        assert!(
+            before.is_none() || before == Some(0.0),
+            "before first token: 0 or blank, got {before:?}"
+        );
+        let after_ttft_only = live_badge_tok_s(1, ttft_secs, ttft_secs);
+        let wall_ttft = 1.0 / ttft_secs;
+        match after_ttft_only {
+            None => {}
+            Some(s) => assert!(
+                (f64::from(s) - wall_ttft).abs() > 0.001,
+                "after only TTFT, badge must not be wall 1/ttft ({wall_ttft}), got {s}"
+            ),
+        }
+    }
 
     #[test]
     fn generate_progress_tok_s_after_ttft_is_decode_not_wall() {
@@ -6834,9 +6955,11 @@ mod chrome_tests {
                 !cli.headless,
                 "without --headless the product stays windowed"
             );
-            assert_eq!(native_start_kind(cli), NativeStartKind::VisibleWindow);
+            assert!(!cli.screenshot, "without --screenshot there is no capture");
+            let kind = native_start_kind(cli);
+            assert_eq!(kind, NativeStartKind::VisibleWindow);
             assert!(
-                opens_visible_window(native_start_kind(cli)),
+                opens_visible_window(kind),
                 "default start must open the visible window"
             );
         }
@@ -6849,6 +6972,70 @@ mod chrome_tests {
         assert!(
             !opens_visible_window(kind),
             "headless must not call the visible window open path"
+        );
+    }
+
+    #[test]
+    fn cli_recognizes_screenshot_flag() {
+        let cli = native_cli_from_args(["--screenshot"]);
+        assert!(cli.screenshot, "--screenshot must be recognized");
+        assert_eq!(
+            native_start_kind(cli),
+            NativeStartKind::HeadlessScreenshot,
+            "--screenshot must use the headless capture driver, not a visible window"
+        );
+        let equals = native_cli_from_args(["--screenshot=frame.png"]);
+        assert!(equals.screenshot);
+        assert_eq!(equals.screenshot_path.as_deref(), Some("frame.png"));
+        let among = native_cli_from_args(["--headless", "--screenshot", "frame.png"]);
+        assert!(
+            among.headless && among.screenshot,
+            "--headless --screenshot PATH must set both flags"
+        );
+        assert_eq!(among.screenshot_path.as_deref(), Some("frame.png"));
+        assert_eq!(
+            native_start_kind(among),
+            NativeStartKind::HeadlessScreenshot
+        );
+    }
+
+    #[test]
+    fn headless_screenshot_does_not_open_visible_window() {
+        for args in [
+            vec!["--screenshot"],
+            vec!["--headless", "--screenshot"],
+            vec!["--headless", "--screenshot", "frame.png"],
+        ] {
+            let kind = native_start_kind(native_cli_from_args(args));
+            assert_eq!(kind, NativeStartKind::HeadlessScreenshot);
+            assert!(
+                !opens_visible_window(kind),
+                "screenshot driver must not call open_desktop_window"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_headless_first_frame_fails_loud_without_opening_a_window() {
+        // Named e2e driver: capture without calling open_desktop_window.
+        let err = capture_headless_first_frame().expect_err(
+            "gpui 0.2.2 Linux headless cannot capture; the driver must fail loud, not open a window",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot capture a frame"),
+            "loud fail must be a plain sentence, got {msg}"
+        );
+        let cli = native_cli_from_args(["--headless", "--screenshot", "frame.png"]);
+        let driver_err = run_headless_screenshot(&cli)
+            .expect_err("screenshot CLI must fail loud, not open a window");
+        assert!(
+            driver_err.contains("cannot capture a frame"),
+            "CLI driver must use the same loud fail, got {driver_err}"
+        );
+        assert!(
+            !opens_visible_window(native_start_kind(cli)),
+            "capture path must not be the visible window open"
         );
     }
 }

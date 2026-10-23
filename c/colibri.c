@@ -11848,7 +11848,8 @@ static double coli_resolve_ram_gb(double ram_gb_explicit, double mem_avail_gb,
     int auto_b = ram_gb_explicit <= 0;
     double ram_gb = coli_ram_budget_gb(auto_b?0.0:ram_gb_explicit, mem_avail_gb, mem_total_gb);
     if(!auto_b && ram_gb > ram_gb_explicit) auto_b = 1; /* stale 64-class default raised */
-    if(ram_gb < 4) ram_gb = 8;
+    /* Auto / unreadable only. An explicit 3.7 GB (dense-only glm) must still win. */
+    if(auto_b && ram_gb < 4) ram_gb = 8;
     /* Host-class auto (and a rust-written copy of it) must keep 88% of MemTotal.
      * Clamping that back to MemAvailable recreates the 64 GB default. An
      * operator budget above host class still clamps to MemAvailable (#759). */
@@ -11887,7 +11888,7 @@ static int cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx, int embe
               "can actually use (#653 snapshot; COLI_RAM_OVERCOMMIT=1 keeps the literal budget)\n",
               orig, sampled);
       }
-      if(sampled<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); sampled=8; }
+      if(auto_out && sampled<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); sampled=8; }
       auto_b = auto_out;
       ram_gb = sampled;
     }

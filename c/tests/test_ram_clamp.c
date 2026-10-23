@@ -81,6 +81,18 @@ int main(void){
           fprintf(stderr, "FAIL resolve operator 32 GB must win -> %.3f\n", got);
           failures++;
       }
+      /* dense-only glm: RAM_GB=3.7145 is just above the fixture reserve. Host
+       * class (~79.2) and the auto 8 GB floor must not swallow that budget. */
+      got = coli_resolve_ram_gb(3.7145, 72.727, 90.0, 0, NULL);
+      if(fabs(got - 3.7145) > 1e-9){
+          fprintf(stderr, "FAIL resolve operator 3.7145 GB must win -> %.3f (want 3.7145, not 8)\n", got);
+          failures++;
+      }
+      got = coli_resolve_ram_gb(8.0, 72.727, 90.0, 0, NULL);
+      if(fabs(got - 8.0) > 1e-9){
+          fprintf(stderr, "FAIL resolve operator 8 GB must win -> %.3f\n", got);
+          failures++;
+      }
       got = coli_resolve_ram_gb(100.0, 59.0, 90.0, 0, NULL);
       if(fabs(got - 59.0) > 1e-9){
           fprintf(stderr, "FAIL resolve oversized explicit still clamps -> %.3f (want 59)\n", got);

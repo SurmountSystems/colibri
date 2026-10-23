@@ -10,8 +10,10 @@ GLM shared-expert artifacts. Linux loads `libcoli_xdna.so` the same way
 (beside the executable, absolute path, no PATH search). Dispatch selection
 accepts every model on the 2.0 roster. A roster family also has one qualified
 synthetic op: the public IRON npu2 single-core matmul, M=K=N=64, int16 in,
-int32 out. That op is not a token generate. The GLM shared-expert files
-(K=6144, N=2048) are still not in this tree, so that gate/up still declines.
+int32 out. That op is not a token generate. The dedicated GLM shared-expert
+files (K=6144, N=2048) are still not in this tree. When the on-disk 64x64x64
+program is present, expert GEMM at that shape tiles through it (`TILED_64`).
+That is not a dedicated aiecc kernel for K=6144, and it is not a token generate.
 No throughput number is claimed.
 
 ```bash
@@ -33,24 +35,28 @@ With `COLI_XDNA=1`, each owned engine main calls
 the 64x64x64 int16 program. The int32 result is not an expert GEMM output.
 This is not a token generate. No throughput number is claimed.
 
-`coli_xdna_try_matmul` at K=6144 N=2048 still declines `ARTIFACT_UNAVAILABLE`.
-The wa_F3 files are not on disk. Any other native K,N declines
-`SHAPE_NO_PROGRAM`. `COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and does
-not open the device.
+When the on-disk 64x64x64 xclbin is present, expert GEMM at K=6144 N=2048
+tiles through that program (`TILED_64`). It is not an immediate
+`ARTIFACT_UNAVAILABLE` decline. The dedicated wa_F3 files are still not on
+disk. Exact 64x64 is `PROGRAM_PRESENT`. Other positive K,N also tile
+(`TILED_64`; remainders pad to 64). A live submit still needs permission, a
+bound helper, and a device after the shape gate. `COLI_XDNA` off returns
+`ENGINE_LANE_NOT_CALLED` and does not open the device.
 
 The historical MoE shared-expert gate/up projection for GLM
-(`K=6144, N=2048`, fmt=4 grouped int4, group size 64) is still the shape
-`coli_xdna_try_matmul` knows. Those artifacts are not in this tree, so that
-call declines and the normal path runs. It does not execute the 64x64x64
-program and it does not write a 64 result into the expert output.
+(`K=6144, N=2048`, fmt=4 grouped int4, group size 64) is still a shape
+`coli_xdna_try_matmul` knows. The dedicated artifacts for that row are not
+in this tree. When the 64x64x64 xclbin is present, that expert GEMM tiles
+through the on-disk program. This is not a token generate.
 
 ## Precision
 
 The session submit that runs today is int16 in and int32 out. It is not BF16.
 The historical GLM shared-expert path converts activations and weights to BF16
-and accumulates in F32. That path still declines, because the K=6144 N=2048
-files are not on disk. BF16 on that path is not the same arithmetic as the
-normal path, and it is not claimed to be equivalent:
+and accumulates in F32. The dedicated K=6144 N=2048 files for that path are
+not on disk, so that BF16 path still declines. Tiling uses the on-disk
+64x64x64 int16 program, not those files. BF16 on the dedicated path is not
+the same arithmetic as the normal path, and it is not claimed to be equivalent:
 
 - per-option scores on a small internal benchmark changed on every operation the
   NPU handled;
@@ -258,12 +264,16 @@ matches the host reference. That is one matmul per family. It is not a
 downloaded-weight generate.
 
 The two GLM shared-expert rows (K=6144, N=2048, M64 and M256) are still in
-the registry. Their files are not shipped. `coli_xdna_try_matmul` at that
-shape declines `ARTIFACT_UNAVAILABLE`. Any other native K,N declines
-`SHAPE_NO_PROGRAM`. With `COLI_XDNA=1`, each owned engine main calls
+the registry. Their dedicated files are not shipped. When the on-disk
+64x64x64 xclbin is present, `coli_xdna_try_matmul` at K=6144 N=2048 tiles
+through that program (`TILED_64`). It is not an immediate
+`ARTIFACT_UNAVAILABLE` decline and it is not a dedicated aiecc kernel for
+K=6144. Exact 64x64 is `PROGRAM_PRESENT`. Other positive K,N also tile
+(`TILED_64`). With `COLI_XDNA=1`, each owned engine main calls
 `coli_xdna_engine_qualified_submit` once at session start and that submits
-the 64x64x64 int16 program. The int32 result is not an expert GEMM output.
-`COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and does not open the device.
+the 64x64x64 int16 program. That session-start int32 result is not an expert
+GEMM output. `COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and does not
+open the device.
 Work with no matching artifact declines to the normal path. Acceptance
 of a model id does not mean a generate ran. This is not a token generate.
 No throughput number is claimed.
@@ -277,7 +287,7 @@ No throughput number is claimed.
 - Linux selection covers the 2.0 roster. A family with no row still declines.
   The synthetic 64x64x64 int16 matmul is not a token generate, and a declined
   operation is not reported as a run.
-- It does not claim the GLM K=6144 N=2048 gate/up ran. Those files are absent.
-  That shape declines `ARTIFACT_UNAVAILABLE`. Any other native K,N declines
-  `SHAPE_NO_PROGRAM`. `COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and
-  does not open the device.
+- It does not claim the dedicated GLM K=6144 N=2048 gate/up ran. Those files
+  are absent. When the 64x64x64 xclbin is present, expert GEMM at that shape
+  tiles through the on-disk program (`TILED_64`). That is not a token generate.
+  `COLI_XDNA` off returns `ENGINE_LANE_NOT_CALLED` and does not open the device.

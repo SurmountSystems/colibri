@@ -685,10 +685,12 @@ PY
   # The serve protocol with the tier on: KV prefix reuse token-identical to a cold
   # engine, HITS and EMAP (tier 2 on the device) after every turn, Brio's snapshot
   # scoring; every engine after the first warm-starts from the history the one before
-  # it saved.
-  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 INKLING_TINY=tiny_inkling \
+  # it saved. COLI_VK_TIER_BALANCE=0: a loaded machine otherwise hands expert rows
+  # back by timing, and Brio's last printed ECHO digit moves. BrioServe itself also
+  # sets COLI_VK_TIER=0 (a detour leaves a different resident set than a cold start).
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
-  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 OLMOE_TINY=olmoe_tiny_c \
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 OLMOE_TINY=olmoe_tiny_c \
     $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
 }
 
@@ -2088,7 +2090,10 @@ family_inkling_olmoe_chain() {
   # (these compare a warm session's logprobs with a cold one's to the last printed
   # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
   # experts between the device and the CPU alike. Use per-row attention on both:
-  # a cold prefill and a short suffix must share a reduction order for exact bits.)
+  # a cold prefill and a short suffix must share a reduction order for exact bits.
+  # BrioServe also sets COLI_VK_TIER=0: a detour leaves a different resident set
+  # than a cold start, with or without the balancer, the same reason
+  # qwen38-tiny-mtp-check turns the tier off for pin logits.)
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 LP_NUM_THREADS=1 OLMOE_TINY=olmoe_tiny_c \

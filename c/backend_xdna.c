@@ -595,17 +595,19 @@ int coli_xdna_sha256_file(const char *path, unsigned char out[32]){
  * eligibility table, not from "it compiled". Filenames are LOGICAL: they are
  * resolved under a caller-supplied root, and no build path appears here.
  *
- * The GLM shared-expert files are not shipped by this build. A row describing
- * an absent file yields ARTIFACT_UNAVAILABLE. Those two rows are not a program
- * for Kimi, Qwen, DeepSeek, Laya, or the image model.
+ * The GLM shared-expert files are not shipped by this build. A dedicated
+ * F3 row whose files are absent is not an immediate decline: expert GEMM
+ * (K=6144 N=2048 and other tileable shapes) runs as tiles of the 64x64x64
+ * program below. Those two F3 rows are still not a dedicated kernel for
+ * Kimi, Qwen, DeepSeek, Laya, or the image model.
  *
- * The roster rows below are a different operation: M=K=N=64, int16 in, int32
+ * The roster rows below are the on-disk program: M=K=N=64, int16 in, int32
  * out, the public IRON npu2 single-core matmul. The bytes live under
- * c/xdna/kernels and are checked by hash. The weight argument for that
- * program is a host-only buffer on group 4. The four qualification bits on
- * these rows record that this program was the one executed and compared.
- * They do not record a token generate, and they do not make the absent
- * K=6144 files appear.
+ * c/xdna/kernels and are checked by hash. Expert shapes pad to 64 and
+ * accumulate those tiles. The weight argument for that program is a
+ * host-only buffer on group 4. The four qualification bits on these rows
+ * record that this program was the one executed and compared. They do not
+ * record a token generate.
  */
 #define COLI_XDNA_I16_64_ROW(fam) \
     { fam, "NPU2_I16_64", \
@@ -1074,6 +1076,15 @@ static unsigned short coli_xdna_f2b(float f){
     return (unsigned short)(u >> 16);
 }
 
+static float coli_xdna_b2f(unsigned short b){
+    unsigned int u = (unsigned int)b << 16;
+    float f;
+    memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+static float coli_xdna_absf(float x){ return x < 0.f ? -x : x; }
+
 /* Convert ONE fmt=4 output column into the transposed BF16 destination.
  *
  * Extracted verbatim from the loop body that used to live inline in
@@ -1501,6 +1512,104 @@ int coli_xdna_test_helper_calls(void){ return g_xdna_helper_calls; }
 int coli_xdna_test_userptr_wraps(void){ return g_xdna_userptr_wraps; }
 int coli_xdna_test_conversions(void){ return g_xdna_conversions; }
 
+/* Per 64-length K tile, |a|*|b|*64 must fit in int32: 64 * 4096^2 = 1.07e9. */
+#define COLI_XDNA_I16_QMAX 4096.f
+
+static unsigned coli_xdna_tile64_dim(int dim){
+    if(dim <= 0) return 0;
+    return ((unsigned)dim + (COLI_XDNA_TILE64 - 1u)) / COLI_XDNA_TILE64;
+}
+
+int coli_xdna_tile64_plan(int m, int k, int n,
+                          unsigned *mt, unsigned *kt, unsigned *nt){
+    if(m <= 0 || k <= 0 || n <= 0) return 0;
+    if(mt) *mt = coli_xdna_tile64_dim(m);
+    if(kt) *kt = coli_xdna_tile64_dim(k);
+    if(nt) *nt = coli_xdna_tile64_dim(n);
+    return 1;
+}
+
+int coli_xdna_tile64_host_i16(const int16_t *a, const int16_t *b, int32_t *c,
+                              int m, int k, int n){
+    const unsigned T = COLI_XDNA_TILE64;
+    unsigned mt, kt, nt, mi, ni, ki, i, j, kk;
+    int16_t At[64 * 64], Bt[64 * 64];
+    int32_t acc[64 * 64];
+    if(!a || !b || !c || !coli_xdna_tile64_plan(m, k, n, &mt, &kt, &nt))
+        return 0;
+    for(mi = 0; mi < mt; mi++){
+        for(ni = 0; ni < nt; ni++){
+            memset(acc, 0, sizeof acc);
+            for(ki = 0; ki < kt; ki++){
+                for(i = 0; i < T; i++){
+                    unsigned gi = mi * T + i;
+                    for(kk = 0; kk < T; kk++){
+                        unsigned gk = ki * T + kk;
+                        int16_t v = 0;
+                        if(gi < (unsigned)m && gk < (unsigned)k)
+                            v = a[(size_t)gi * (size_t)k + gk];
+                        At[i * T + kk] = v;
+                    }
+                }
+                for(kk = 0; kk < T; kk++){
+                    unsigned gk = ki * T + kk;
+                    for(j = 0; j < T; j++){
+                        unsigned gj = ni * T + j;
+                        int16_t v = 0;
+                        if(gk < (unsigned)k && gj < (unsigned)n)
+                            v = b[(size_t)gk * (size_t)n + gj];
+                        Bt[kk * T + j] = v;
+                    }
+                }
+                for(i = 0; i < T; i++){
+                    for(j = 0; j < T; j++){
+                        int32_t s = 0;
+                        for(kk = 0; kk < T; kk++)
+                            s += (int32_t)At[i * T + kk] * (int32_t)Bt[kk * T + j];
+                        acc[i * T + j] += s;
+                    }
+                }
+            }
+            for(i = 0; i < T; i++){
+                unsigned gi = mi * T + i;
+                if(gi >= (unsigned)m) break;
+                for(j = 0; j < T; j++){
+                    unsigned gj = ni * T + j;
+                    if(gj >= (unsigned)n) break;
+                    c[(size_t)gi * (size_t)n + gj] = acc[i * T + j];
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static ColiXdnaRequest coli_xdna_i16_64_request(void){
+    ColiXdnaRequest q;
+    q.family = COLI_XDNA_FAMILY_ROSTER_KIMI;
+    q.m = 64; q.k = 64; q.n = 64;
+    q.in_dtype = COLI_XDNA_DT_I16;
+    q.weight_dtype = COLI_XDNA_DT_I16;
+    q.out_dtype = COLI_XDNA_DT_I32;
+    return q;
+}
+
+static int coli_xdna_i16_64_present(void){
+    ColiXdnaRequest q = coli_xdna_i16_64_request();
+    char scratch[1024];
+    const char *root = coli_xdna_effective_root(scratch, sizeof scratch);
+    const ColiXdnaArtifact *row = coli_xdna_registry_lookup(&q);
+    if(!root || !row) return 0;
+    return coli_xdna_artifact_status(&q, root) == COLI_XDNA_STATIC_QUALIFIED;
+}
+
+static int16_t coli_xdna_q_i16(float x, float scale){
+    float q = x * scale;
+    if(q > COLI_XDNA_I16_QMAX) q = COLI_XDNA_I16_QMAX;
+    if(q < -COLI_XDNA_I16_QMAX) q = -COLI_XDNA_I16_QMAX;
+    return (int16_t)(q >= 0.f ? q + 0.5f : q - 0.5f);
+}
+
 /* ---- the candidate --------------------------------------------------------
  *
  * Gate order is the point of this function, not an accident of it. Everything
@@ -1513,22 +1622,17 @@ int coli_xdna_test_conversions(void){ return g_xdna_conversions; }
 static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
                                            int fmt, int I, int O, int gs, int planar, int S,
                                            const ColiXdnaArtifact **row_out){
+    ColiXdnaHard dedicated_fail = COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
     /*  1  semantic family -- passed in by the call site, never inferred */
     if(family != COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP)
         return COLI_XDNA_HARD_FAMILY_UNSUPPORTED;
 
-    /*  2  logical M within the range some compiled bucket serves.
-     *
-     *     The upper bound is now the LARGEST bucket, not the only one. Below
-     *     the minimum and above the largest are the same verdict to the caller
-     *     -- M_OUT_OF_RANGE, decline to the current path -- but the
-     *     above-the-range case is counted separately, because it is the new
-     *     first-decline boundary and a later slice will want to know how often
-     *     real work lands there. */
-    if(S < COLI_XDNA_LOGICAL_M_MIN || S > COLI_XDNA_LOGICAL_M_MAX){
-        if(S > COLI_XDNA_LOGICAL_M_MAX) g_xdna_m_above_range_declines++;
+    /*  2  logical M at least one row. Dedicated buckets still cap at M256;
+     *     the 64^3 tiled path pads M as well, so S above that cap is not an
+     *     immediate decline when the 64^3 program is present. */
+    if(S < COLI_XDNA_LOGICAL_M_MIN)
         return COLI_XDNA_HARD_M_OUT_OF_RANGE;
-    }
+    if(S > COLI_XDNA_LOGICAL_M_MAX) g_xdna_m_above_range_declines++;
 
     /*  3  K / N representable and positive */
     if(I <= 0 || O <= 0) return COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
@@ -1553,49 +1657,62 @@ static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
     if(planar)
         return COLI_XDNA_HARD_LAYOUT_UNSUPPORTED;
 
-    /*  6  a qualified artifact for exactly this family/bucket/shape/dtypes.
-     *     The bucket is the artifact's M, which is where logical M is mapped. */
-    ColiXdnaRequest q;
-    q.family = family;
-    q.m = coli_xdna_bucket_for_logical_m(S);      /* smallest bucket holding S */
-    if(q.m == 0u) return COLI_XDNA_HARD_M_OUT_OF_RANGE;   /* unreachable: gate 2 */
-    q.k = (unsigned)I; q.n = (unsigned)O;
-    q.in_dtype = COLI_XDNA_DT_BF16;
-    q.weight_dtype = COLI_XDNA_DT_BF16;
-    q.out_dtype = COLI_XDNA_DT_F32;
-
-    const ColiXdnaArtifact *row = coli_xdna_registry_lookup(&q);
-    if(!row) return COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
-
-    /*  7-9  qualification flags, artifact presence, artifact integrity. All
-     *       three live behind coli_xdna_artifact_status, which fails closed.
-     *       The sub-reason is carried through rather than collapsed: "this
-     *       build does not ship that artifact", "the bytes are not the bytes
-     *       that were qualified", and "we never qualified this one" call for
-     *       different actions, and an operator who is told only
-     *       ARTIFACT_NOT_QUALIFIED cannot tell a missing file from a tampered
-     *       one. */
-    char root_scratch[1024];
-    const char *eff_root = coli_xdna_effective_root(root_scratch, sizeof root_scratch);
-    switch(coli_xdna_artifact_status(&q, eff_root)){
-        case COLI_XDNA_STATIC_QUALIFIED:
-            break;
-        case COLI_XDNA_STATIC_ARTIFACT_UNAVAILABLE:
-            return COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE;
-        case COLI_XDNA_STATIC_ARTIFACT_INTEGRITY_FAILED:
-            return COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED;
-        case COLI_XDNA_STATIC_ARTIFACT_UNQUALIFIED:
-            return COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED;
-        case COLI_XDNA_STATIC_REGISTRY_INVALID:
-            return COLI_XDNA_HARD_REGISTRY_INVALID;
-        default:
-            /* Family/shape/format verdicts cannot occur here: the lookup above
-             * already matched a row on the full key. */
-            return COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
+    /*  6  a qualified dedicated artifact for this family/bucket/shape, when
+     *     the files are present. Missing F3 bytes fall through to 64^3 tiles. */
+    if(S <= COLI_XDNA_LOGICAL_M_MAX){
+        ColiXdnaRequest q;
+        const ColiXdnaArtifact *row;
+        char root_scratch[1024];
+        const char *eff_root;
+        q.family = family;
+        q.m = coli_xdna_bucket_for_logical_m(S);
+        if(q.m == 0u) return COLI_XDNA_HARD_M_OUT_OF_RANGE;
+        q.k = (unsigned)I; q.n = (unsigned)O;
+        q.in_dtype = COLI_XDNA_DT_BF16;
+        q.weight_dtype = COLI_XDNA_DT_BF16;
+        q.out_dtype = COLI_XDNA_DT_F32;
+        row = coli_xdna_registry_lookup(&q);
+        if(!row){
+            dedicated_fail = COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
+        } else {
+            eff_root = coli_xdna_effective_root(root_scratch, sizeof root_scratch);
+            switch(coli_xdna_artifact_status(&q, eff_root)){
+                case COLI_XDNA_STATIC_QUALIFIED:
+                    *row_out = row;
+                    return COLI_XDNA_HARD_ELIGIBLE;
+                case COLI_XDNA_STATIC_ARTIFACT_UNAVAILABLE:
+                    dedicated_fail = COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE;
+                    break;
+                case COLI_XDNA_STATIC_ARTIFACT_INTEGRITY_FAILED:
+                    dedicated_fail = COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED;
+                    break;
+                case COLI_XDNA_STATIC_ARTIFACT_UNQUALIFIED:
+                    dedicated_fail = COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED;
+                    break;
+                case COLI_XDNA_STATIC_REGISTRY_INVALID:
+                    return COLI_XDNA_HARD_REGISTRY_INVALID;
+                default:
+                    dedicated_fail = COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
+                    break;
+            }
+        }
+    } else {
+        dedicated_fail = COLI_XDNA_HARD_M_OUT_OF_RANGE;
     }
 
-    *row_out = row;
-    return COLI_XDNA_HARD_ELIGIBLE;
+    /* Tile through the on-disk 64x64x64 i16 program when it hashes. */
+    {
+        ColiXdnaRequest tq = coli_xdna_i16_64_request();
+        const ColiXdnaArtifact *trow = coli_xdna_registry_lookup(&tq);
+        char root_scratch[1024];
+        const char *eff_root = coli_xdna_effective_root(root_scratch, sizeof root_scratch);
+        if(trow && coli_xdna_artifact_status(&tq, eff_root) == COLI_XDNA_STATIC_QUALIFIED){
+            *row_out = trow;
+            return COLI_XDNA_HARD_ELIGIBLE;
+        }
+    }
+
+    return dedicated_fail;
 }
 
 /* Grow a staging buffer to at least `need` bytes. Transient operation state:
@@ -1608,6 +1725,160 @@ static int coli_xdna_stage(void **base, size_t *cap, size_t need){
     free(*base);
     *base = p; *cap = need;
     return 1;
+}
+
+/* Expert GEMM through the on-disk 64x64x64 i16 program. y is written only
+ * after every tile completes. */
+static ColiXdnaExec coli_xdna_attempt_tiled64(const ColiXdnaArtifact *row,
+                                              ColiXdnaPrepared *prep,
+                                              float *y, const float *x,
+                                              int S, int I, int O){
+    const unsigned T = COLI_XDNA_TILE64;
+    unsigned mt, kt, nt, mi, ni, ki, i, j, kk;
+    const unsigned short *W;
+    float xmax = 0.f, wmax = 0.f, sa, sw, inv;
+    int16_t At[64 * 64];
+    int32_t Ct[64 * 64];
+    int64_t acc[64 * 64];
+    void *bmem = NULL;
+    int16_t *Bt;
+    char xb[2048], ib[2048], rs2[1024];
+    const char *r2;
+    int rc;
+
+    if(!coli_xdna_tile64_plan(S, I, O, &mt, &kt, &nt)){
+        g_xdna_last_hard = COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
+    }
+
+    r2 = coli_xdna_effective_root(rs2, sizeof rs2);
+    if(!r2
+       || !coli_xdna_join(xb, sizeof xb, r2, row->xclbin_name)
+       || !coli_xdna_join(ib, sizeof ib, r2, row->insts_name)){
+        g_xdna_last_hard = COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED);
+    }
+
+    if(!g_lane.open || g_lane.m != T || g_lane.k != T || g_lane.n != T){
+        if(g_lane.open){
+            coli_xdna_lane_drop_wrapper();
+            coli_xdna_helper_shutdown_call();
+        }
+        g_lane.open = 0;
+        g_xdna_helper_calls++; g_xdna_device_opens++;
+        rc = coli_xdna_helper_open_call(xb, ib, T, T, T);
+        if(rc != COLI_XDNA_H_OK){
+            if(rc == COLI_XDNA_H_E_DEVICE){
+                g_xdna_lane_health = COLI_XDNA_LANE_UNAVAILABLE;
+                g_xdna_last_hard = COLI_XDNA_HARD_DEVICE_UNAVAILABLE;
+                return (g_xdna_last_exec = COLI_XDNA_EXEC_DEVICE_INIT_FAILED);
+            }
+            g_xdna_last_hard = COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
+            return (g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED);
+        }
+        g_lane.open = 1; g_lane.m = T; g_lane.k = T; g_lane.n = T;
+        g_lane.wrapped = NULL; g_lane.wrapped_gen = 0;
+        g_xdna_lane_health = COLI_XDNA_LANE_HEALTHY;
+        g_xdna_artifact_opens++;
+        { int sl = coli_xdna_bucket_slot(T); if(sl >= 0) g_xdna_b_artifact_opens[sl]++; }
+    }
+
+    if(posix_memalign(&bmem, 4096, (size_t)T * T * 2u) != 0){
+        g_xdna_last_hard = COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_WRAP_FAILED);
+    }
+    Bt = (int16_t *)bmem;
+    W = (const unsigned short *)coli_xdna_prepared_image(prep);
+    for(size_t p = 0; p < (size_t)S * (size_t)I; p++){
+        float a = coli_xdna_absf(x[p]);
+        if(a > xmax) xmax = a;
+    }
+    for(size_t p = 0; p < (size_t)I * (size_t)O; p++){
+        float a = coli_xdna_absf(coli_xdna_b2f(W[p]));
+        if(a > wmax) wmax = a;
+    }
+    sa = xmax > 0.f ? (COLI_XDNA_I16_QMAX / xmax) : 1.f;
+    sw = wmax > 0.f ? (COLI_XDNA_I16_QMAX / wmax) : 1.f;
+    inv = 1.f / (sa * sw);
+
+    g_xdna_last_hard = COLI_XDNA_HARD_ELIGIBLE;
+    { int sl = coli_xdna_bucket_slot(T); if(sl >= 0) g_xdna_b_hard_eligible[sl]++; }
+
+    for(mi = 0; mi < mt; mi++){
+        for(ni = 0; ni < nt; ni++){
+            memset(acc, 0, sizeof acc);
+            for(ki = 0; ki < kt; ki++){
+                for(i = 0; i < T; i++){
+                    unsigned gi = mi * T + i;
+                    for(kk = 0; kk < T; kk++){
+                        unsigned gk = ki * T + kk;
+                        float v = 0.f;
+                        if(gi < (unsigned)S && gk < (unsigned)I)
+                            v = x[(size_t)gi * (size_t)I + gk];
+                        At[i * T + kk] = coli_xdna_q_i16(v, sa);
+                    }
+                }
+                for(kk = 0; kk < T; kk++){
+                    unsigned gk = ki * T + kk;
+                    for(j = 0; j < T; j++){
+                        unsigned gj = ni * T + j;
+                        float v = 0.f;
+                        if(gk < (unsigned)I && gj < (unsigned)O)
+                            v = coli_xdna_b2f(W[(size_t)gk * (size_t)O + gj]);
+                        Bt[kk * T + j] = coli_xdna_q_i16(v, sw);
+                    }
+                }
+                if(g_lane.wrapped) coli_xdna_lane_drop_wrapper();
+                g_xdna_helper_calls++; g_xdna_userptr_wraps++;
+                if(coli_xdna_helper_wrap_call(Bt, (uint64_t)T * T * 2u) != COLI_XDNA_H_OK){
+                    coli_xdna_lane_drop_wrapper();
+                    compat_aligned_free(bmem);
+                    g_xdna_last_hard = COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE;
+                    return (g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_WRAP_FAILED);
+                }
+                g_lane.wrapped = Bt; g_lane.wrapped_gen = 0;
+                g_xdna_helper_calls++;
+                rc = coli_xdna_helper_execute_call(At, (uint64_t)T * T * 2u,
+                                                   Ct, (uint64_t)T * T * 4u);
+                if(rc != COLI_XDNA_H_OK){
+                    coli_xdna_lane_drop_wrapper();
+                    compat_aligned_free(bmem);
+                    return (g_xdna_last_exec = (rc == COLI_XDNA_H_E_COMPLETION)
+                                             ? COLI_XDNA_EXEC_COMPLETION_FAILED
+                                             : COLI_XDNA_EXEC_EXECUTE_FAILED);
+                }
+                g_xdna_dispatches++; g_xdna_completions++;
+                { int sl = coli_xdna_bucket_slot(T);
+                  if(sl >= 0){ g_xdna_b_dispatches[sl]++; g_xdna_b_completions[sl]++; } }
+                for(i = 0; i < T * T; i++) acc[i] += (int64_t)Ct[i];
+            }
+            for(i = 0; i < T; i++){
+                unsigned gi = mi * T + i;
+                if(gi >= (unsigned)S) break;
+                for(j = 0; j < T; j++){
+                    unsigned gj = ni * T + j;
+                    if(gj >= (unsigned)O) break;
+                    y[(size_t)gi * (size_t)O + gj] = (float)acc[i * T + j] * inv;
+                }
+            }
+        }
+    }
+
+    g_xdna_act_preps++;
+    if(((unsigned)S % T) != 0u || ((unsigned)I % T) != 0u || ((unsigned)O % T) != 0u){
+        g_xdna_padded_ops++;
+        { int sl = coli_xdna_bucket_slot(T);
+          if(sl >= 0){
+              g_xdna_b_padded_ops[sl]++;
+              if(((unsigned)S % T) != 0u)
+                  g_xdna_b_padded_rows[sl] += (long long)(T - ((unsigned)S % T));
+          } }
+    }
+
+    coli_xdna_lane_drop_wrapper();
+    compat_aligned_free(bmem);
+    g_xdna_output_valid = 1;
+    return (g_xdna_last_exec = COLI_XDNA_EXEC_OK);
 }
 
 /* The shared execution core. Both modes call this, so their gate order and
@@ -1688,6 +1959,9 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
         g_xdna_last_hard = COLI_XDNA_HARD_ALIGNMENT_INVALID;
         return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
     }
+
+    if(row->in_dtype == COLI_XDNA_DT_I16)
+        return coli_xdna_attempt_tiled64(row, prep, y, x, S, I, O);
 
     const unsigned am = row->artifact_m;
 
@@ -1817,12 +2091,12 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
                          int I, int O, int gs, int planar,
                          float *y, const float *x, int S)
 {
-    /* Record a shape decline. This does not submit the 64 program and does
-     * not write y from a 64 result. Expert GEMM stays on the gates below. */
+    /* Record whether this (K,N) is the 64^3 program or tiles through it.
+     * Expert GEMM K=6144 N=2048 takes the tiled path in coli_xdna_attempt. */
     {
         char shape_reason[128];
-        if(!coli_xdna_shape_would_run(I, O, shape_reason, sizeof shape_reason))
-            snprintf(g_xdna_decline, sizeof g_xdna_decline, "%s", shape_reason);
+        coli_xdna_shape_would_run(I, O, shape_reason, sizeof shape_reason);
+        snprintf(g_xdna_decline, sizeof g_xdna_decline, "%s", shape_reason);
     }
     /* Gate 0: PERMISSION. Without it this function is inert, which is what keeps
      * the lane from being an automatic scheduler.
@@ -1978,19 +2252,16 @@ const char *coli_xdna_engine_roster_id(const char *engine_name){
 }
 
 int coli_xdna_shape_would_run(int k, int n, char *reason, size_t reason_cap){
-    if(k == 64 && n == 64){
-        ColiXdnaRequest q;
+    if(k <= 0 || n <= 0){
+        coli_xdna_reason(reason, reason_cap, "SHAPE_NO_PROGRAM");
+        return 0;
+    }
+    if(!coli_xdna_i16_64_present()){
+        ColiXdnaRequest q = coli_xdna_i16_64_request();
         char scratch[1024];
-        const char *root;
-        const ColiXdnaArtifact *row;
+        const char *root = coli_xdna_effective_root(scratch, sizeof scratch);
+        const ColiXdnaArtifact *row = coli_xdna_registry_lookup(&q);
         ColiXdnaStatic sx, si;
-        q.family = COLI_XDNA_FAMILY_ROSTER_KIMI;
-        q.m = 64; q.k = 64; q.n = 64;
-        q.in_dtype = COLI_XDNA_DT_I16;
-        q.weight_dtype = COLI_XDNA_DT_I16;
-        q.out_dtype = COLI_XDNA_DT_I32;
-        row = coli_xdna_registry_lookup(&q);
-        root = coli_xdna_effective_root(scratch, sizeof scratch);
         if(!root || !row){
             coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
             return 0;
@@ -2002,19 +2273,15 @@ int coli_xdna_shape_would_run(int k, int n, char *reason, size_t reason_cap){
             coli_xdna_reason(reason, reason_cap, "ARTIFACT_INTEGRITY_FAILED");
             return 0;
         }
-        if(sx != COLI_XDNA_STATIC_QUALIFIED || si != COLI_XDNA_STATIC_QUALIFIED){
-            coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
-            return 0;
-        }
-        coli_xdna_reason(reason, reason_cap, "PROGRAM_PRESENT");
-        return 1;
-    }
-    if(k == 6144 && n == 2048){
         coli_xdna_reason(reason, reason_cap, "ARTIFACT_UNAVAILABLE");
         return 0;
     }
-    coli_xdna_reason(reason, reason_cap, "SHAPE_NO_PROGRAM");
-    return 0;
+    if(k == 64 && n == 64){
+        coli_xdna_reason(reason, reason_cap, "PROGRAM_PRESENT");
+        return 1;
+    }
+    coli_xdna_reason(reason, reason_cap, "TILED_64");
+    return 1;
 }
 
 int coli_xdna_engine_qualified_submit(const char *engine_name,

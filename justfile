@@ -386,7 +386,12 @@ make_flags := env_var_or_default("MAKEFLAGS", "")
 make_j := if make_flags =~ "--jobserver" { "" } else if make_flags =~ "-j" { "" } else { "-j" + make_jobs }
 
 # Official portable gate: clean + portable CPU build + C unit suites + Python stdlib tests.
+# Parent OMP_NUM_THREADS is a build cap, not an operator engine override.
+# Unset it so C CLI tests see physical cores (test_other_engines_get_physical_cores).
 c-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unset OMP_NUM_THREADS
     make -C c check {{ make_j }}
 
 # C unit binaries only (faster than full `make check` when iterating on C).
@@ -404,6 +409,8 @@ c-test:
 python-test omit_tok_s="0":
     #!/usr/bin/env bash
     set -euo pipefail
+    # Parent OMP_NUM_THREADS is a build cap, not an operator engine override.
+    unset OMP_NUM_THREADS
     # Same engines as ci.yml job python, before discover. A bare
     # `just python-test` still builds them and still runs the tok/s tests.
     make -C c {{ make_j }} kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage

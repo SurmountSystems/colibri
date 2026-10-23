@@ -89,16 +89,16 @@ The approved harden plan landed. These were **looked at, later** on purpose. The
 | Id | Gap | Notes |
 |----|-----|--------|
 | `later:mmap-without-touch` | File-backed experts via `COLI_MMAP` **without** `madvise(WILLNEED)` + touch every 4K page | Default load stays pread + malloc. Opt-in mmap today faults every expert in. Do not treat mmap flags as an oomd fence. |
-| `later:hip-explicit-rebuild` | Explicit `just install features=install,ffi-hip` on this ROCm host | Operator-gated. Default `just install` stays CPU `ffi`. Clamp + flavor log must stay. |
+| `later:hip-explicit-rebuild` | Explicit HIP rebuild when auto-detect is wrong | `just install` is now `auto`: HIP when `hipcc` is on PATH (`install,ffi-hip`), else CPU. It prints the flavor and refuses to wipe a HIP archive with a CPU rebuild. This row is only the case where auto-detect is wrong and someone must force a flavor. |
 | `later:cgroup-memory-max` | systemd `MemoryMax` on the app scope so a runaway cannot take `session.slice` | Real fence later. Process mode still does not isolate oomd without a memory cap. |
 
 ### What feature/native-on-2.0 re-proved (2026-10-12)
 
-These sentences are the checks under `/home/hunter/.agents/reports/`. They are not a second production close, and none of this port work is committed. The branch tip is still main at bf244291 (upstream 2.0.0).
+These sentences are the checks under `/home/hunter/.agents/reports/`. They are not a second production close. The operator committed `fixes` (`71eb2da7`) on `feature/native-on-2.0`. Later product files (XDNA tile, RAM resolve, native UI) may still be uncommitted. The branch started from main at bf244291 (upstream 2.0.0).
 
 Crates were copied from colibri-sys and `cargo check` passed (`colibri-port-crates.md`). Surmount C hooks were replayed onto this tree without deleting Vulkan, XDNA, or the new engines (`colibri-replay-c-delta.md`). The native window follows the six web locales, and 320 native tests passed (`colibri-native-surface.md`). Six new text FFI archives were rebuilt on 2026-10-12, and 236 ffi lib tests passed (`colibri-roster-ffi.md`). The unified-memory planner clamps a tight APU pool, and the plan tests passed (`colibri-rocm-uma.md`). `cargo update` moved 171 packages. Nine RUSTSEC vulnerabilities and the yanked chacha20 crate are gone (`colibri-cargo-audit.md`).
 
-XDNA on this machine is `/dev/accel/accel0`, driver `amdxdna`, Krackan, PCI 1022:17f0 (`colibri-xdna-linux.md`). With `COLI_XDNA=1`, ten engine mains submit one 64x64x64 int16 matmul at session start, and the device result matched the host. That buffer is not an expert GEMM. K=6144 N=2048 still declines because the wa_F3 xclbin files are not on disk. No token generate was run. The only weight file found was `c/glm_tiny/model.safetensors` (2.4 MiB).
+XDNA on this machine is `/dev/accel/accel0`, driver `amdxdna`, Krackan, PCI 1022:17f0 (`colibri-xdna-linux.md`). With `COLI_XDNA=1`, ten engine mains submit one 64x64x64 int16 matmul at session start, and the device result matched the host. Expert shape K=6144 N=2048 now tiles through that 64³ program (`TILED_64`) when the xclbin is on disk. Dedicated wa_F3 expert kernels are still absent (`aiecc` is not installed). That tiled dispatch is not a general NPU decoder. `just check` on 2026-10-17 ended `CHECK_EXIT:0` (`/tmp/colibri-just-check-after-k3.log`).
 
 Ten unmaintained Rust advisories remain. They come in through gpui 0.2.2, and there is no patched release that clears them. The Tauri tree under `desktop/` was not bumped.
 

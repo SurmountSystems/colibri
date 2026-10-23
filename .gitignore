@@ -181,6 +181,8 @@ c/*.a
 # vendor modeling cache for the tiny K3 oracle (maintainer tool)
 c/kimi_k3_tiny/.vendor_kimi_k3/
 c/kimi_k3_tiny/.coli_usage
+# vulkan_engines.sh byte_tokenizer leftover; kimi-k3-tiny-check forbids this file
+c/kimi_k3_tiny/tokenizer.json
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
 c/qwen38_tiny_fp8/
@@ -230,3 +232,37 @@ c/dsv41_split_meta/
 c/qwen38_27b_*/
 c/qwen38_tiny_bad/
 c/tiny_inkling_*/
+
+# just check leftover dirs (2026-10-17): generated tiny/serve/wide/kv
+# copies. Tracked fixtures such as c/glm_tiny and c/kimi_k3_tiny stay.
+c/d2-ink.out
+c/d2-v4.json
+c/deepseek_v4_mux/
+c/deepseek_v4_tiny_e16/
+c/deepseek_v4_tiny_p/
+c/dsv41_vlong/
+c/glm53_l6/
+c/glm53_l6_serve/
+c/glm53_l6s-deq/
+c/glm53_l6s-i4/
+c/glm53_lim0/
+c/glm53_mm_tiny/
+c/glm53_serve/
+c/glm53_wide/
+c/glm_tiny_mtp/
+c/glm_tiny_serve/
+c/glm_tiny_shx/
+c/glm_tiny_wide/
+c/k3c_photos/
+c/kimi_k3_serve/
+c/mimo_tiny_served/
+c/olmoe_wide/
+c/olmoe_wide_c/
+c/qwen36_kv/
+c/qwen36_kv_c/
+c/qwen38_kv/
+c/qwen38_kv_mtp/
+c/qwen38_long/
+c/qwen38_long_int4/
+c/qwen38_tiny_ple3/
+c/**/.coli_analysis.json

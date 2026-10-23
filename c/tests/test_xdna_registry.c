@@ -477,6 +477,95 @@ static void test_production_registry_default(void){
        "and restoring brings the production rows back");
 }
 
+/* Expert GEMM K=6144 N=2048 tiles through the on-disk 64x64x64 program.
+ * This is the dispatch contract without a live NPU: presence of the 64^3
+ * bytes is enough for the shape to stop declining. */
+static int find_kernels_root(char *out, size_t cap){
+    static const char *cands[] = {
+        "xdna/kernels",
+        "../c/xdna/kernels",
+        "c/xdna/kernels",
+        NULL
+    };
+    for(int i = 0; cands[i]; i++){
+        char p[1024];
+        snprintf(p, sizeof p, "%s/mlir_aie_single_core_matmul_npu2.xclbin", cands[i]);
+        FILE *f = fopen(p, "rb");
+        if(f){
+            fclose(f);
+            snprintf(out, cap, "%s", cands[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void test_tiled_expert_shape(void){
+    char kernels[512];
+    char r64[64], r6144[64], rpad[64], rbad[64];
+    unsigned mt = 0, kt = 0, nt = 0;
+    int16_t A[128 * 128], B[128 * 128];
+    int32_t C[128 * 128], R[128 * 128];
+    int i, k, j;
+    int host_ok;
+
+    printf("tiled 64^3 expert shape (no live NPU claim)\n");
+    if(!find_kernels_root(kernels, sizeof kernels)){
+        ck(0, "in-tree 64^3 xclbin is present for the tiling contract");
+        return;
+    }
+    coli_xdna_test_set_registry(NULL, 0);
+    coli_xdna_test_set_artifact_root(kernels);
+
+    ck(coli_xdna_shape_would_run(64, 64, r64, sizeof r64) == 1,
+       "64x64 still runs the on-disk program");
+    ck(!strcmp(r64, "PROGRAM_PRESENT"), "64x64 reason is PROGRAM_PRESENT");
+
+    ck(coli_xdna_shape_would_run(6144, 2048, r6144, sizeof r6144) == 1,
+       "expert K=6144 N=2048 is not an immediate decline when 64^3 works");
+    ck(!strcmp(r6144, "TILED_64"), "expert shape reason is TILED_64");
+
+    ck(coli_xdna_tile64_plan(1, 6144, 2048, &mt, &kt, &nt) == 1,
+       "tile plan accepts expert GEMM M=1 K=6144 N=2048");
+    ck(mt == 1 && kt == 96 && nt == 32,
+       "expert GEMM tiles as 1 x 96 x 32 blocks of 64");
+
+    ck(coli_xdna_tile64_plan(64, 128, 65, &mt, &kt, &nt) == 1,
+       "remainders pad to the next multiple of 64");
+    ck(mt == 1 && kt == 2 && nt == 2, "128x65 pads N to two 64-wide tiles");
+
+    ck(coli_xdna_shape_would_run(0, 64, rbad, sizeof rbad) == 0,
+       "non-positive K still declines");
+    ck(!strcmp(rbad, "SHAPE_NO_PROGRAM"), "non-positive K is SHAPE_NO_PROGRAM");
+
+    ck(coli_xdna_shape_would_run(63, 64, rpad, sizeof rpad) == 1,
+       "K=63 pads through the 64^3 program");
+    ck(!strcmp(rpad, "TILED_64"), "padded remainder reason is TILED_64");
+
+    for(i = 0; i < 128; i++)
+        for(k = 0; k < 128; k++)
+            A[(size_t)i * 128 + (size_t)k] = (int16_t)((i + 3 * k) % 7 - 3);
+    for(k = 0; k < 128; k++)
+        for(j = 0; j < 128; j++)
+            B[(size_t)k * 128 + (size_t)j] = (int16_t)((2 * k + j) % 5 - 2);
+    for(i = 0; i < 128; i++)
+        for(j = 0; j < 128; j++){
+            int32_t acc = 0;
+            for(k = 0; k < 128; k++)
+                acc += (int32_t)A[(size_t)i * 128 + (size_t)k]
+                     * (int32_t)B[(size_t)k * 128 + (size_t)j];
+            R[(size_t)i * 128 + (size_t)j] = acc;
+        }
+    memset(C, 0x5a, sizeof C);
+    host_ok = coli_xdna_tile64_host_i16(A, B, C, 128, 128, 128);
+    ck(host_ok == 1, "host tiled i16 GEMM 128^3 returns success");
+    ck(memcmp(C, R, sizeof C) == 0,
+       "host 64^3 tiling matches the naive i16 reference");
+
+    coli_xdna_test_set_artifact_root(g_root);
+    coli_xdna_test_set_registry(NULL, 0);
+}
+
 int main(void){
     /* Every fixture lives in a private directory beside the test binary; the
      * registry never reads the current directory of its own accord. */
@@ -499,6 +588,7 @@ int main(void){
     test_path_contract();
     test_state_separation();
     test_production_rows();
+    test_tiled_expert_shape();
     test_no_runtime_readiness();
 
     /* Leave nothing behind: the fixtures are written beside the test binary,

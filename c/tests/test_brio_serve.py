@@ -52,9 +52,19 @@ OPTION = " no"
 
 
 def olmoe_engine():
+    # Last printed ECHO digit: the CPU expert kernel is not the device's bits.
+    # COLI_VK_TIER_BALANCE=0: the balancer does not hand rows back by timing.
+    # COLI_VK_TIER=0: a session that just ran another prompt still holds a
+    # different resident set than a cold one, with or without the balancer
+    # (qwen38-tiny-mtp-check uses the same switch for pin logits).
+    # COLI_VK_ATTN_BLOCK=0: a cold prefill and a short suffix share a reduction
+    # order.
     return Engine(ENGINE, [], dict(SNAP=str(FIXTURE), SERVE="1",
                                    TOK=str(FIXTURE / "tokenizer.json"),
-                                   COLI_NO_OMP_TUNE="1", OMP_NUM_THREADS="2"))
+                                   COLI_NO_OMP_TUNE="1", OMP_NUM_THREADS="2",
+                                   COLI_VK_TIER="0",
+                                   COLI_VK_TIER_BALANCE="0",
+                                   COLI_VK_ATTN_BLOCK="0"))
 
 
 class Engine:

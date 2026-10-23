@@ -112,8 +112,21 @@ pub fn env_engine_path() -> Option<PathBuf> {
         .map(|p| expand_user_path(PathBuf::from(p)))
 }
 
+/// Record the session-start 64³ NPU check from the XDNA switch.
+///
+/// App start and [`apply_xdna_request`] call this. On stores the live check so
+/// Config is honest before Start. Off leaves the check unrun. Not expert GEMM
+/// and not token generate.
+pub fn record_xdna_probe_from_switch(xdna_on: bool) {
+    crate::xdna_memory::record_session_start_probe(xdna_on);
+}
+
 /// Probe the host machine (sync; cheap on Linux).
+///
+/// Also records the XDNA session-start 64³ check from the saved switch so
+/// Config is honest before Start. DesktopApp::new already calls this.
 pub fn probe_machine() -> Result<MachineInfo, String> {
+    record_xdna_probe_from_switch(prefs::load().xdna);
     MachineInfo::probe_with(&ProbeOptions::default()).map_err(|e| e.to_string())
 }
 
@@ -507,6 +520,11 @@ pub fn ram_gb_for_engine(
 }
 
 /// Counts for [`live_tiers_from_counts`].
+///
+/// Test-only: the live strip paints a `TiersSnap` already accounted in C
+/// (`coli_tiers_ram_experts` in `c/telemetry.h`). That snapshot has no
+/// `ram_filled` / `ram_cap` split, so this helper has no paint-path call site.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct LiveTiersCounts {
     pub vram: u32,
@@ -521,6 +539,7 @@ pub struct LiveTiersCounts {
 }
 
 /// Live VRAM/RAM/Disk expert counts. RAM cap slots are RAM, not disk.
+#[cfg(test)]
 pub fn live_tiers_from_counts(c: LiveTiersCounts) -> TiersSnap {
     let total = c.vram.saturating_add(c.ram_filled).saturating_add(c.disk);
     let vram = if c.cpu_only { 0 } else { c.vram };
@@ -2020,6 +2039,8 @@ pub struct EngineSession {
     live: LiveEngine,
     family: ModelFamily,
     model_id: String,
+    /// Folder this session opened. Catalog delete matches this path.
+    model_path: PathBuf,
     kv_slots: u32,
     req: Arc<Mutex<ReqBook>>,
     /// Cooperative cancel for in-process generate (mux STOP is process-only).
@@ -2116,10 +2137,11 @@ impl EngineSession {
                         return Ok(Self {
                             live: LiveEngine::Ffi {
                                 engine: Arc::new(Mutex::new(FfiEngineSend(eng))),
-                                model_path: model,
+                                model_path: model.clone(),
                             },
                             family,
                             model_id,
+                            model_path: model,
                             kv_slots: 1,
                             req: Arc::new(Mutex::new(ReqBook::default())),
                             cancel: Arc::new(AtomicBool::new(false)),
@@ -2212,6 +2234,7 @@ impl EngineSession {
             live: LiveEngine::Process(handle),
             family,
             model_id,
+            model_path: model.to_path_buf(),
             kv_slots,
             req: Arc::new(Mutex::new(ReqBook::default())),
             #[cfg(feature = "ffi")]
@@ -2223,6 +2246,11 @@ impl EngineSession {
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// Path the engine opened at start. Catalog delete matches this, not a later selected row.
+    pub fn started_model_path(&self) -> &Path {
+        &self.model_path
     }
 
     pub fn family(&self) -> ModelFamily {
@@ -2635,6 +2663,12 @@ fn pulse_ffi_generate_emit(_count: u64, tx: &mpsc::Sender<GenEvent>) {
     let _ = tx.send(GenEvent::Token("·".into()));
 }
 
+/// One DeepSeek V4 token callback tick. Same Chat pulse as GLM FFI.
+fn on_v4_generate_token(count: &mut u64, tx: &mpsc::Sender<GenEvent>) {
+    *count = count.saturating_add(1);
+    pulse_ffi_generate_emit(*count, tx);
+}
+
 /// In-process generate (feature `ffi`). Streams token-count progress; V4 also
 /// appends detokenized text when the session API exposes it.
 #[cfg(feature = "ffi")]
@@ -2670,8 +2704,8 @@ fn generate_ffi(
                     if cancel.load(Ordering::SeqCst) {
                         return Err(colibri_sys::Error::engine("stopped"));
                     }
-                    count = count.saturating_add(1);
                     let _ = ev;
+                    on_v4_generate_token(&mut count, tx);
                     Ok(())
                 },
             )
@@ -2927,6 +2961,7 @@ pub fn apply_xdna_request(enabled: bool) {
             std::env::remove_var("COLI_XDNA");
         }
     }
+    record_xdna_probe_from_switch(enabled);
 }
 
 /// Build ChatMessage list from UI turns (user / assistant only for MVP).
@@ -3174,6 +3209,31 @@ impl DeleteCatalogError {
     }
 }
 
+/// Live-engine folder catalog delete must match.
+///
+/// `started` is the path the engine opened. `selected` is the catalog row or
+/// model input after start. Delete uses `started` only. Using `selected` can
+/// miss the live folder or refuse the wrong row.
+pub fn catalog_live_engine_path_for_delete<'a>(
+    started: Option<&'a Path>,
+    selected: Option<&'a Path>,
+) -> Option<&'a Path> {
+    let _ = selected;
+    let started = started?;
+    if started.as_os_str().is_empty() {
+        return None;
+    }
+    Some(started)
+}
+
+/// Same as [`catalog_live_engine_path_for_delete`], taking the live session.
+pub fn catalog_live_engine_path_from_session<'a>(
+    session: Option<&'a EngineSession>,
+    selected: Option<&'a Path>,
+) -> Option<&'a Path> {
+    catalog_live_engine_path_for_delete(session.map(EngineSession::started_model_path), selected)
+}
+
 /// True when `live` is the same folder as `installed`.
 pub fn catalog_folder_is_live_engine(installed: &Path, live: Option<&Path>) -> bool {
     let Some(live) = live else {
@@ -3212,8 +3272,11 @@ fn catalog_delete_target_allowed(folder: &Path, store: &Path) -> bool {
 
 /// Remove the Present catalog leaf under `model_store`.
 ///
-/// Refuses when the live engine is that folder. Does not delete Hugging Face
-/// cache outside the product store.
+/// Refuses when the live engine is that folder. `live_engine_path` is the
+/// path the engine started with ([`EngineSession::started_model_path`]),
+/// resolved with [`catalog_live_engine_path_for_delete`]. A later selected
+/// catalog row must not be passed here. Does not delete Hugging Face cache
+/// outside the product store.
 pub fn delete_catalog_model(
     catalog_id: &str,
     entries: &[ModelEntry],
@@ -5415,6 +5478,30 @@ mod tests {
     }
 
     #[test]
+    fn v4_token_event_on_every_emit() {
+        let (tx, rx) = mpsc::channel();
+        let mut count = 0u64;
+        for _ in 1u64..=8 {
+            on_v4_generate_token(&mut count, &tx);
+        }
+        drop(tx);
+        let marks: Vec<String> = rx
+            .iter()
+            .filter_map(|e| match e {
+                GenEvent::Token(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(count, 8);
+        assert_eq!(
+            marks.len(),
+            8,
+            "V4 must pulse GenEvent::Token on every emit, not one dump after generate; got {marks:?}"
+        );
+        assert!(marks.iter().all(|s| s == "·"), "{marks:?}");
+    }
+
+    #[test]
     fn clamp_temperature_bounds() {
         assert_eq!(clamp_temperature(0.0), 0.0);
         assert_eq!(clamp_temperature(2.0), 2.0);
@@ -5763,17 +5850,77 @@ mod tests {
 
     #[test]
     fn apply_xdna_request_sets_and_clears() {
-        let previous = std::env::var("COLI_XDNA").ok();
-        apply_xdna_request(true);
-        assert_eq!(std::env::var("COLI_XDNA").ok().as_deref(), Some("1"));
-        apply_xdna_request(false);
-        assert!(std::env::var("COLI_XDNA").is_err());
-        unsafe {
-            match previous {
-                Some(v) => std::env::set_var("COLI_XDNA", v),
-                None => std::env::remove_var("COLI_XDNA"),
+        crate::xdna_memory::with_session_probe(|| {
+            let previous = std::env::var("COLI_XDNA").ok();
+            apply_xdna_request(true);
+            assert_eq!(std::env::var("COLI_XDNA").ok().as_deref(), Some("1"));
+            apply_xdna_request(false);
+            assert!(std::env::var("COLI_XDNA").is_err());
+            unsafe {
+                match previous {
+                    Some(v) => std::env::set_var("COLI_XDNA", v),
+                    None => std::env::remove_var("COLI_XDNA"),
+                }
             }
-        }
+        });
+    }
+
+    #[test]
+    fn apply_xdna_request_on_records_config_probe_not_has_not_run() {
+        crate::xdna_memory::with_session_probe(|| {
+            let previous = std::env::var("COLI_XDNA").ok();
+            crate::xdna_memory::record_session_start_probe(false);
+            assert!(
+                crate::xdna_memory::xdna_config_sentence(true).contains("has not run"),
+                "precondition: unrun check"
+            );
+            apply_xdna_request(true);
+            let s = crate::xdna_memory::xdna_config_sentence(true);
+            assert!(
+                !s.contains("has not run"),
+                "On request must record the 64 by 64 by 64 check: {s}"
+            );
+            assert!(!s.contains("generate on"), "{s}");
+            apply_xdna_request(false);
+            let off = crate::xdna_memory::xdna_config_sentence(false);
+            assert_eq!(
+                off,
+                "XDNA is off. The next engine start leaves COLI_XDNA unset."
+            );
+            assert!(!off.contains("completed"), "{off}");
+            assert!(
+                crate::xdna_memory::xdna_config_sentence(true).contains("has not run"),
+                "Off must leave the check unrun"
+            );
+            unsafe {
+                match previous {
+                    Some(v) => std::env::set_var("COLI_XDNA", v),
+                    None => std::env::remove_var("COLI_XDNA"),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn xdna_on_at_process_start_records_probe_without_engine_start() {
+        crate::xdna_memory::with_session_probe(|| {
+            crate::xdna_memory::record_session_start_probe(false);
+            record_xdna_probe_from_switch(true);
+            let s = crate::xdna_memory::xdna_config_sentence(true);
+            assert!(
+                !s.contains("has not run"),
+                "process start On must record the check before Start: {s}"
+            );
+            assert!(!s.contains("generate on"), "{s}");
+            record_xdna_probe_from_switch(false);
+            assert!(
+                crate::xdna_memory::xdna_config_sentence(true).contains("has not run"),
+                "process start Off must leave the check unrun"
+            );
+            let off = crate::xdna_memory::xdna_config_sentence(false);
+            assert!(!off.contains("completed"), "{off}");
+            assert!(!off.contains("has not run"), "{off}");
+        });
     }
 
     #[test]
@@ -5972,6 +6119,19 @@ mod tests {
         (folder, entry)
     }
 
+    fn glm_fixture_under(store: &Path) -> (PathBuf, ModelEntry) {
+        let folder = store.join("GLM-5.2-colibri-int4-g64-with-int8-mtp");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("config.json"), br#"{"model_type":"glm"}"#).unwrap();
+        fs::write(folder.join("weights.bin"), b"fixture").unwrap();
+        let entry = test_entry(
+            folder.to_str().expect("utf8 fixture path"),
+            ModelStatus::Present,
+            ModelFamily::Glm,
+        );
+        (folder, entry)
+    }
+
     /// Deleting an installed fixture dir under a temp store makes
     /// `catalog_next_step` Install. Does not touch the operator model store.
     #[test]
@@ -6036,6 +6196,72 @@ mod tests {
         );
         let model = supported_model_by_id("deepseek-v4-colibri").expect("deepseek");
         assert!(catalog_is_installed(model, &entries).is_some());
+    }
+
+    #[test]
+    fn catalog_live_engine_path_for_delete_uses_start_path_not_selected_row() {
+        let started = Path::new("/store/DeepSeek-V4-Flash-0731");
+        let selected = Path::new("/store/GLM-5.2-colibri-int4-g64-with-int8-mtp");
+        assert_eq!(
+            catalog_live_engine_path_for_delete(Some(started), Some(selected)),
+            Some(started),
+            "delete must match the engine start path, not a later selected row"
+        );
+        assert_eq!(
+            catalog_live_engine_path_for_delete(Some(started), None),
+            Some(started)
+        );
+        assert_eq!(
+            catalog_live_engine_path_for_delete(None, Some(selected)),
+            None,
+            "a selected row is not the live engine when nothing started"
+        );
+        assert_eq!(
+            catalog_live_engine_path_for_delete(Some(Path::new("")), Some(selected)),
+            None
+        );
+        assert_eq!(
+            catalog_live_engine_path_from_session(None, Some(selected)),
+            None,
+            "no session means no live engine, even if a row is selected"
+        );
+    }
+
+    #[test]
+    fn delete_catalog_model_matches_engine_start_path_not_selected_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        let (started_folder, started_entry) = deepseek_fixture_under(store);
+        let (selected_folder, selected_entry) = glm_fixture_under(store);
+        let entries = [started_entry, selected_entry];
+        let live = catalog_live_engine_path_for_delete(
+            Some(started_folder.as_path()),
+            Some(selected_folder.as_path()),
+        );
+        assert_eq!(live, Some(started_folder.as_path()));
+        assert!(catalog_folder_is_live_engine(&started_folder, live));
+        assert!(!catalog_folder_is_live_engine(&selected_folder, live));
+
+        let err = delete_catalog_model("deepseek-v4-colibri", &entries, store, live)
+            .expect_err("live start folder must refuse");
+        assert_eq!(err, DeleteCatalogError::LiveEngine);
+        assert_eq!(err.as_message(), DELETE_CATALOG_LIVE_ENGINE);
+        assert!(
+            started_folder.is_dir(),
+            "refused delete must leave the live start fixture"
+        );
+
+        let deleted = delete_catalog_model("glm-5.2-colibri", &entries, store, live)
+            .expect("selected other row is not the live engine");
+        assert_eq!(deleted, selected_folder);
+        assert!(
+            !selected_folder.exists(),
+            "non-live selected row may delete"
+        );
+        assert!(
+            started_folder.is_dir(),
+            "live start folder must remain after deleting the selected row"
+        );
     }
 
     #[test]
