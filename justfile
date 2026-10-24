@@ -749,7 +749,10 @@ inkling-oracle: (_venv "oracle" "c/tools/oracle-requirements.txt")
     )
 
 # ci.yml efficiency. Shared oracle venv. The integer-kernel binary is
-# target/just-check-all/tike, not /tmp/tike. --fp8 stays after the bf16 assertions.
+# target/just-check-all/tike, not /tmp/tike. --fp8 writes under glm_fp8/ so
+# glm_tiny stays the bf16 oracle (same isolation as vulkan_engines.sh). A
+# leftover FP8 glm_tiny makes rust-nextest's glm_tiny_open_* tests refuse
+# embed_tokens.weight as F8_E4M3.
 efficiency: (_venv "oracle" "c/tools/oracle-requirements.txt")
     #!/usr/bin/env bash
     set -euo pipefail
@@ -789,9 +792,9 @@ efficiency: (_venv "oracle" "c/tools/oracle-requirements.txt")
     (
     cd "$root"
     cd c
-    python3 tools/make_glm_oracle.py --fp8
-    python3 tools/convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
-    cp ref_glm.json glm_tiny_i4/ref_glm.json
+    mkdir -p glm_fp8 && (cd glm_fp8 && python3 ../tools/make_glm_oracle.py --fp8)
+    python3 tools/convert_fp8_to_int4.py --indir glm_fp8/glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
+    cp glm_fp8/ref_glm.json glm_tiny_i4/ref_glm.json
     )
     (
     cd "$root"

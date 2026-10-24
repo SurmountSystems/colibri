@@ -25,6 +25,12 @@ $ ./coli chat
   ◆ Ciao! Come posso aiutarti oggi?
 ```
 
+<p align="center">
+  <a href="https://www.buymeacoffee.com/justvugg"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=justvugg&button_colour=FFDD00&font_colour=000000&font_family=Poppins&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="40"></a>
+  <br>
+  <sub>colibri 免费且开源。如果它已经在你的机器上站稳了脚跟，一杯咖啡就能支持下一个引擎和下一次提速。</sub>
+</p>
+
 <a id="get-started"></a>
 <a id="the-one-step-way"></a>
 

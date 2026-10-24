@@ -1,5 +1,6 @@
 #version 450
-// The dense chain's decode GEMV (vk_chain.c, S <= 4 rows): y[s,o] = sum_i x[s,i] *
+// The dense chain's decode GEMV (vk_chain.c, S <= 6 rows; nr <= 4 share a workgroup,
+// S = 5 or 6 uses nr = 1): y[s,o] = sum_i x[s,i] *
 // dequant(W[o,i]) for int8 per row (fmt 1), int4 per row (2) and int4 per (row, gs) (4),
 // the bindings and push constants of chain_gemv.comp plus rpw. A workgroup takes rpw
 // output rows of one input row (WorkGroupID.x the block, .y the row); x is staged in

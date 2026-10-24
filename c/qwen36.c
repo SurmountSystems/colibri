@@ -1565,6 +1565,7 @@ static int vk_dense_matmul(float *y, const float *x, const QW *w, int S, int I, 
 }
 /* One line at the end of a run or a serve turn: how many matmuls the device
  * really answered, so a test can tell a used path from an initialised one. */
+#include "vk_chain.h"   /* vkc_stats: the chain's matmuls are not coli_vk_matmul calls */
 /* The tier's line and, while it keeps one, its history: at every run and turn end. */
 static char g_vk_usage[2100];   /* where the tier's history lives (vk_tier_start) */
 static void vk_tier_turn(Model *m, const char *scope) {
@@ -1580,8 +1581,15 @@ static void vk_report(void) {
     size_t imp = coli_vk_imported_bytes();
     if (g_vk_placed[3] || imp)
         snprintf(more, sizeof more, ", f16 %u; %.1f MiB read in place", g_vk_placed[3], imp / 1048576.0);
+    /* The chain records its own matmuls (vkc_stats). On an integrated GPU the
+     * chain is the default (coli_vk_chain_decide, COLI_VK_CHAIN_ON), so the
+     * per-matrix counter stays 0 while the device still answered every dense
+     * projection. This line is "how many the device really answered". */
+    VkcStats st;
+    memset(&st, 0, sizeof st);
+    vkc_stats(&st);
     fprintf(stderr, "[VK] qwen36: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB; placed int8 %u, int4 %u, f32 %u%s)\n",
-            coli_vk_matmul_calls(), tensors, bytes / 1048576.0,
+            coli_vk_matmul_calls() + st.matmuls, tensors, bytes / 1048576.0,
             g_vk_placed[0], g_vk_placed[1], g_vk_placed[2], more);
 }
 #endif

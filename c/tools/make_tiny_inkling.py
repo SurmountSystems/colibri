@@ -18,6 +18,8 @@ expert batch stages its input at, and the dense chain's matrices, norms and
 convolutions at the width they run at.
 """
 import json
+import os
+import struct
 import sys
 
 import torch
@@ -28,11 +30,103 @@ except ImportError:
     sys.exit("transformers has no Inkling support: pip install -U transformers")
 
 
+def pin_tiny_moe_widths(cfg, expert_w, dense_w):
+    """Keep the tiny MoE width after InklingTextConfig.__post_init__.
+
+    transformers InklingTextConfig (huggingface/transformers#49416): when
+    dense_intermediate_size is set, intermediate_size is the routed experts'
+    width and is copied onto moe_intermediate_size. Passing only
+    moe_intermediate_size left the default 24576 on intermediate_size, and
+    that 24576 overwrote the tiny width. Vulkan then sized each expert at
+    18.0 MiB, so a two-expert budget of 62.9 KiB (COLI_VK_TIER_GB=0.00006)
+    could not hold one.
+    """
+    cfg.moe_intermediate_size = expert_w
+    cfg.intermediate_size = dense_w
+
+
+def require_tiny_experts(model, expert_w, hidden):
+    """Refuse a fixture whose routed experts used the real-model MoE width."""
+    layers = getattr(getattr(model, "model", model), "layers", None)
+    w = None
+    if layers is not None:
+        for layer in layers:
+            ex = getattr(getattr(layer, "mlp", None), "experts", None)
+            w = getattr(ex, "gate_up_proj", None) if ex is not None else None
+            if w is not None:
+                break
+    shape = tuple(w.shape) if w is not None else None
+    if shape is None or shape[-2] != 2 * expert_w or shape[-1] != hidden:
+        sys.exit(
+            f"tiny Inkling experts are {shape}, not [E, {2 * expert_w}, {hidden}]"
+        )
+
+
+def pin_saved_config(path, expert_w, dense_w):
+    """HF-saved form: intermediate_size is dense, moe_intermediate_size is MoE."""
+    with open(path) as f:
+        saved = json.load(f)
+    text = saved.get("text_config", saved)
+    text["moe_intermediate_size"] = expert_w
+    text["intermediate_size"] = dense_w
+    text.pop("dense_intermediate_size", None)
+    with open(path, "w") as f:
+        json.dump(saved, f, indent=2)
+        f.write("\n")
+
+
+def _saved_expert_names(hdr):
+    """Packed experts on a layer that exists.
+
+    Non-wide is 8 layers with dense_mlp_idx=2, so layer 2 has experts. --wide is
+    2 layers (0 dense, 1 sparse): model.layers.2.mlp.experts.gate_up_proj is
+    absent. Scan like require_tiny_experts rather than hardcoding layer 2.
+    """
+    up = None
+    for name in hdr:
+        if name.endswith(".mlp.experts.gate_up_proj"):
+            up = name
+            break
+    if up is None:
+        return "model.layers.N.mlp.experts.gate_up_proj", "model.layers.N.mlp.experts.down_proj"
+    return up, up[: -len("gate_up_proj")] + "down_proj"
+
+
+def require_saved_tiny_experts(outdir, expert_w, hidden):
+    """Refuse a snapshot whose packed experts used the real-model MoE width.
+
+    In-memory require_tiny_experts can miss a save that still writes 24576-wide
+    rows. Those rows are 18.0 MiB each; COLI_VK_TIER_GB=0.00006 (62.9 KiB) then
+    holds no expert, and vulkan_engines.sh fails: no routed expert ran on the
+    device.
+    """
+    path = os.path.join(outdir, "model.safetensors")
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    up, down = _saved_expert_names(hdr)
+    up_shape = hdr.get(up, {}).get("shape")
+    down_shape = hdr.get(down, {}).get("shape")
+    if up_shape is None or len(up_shape) < 2 or up_shape[-2] != 2 * expert_w or up_shape[-1] != hidden:
+        sys.exit(
+            f"saved tiny Inkling {up} is {up_shape}, not [E, {2 * expert_w}, {hidden}]"
+        )
+    if down_shape is None or len(down_shape) < 2 or down_shape[-2] != hidden or down_shape[-1] != expert_w:
+        sys.exit(
+            f"saved tiny Inkling {down} is {down_shape}, not [E, {hidden}, {expert_w}]"
+        )
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     wide = "--wide" in sys.argv[1:]
     out = args[0] if args else "tiny_inkling"
     torch.manual_seed(0)
+    # When dense_intermediate_size is set, intermediate_size is the experts'
+    # width (#49416). The tiny MoE width is 32 (64 on --wide); 24576 is the
+    # real model.
+    expert_w = 64 if wide else 32
+    dense_w = 128 if wide else 96
 
     if wide:
         cfg = InklingTextConfig(
@@ -53,8 +147,9 @@ def main():
             log_scaling_alpha=0.1,
             local_layer_ids=[0],                 # global layer at 1
             dense_mlp_idx=1,
-            dense_intermediate_size=128,
-            moe_intermediate_size=64,
+            intermediate_size=expert_w,
+            dense_intermediate_size=dense_w,
+            moe_intermediate_size=expert_w,
             n_routed_experts=8,
             num_experts_per_tok=2,
             n_shared_experts=2,
@@ -82,8 +177,9 @@ def main():
             log_scaling_alpha=0.1,
             local_layer_ids=[0, 1, 2, 3, 4, 6, 7],   # global layer at 5
             dense_mlp_idx=2,
-            dense_intermediate_size=96,
-            moe_intermediate_size=32,
+            intermediate_size=expert_w,
+            dense_intermediate_size=dense_w,
+            moe_intermediate_size=expert_w,
             n_routed_experts=8,
             num_experts_per_tok=2,
             n_shared_experts=2,
@@ -92,8 +188,10 @@ def main():
             max_position_embeddings=4096,
             eos_token_id=None,
         )
+    pin_tiny_moe_widths(cfg, expert_w, dense_w)
 
     model = InklingForCausalLM(cfg).eval().float()
+    require_tiny_experts(model, expert_w, cfg.hidden_size)
 
     prompt = [7, 42, 199, 3, 88, 154, 21, 60, 9, 133, 77, 245]
     ids = torch.tensor([prompt], dtype=torch.long)
@@ -107,6 +205,8 @@ def main():
         tf = model(torch.tensor([full], dtype=torch.long)).logits[0].argmax(-1).tolist()
 
     model.save_pretrained(out, safe_serialization=True)
+    pin_saved_config(f"{out}/config.json", expert_w, dense_w)
+    require_saved_tiny_experts(out, expert_w, cfg.hidden_size)
     ref = {"prompt_ids": prompt, "full_ids": full, "tf_pred": tf}
     with open(f"{out}/ref_inkling.json", "w") as f:
         json.dump(ref, f)

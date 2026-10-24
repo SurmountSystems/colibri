@@ -96,8 +96,9 @@ def _skip_reason() -> str:
         return "colibri not built (run: make -C c colibri)"
     if not _quantized_fixture_present():
         return (f"quantized trunk fixture absent or not int4: {QUANT} "
-                f"(run: tools/make_glm_oracle.py --fp8 && "
-                f"tools/convert_fp8_to_int4.py --indir glm_tiny "
+                f"(run: mkdir -p glm_fp8 && (cd glm_fp8 && "
+                f"python3 ../tools/make_glm_oracle.py --fp8) && "
+                f"tools/convert_fp8_to_int4.py --indir glm_fp8/glm_tiny "
                 f"--outdir glm_tiny_i4 --ebits 4 --io-bits 4)")
     if _ref_path() is None:
         return (f"oracle ref absent (expected {QUANT}/ref_glm.json or "

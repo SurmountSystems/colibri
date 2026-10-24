@@ -2433,6 +2433,22 @@ SEGMENT_RUNTIME_LIB = $(SEGMENT_BUILD_DIR)/libcolibri_segment_edge.a
 $(SEGMENT_BUILD_DIR):
 	mkdir -p $@
 
+# Named after the unit, not the flags. test-asan writes AddressSanitizer
+# objects here; a later non-ASan engine / test-c link would keep them
+# and fail undefined __asan_register_globals (same class as
+# build/ownership/ and deepseek_v4.cflags, #1702).
+SEGMENT_FLAGS_STAMP = $(SEGMENT_BUILD_DIR)/cflags
+SEGMENT_TRACK_FLAGS = $(subst ','\'',$(CC) $(SEGMENT_CPU_CFLAGS) $(NOCUDA_LDFLAGS))
+$(SEGMENT_FLAGS_STAMP): SEGMENT_FORCE | $(SEGMENT_BUILD_DIR)
+	@flags='$(SEGMENT_TRACK_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "segment: build flags changed, rebuilding segment objects" >&2; \
+		echo "$$flags" > $@; \
+	fi
+.PHONY: SEGMENT_FORCE
+SEGMENT_FORCE:
+$(SEGMENT_ALL_OBJS) $(SEGMENT_RUNTIME_OBJS): $(SEGMENT_FLAGS_STAMP)
+
 $(SEGMENT_BUILD_DIR)/glm.o: colibri.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLIBRI_NO_MAIN -c colibri.c -o $@
 
@@ -2610,6 +2626,24 @@ V4_OWNERSHIP_OBJS = \
 
 $(V4_OWN_DIR):
 	mkdir -p $(V4_OWN_DIR)
+
+# Named after the unit, not the flags. test-asan writes AddressSanitizer
+# objects here; a later non-ASan engine / test-c link would keep them
+# (timestamps cannot tell EXTRA_CFLAGS apart) and fail undefined
+# __asan_register_globals. The compiler line is recorded here and rewritten
+# only when it changes; every ownership object depends on it. Same scheme
+# as deepseek_v4.cflags (#1702).
+V4_OWN_FLAGS_STAMP = $(V4_OWN_DIR)/cflags
+V4_OWN_TRACK_FLAGS = $(subst ','\'',$(CC) $(V4_OWN_CFLAGS) $(LDFLAGS))
+$(V4_OWN_FLAGS_STAMP): V4_OWN_FORCE | $(V4_OWN_DIR)
+	@flags='$(V4_OWN_TRACK_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "v4-ownership: build flags changed, rebuilding ownership objects" >&2; \
+		echo "$$flags" > $@; \
+	fi
+.PHONY: V4_OWN_FORCE
+V4_OWN_FORCE:
+$(V4_OWNERSHIP_OBJS): $(V4_OWN_FLAGS_STAMP)
 
 $(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c deepseek_v4.c -o $@

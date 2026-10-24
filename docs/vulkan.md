@@ -972,8 +972,9 @@ integrated GPU that made the dense part slower on the device than on the CPU (se
 command buffer instead, and keeps the residual stream on the device from one layer
 to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flash
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
-the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
-anywhere. `COLI_VK_DENSE=0` keeps it off too, unless `COLI_VK_CHAIN` says otherwise: the
+the expert tier and `COLI_VK_DENSE=1` (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
+anywhere. `COLI_VK_DENSE=0`, and unset `COLI_VK_DENSE` on a RAM-sharing device with the
+expert tier, keep it off too, unless `COLI_VK_CHAIN` says otherwise: the
 chain's copy of the trunk would take the expert tier's budget (on an 8 GB RTX 4070
 Laptop with qwen38, disk-bound, the tier got 1.87 GiB instead of 6.00 and decode went
 from 0.84 to 0.64 tok/s, #1900). olmoe and inkling run it as well ([OLMoE and Inkling](#olmoe-and-inkling)).

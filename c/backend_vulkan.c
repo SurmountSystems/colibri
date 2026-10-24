@@ -2345,9 +2345,14 @@ unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load
  *   Unset, COLI_VK_DENSE=0: off (the trunk stays on the CPU, as that variable says; the
  *   chain's device copy of it would also take the expert tier's budget: on an 8 GB card
  *   with qwen38 the tier got 1.87 GiB instead of 6 and decode lost 24%, #1900).
+ *   Unset, COLI_VK_DENSE unset, a device sharing the CPU's RAM with the expert tier:
+ *   off too. dense_choice already put the trunk on the CPU (an integrated GPU, or
+ *   Lavapipe); turning the chain on would place those matrices and run dense matmuls
+ *   while the "[VK] dense matrices on the CPU" line still said CPU.
  *   Unset, a discrete GPU: on.
- *   Unset, an integrated GPU: `igpu` when the engine runs the expert tier (tier_on),
- *   else off; an engine never timed on one passes COLI_VK_CHAIN_UNMEASURED, which is
+ *   Unset, an integrated GPU: `igpu` when the engine runs the expert tier (tier_on)
+ *   and the trunk is on the device (COLI_VK_DENSE=1; unset already took the branch
+ *   above), else off; an engine never timed on one passes COLI_VK_CHAIN_UNMEASURED, which is
  *   off and says so. `igpu` is what the engine measured on one (a Radeon 780M, docs/vulkan.md,
  *   "The dense chain"): qwen36 passes ON (its chain won decode, 9.9 against 8.0 tok/s,
  *   and prefill, 9.5 against 12.2 s); qwen38 OFF (its chain won prefill, 30.1 against
@@ -2373,6 +2378,9 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
     } else if (dn && *dn == '0') {
         on = COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "COLI_VK_DENSE=0: the trunk on the CPU; COLI_VK_CHAIN=1 turns the chain on");
+    } else if (!(dn && *dn) && tier_on > 0 && coli_vk_device_shares_ram()) {
+        on = COLI_VK_CHAIN_OFF;
+        snprintf(why, sizeof why, "the trunk on the CPU (a device sharing the CPU's RAM, the expert tier is on); COLI_VK_CHAIN=1 turns the chain on, COLI_VK_DENSE=1 puts both on the device");
     } else if (coli_vk_device_integrated()) {
         int measured = igpu != COLI_VK_CHAIN_UNMEASURED;
         on = tier_on && measured ? igpu : COLI_VK_CHAIN_OFF;

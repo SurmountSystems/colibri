@@ -2604,6 +2604,7 @@ int main(int argc, char **argv) {
     for (int k = 0; k < 2; k++) {   /* a verify's rows: the decode step's bits each */
         int f = k ? 4 : 1;
         test_gemv_rows(f, 2, 2048, 512); test_gemv_rows(f, 3, 4096, 256); test_gemv_rows(f, 4, 2048, 300);
+        test_gemv_rows(f, 6, 2048, 300);   /* prompt-lookup: the token and 5 drafts */
     }
     test_rope();
     test_chunk_rows();

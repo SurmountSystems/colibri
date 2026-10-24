@@ -55,6 +55,7 @@ def main():
         log_scaling_alpha=0.1,
         local_layer_ids=[0, 1, 2, 3, 4, 6, 7],
         dense_mlp_idx=2,
+        intermediate_size=32,
         dense_intermediate_size=96,
         moe_intermediate_size=32,
         n_routed_experts=8,
@@ -65,6 +66,10 @@ def main():
         max_position_embeddings=4096,
         eos_token_id=None,
     )
+    # transformers InklingTextConfig (#49416): dense_intermediate_size copies
+    # intermediate_size onto moe_intermediate_size. Keep the tiny widths.
+    text_cfg.moe_intermediate_size = 32
+    text_cfg.intermediate_size = 96
     audio_cfg = InklingAudioConfig(
         n_mel_bins=N_MEL,
         mel_vocab_size=MEL_VOCAB,
@@ -122,6 +127,15 @@ def main():
         )
 
     model.save_pretrained(out, safe_serialization=True)
+    with open(f"{out}/config.json") as f:
+        saved = json.load(f)
+    text = saved.get("text_config", saved)
+    text["moe_intermediate_size"] = 32
+    text["intermediate_size"] = 96
+    text.pop("dense_intermediate_size", None)
+    with open(f"{out}/config.json", "w") as f:
+        json.dump(saved, f, indent=2)
+        f.write("\n")
     ref = {
         "prompt_ids": prompt,
         "full_ids": full,

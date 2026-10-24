@@ -404,9 +404,11 @@ unsigned long long coli_vk_matmul_calls(void);
 
 /* ---- the dense chain (vk_chain.h) ----------------------------------------------
  * Whether an engine runs its layers' dense chain on the device (COLI_VK_CHAIN): set,
- * 0 off, 2 prompts only, else on; unset, on for a discrete GPU, `igpu` (the engine's
- * measured choice) on an integrated GPU with the expert tier on, off otherwise. With an
- * engine name the decision is printed as a [VK] line. */
+ * 0 off, 2 prompts only, else on; unset, off when the trunk is on the CPU
+ * (COLI_VK_DENSE=0, or unset on a RAM-sharing device with the expert tier), on for a
+ * discrete GPU, `igpu` (the engine's measured choice) on an integrated GPU with the
+ * expert tier and COLI_VK_DENSE=1, off otherwise. With an engine name the decision is
+ * printed as a [VK] line. */
 #define COLI_VK_CHAIN_OFF     0
 #define COLI_VK_CHAIN_ON      1
 #define COLI_VK_CHAIN_PREFILL 2   /* forwards of more than two rows only */

@@ -795,12 +795,17 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= KC.gemv4_xs;
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
-    int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
+    /* chain_gemv2.comp NRMAX is 4 (MTP's S). Prompt-lookup verifies are 6 rows
+     * (the token and 5 drafts). S > 4 still takes this kernel with nr = 1 so
+     * each row's bits stay a decode step's; S > 4 used chain_gemv.comp and an
+     * int8 6-row verify's last logits were not the decode GEMV's. int4 stays
+     * on chain_gemv (measured slower here). */
+    int g2 = path < 0 && KC.gv2 && S <= 6 && ti->fmt == 1 &&
              ti->I % 32 == 0 && ti->I <= 16384 && ti->rowWords % 4 == 0;
     if (g2) {
         /* rows a workgroup: short matrices in small blocks, so they still fill the device */
         int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
-        /* a speculative verify's rows (S <= 4) share each weight load */
+        /* a speculative verify's rows (S <= 4, shader NRMAX) share each weight load */
         int nr = S <= 4 && S * ti->I <= 16384 ? S : 1;
         struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
         ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)((ti->O + rpw - 1) / rpw), (uint32_t)((S + nr - 1) / nr), 1);

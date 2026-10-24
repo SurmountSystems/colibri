@@ -48,7 +48,17 @@
 #     routed experts the device served instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}
+# CI pins Lavapipe: .github/workflows/ci.yml
+#   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+# When unset, prefer RADV if that ICD is on the machine (Radeon iGPU), else Lavapipe.
+# Do not skip the two-expert eviction assert on llvmpipe; a real GPU is the local default.
+if [ -z "${VK_ICD_FILENAMES:-}" ]; then
+  if [ -f /usr/share/vulkan/icd.d/radeon_icd.json ]; then
+    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
+  else
+    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+  fi
+fi
 export COLI_NO_OMP_TUNE=1
 PY=${PY:-python3}
 # Speculative decoding is on by default (MTP and prompt lookup, docs/speculative.md): its
@@ -559,6 +569,16 @@ family_inkling_olmoe() {
   # Lavapipe (a CPU device sharing the CPU's RAM) the trunk otherwise stays on the CPU
   # while the expert tier is on; the tier runs beside it.
   $PY tools/make_tiny_inkling.py tiny_inkling
+  # Packed experts must be the tiny MoE width (32), not the real-model 24576.
+  # 24576-wide f32 experts are 18.0 MiB; COLI_VK_TIER_GB=0.00006 cannot hold one.
+  $PY - tiny_inkling/model.safetensors <<'PY' || fail "tiny_inkling: packed experts are not the tiny MoE width"
+import json, struct, sys
+raw = open(sys.argv[1], "rb").read()
+n = struct.unpack("<Q", raw[:8])[0]
+hdr = json.loads(raw[8:8+n])
+shape = hdr["model.layers.2.mlp.experts.gate_up_proj"]["shape"]
+sys.exit(0 if shape[-2] == 64 and shape[-1] == 64 else 1)
+PY
   for cap in 1 2 8; do
     SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1
     COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > vk.log 2>&1

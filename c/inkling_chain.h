@@ -870,6 +870,15 @@ static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_ba
     int CH = mirror_ok ? inkc_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     if (!mirror_ok || pos_base + S > m->max_t || !inkc_scratch(ch, m, rows) || (want_x && !inkc_res(&ch->xd, (size_t)rows * D, VKC_DOWN))) {
+        if (vkc_lost()) {
+            /* COLI_VK_CHAIN_FAULT can land on a scratch zero/upload: the chain started this
+             * forward, then the device was lost. Count it so the report's N forwards is > 0. */
+            vkc_device(0);
+            inkc_recover(m, pos_base);
+            *lost = 1;
+            ch->forwards++;
+            return 0;
+        }
         fprintf(stderr, "[VK] inkling chain: device memory for %d rows refused; per-matrix path\n", rows);
         ch->failed = 1;
         return 0;
@@ -953,6 +962,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     vkc_device(0);
     inkc_recover(m, pos_base);
     *lost = 1;
+    ch->forwards++;   /* this forward ran until the loss; inkc_report still prints N > 0 */
     return 0;
 }
 
