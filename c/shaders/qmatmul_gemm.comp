@@ -157,6 +157,13 @@ uvec4 rwa[WU], rwb[WU]; vec2 rws[WU]; vec4 rx[XU];
 
 float x_at(uint i) { return x4[i >> 2][i & 3u]; }   // x[i], one float of its quad
 
+// quant.h matmul_q on AVX2: eight FMA lanes, then hsum256
+// ((a0+a4)+(a2+a6))+((a1+a5)+(a3+a7)).
+float hsum8(vec4 a0, vec4 a1) {
+    vec4 t = a0 + a1;
+    return (t.x + t.z) + (t.y + t.w);
+}
+
 // Fetch step k0 of this tile into registers (zeros past O, S and I).
 void fetch_step(int tid, int o0, int s0, int k0) {
     [[unroll]] for (int r = 0; r < WU; r++) {
@@ -187,8 +194,13 @@ void main() {
     int o0 = int(gl_WorkGroupID.x) * BM, s0 = int(gl_WorkGroupID.y) * BN;
 
     float acc[TM][TN];
+    precise vec4 acc0[TM][TN], acc1[TM][TN];
     [[unroll]] for (int i = 0; i < TM; i++)
-        [[unroll]] for (int j = 0; j < TN; j++) acc[i][j] = 0.0;
+        [[unroll]] for (int j = 0; j < TN; j++) {
+            acc[i][j] = 0.0;
+            acc0[i][j] = vec4(0.0);
+            acc1[i][j] = vec4(0.0);
+        }
 
     if (PF) fetch_step(tid, o0, s0, 0);
     for (int k0 = 0; k0 < p.I; k0 += BK) {
@@ -210,23 +222,46 @@ void main() {
         }
         barrier();
         if (PF && k0 + BK < p.I) fetch_step(tid, o0, s0, k0 + BK);
-        // The step's BK products sum into a fresh partial that then joins acc: blocked
-        // summation keeps the rounding error near (BK + I/BK) ulps instead of I, the
-        // same order as the GEMV's per-lane sums plus subgroup tree.
-        float part[TM][TN];
-        [[unroll]] for (int i = 0; i < TM; i++)
-            [[unroll]] for (int j = 0; j < TN; j++) part[i][j] = 0.0;
-        [[unroll]] for (int q = 0; q < BK / 4; q++) {
-            vec4 a[TM], b[TN];
-            [[unroll]] for (int i = 0; i < TM; i++) a[i] = wsh[(tm + i * NTM) * KQ + q];
-            [[unroll]] for (int j = 0; j < TN; j++) b[j] = xsh[(tn + j * NTN) * KQ + q];
+        if (p.fmt == 1) {
+            // 8-wide FMA over k, then one hsum8, matching matmul_q. Sequential
+            // per lane (dont_unroll + precise acc): unrolled FMA was contracted
+            // and glm53's 8-bit trunk missed logits_close (2.23e-04 of 1.97e+00).
+            [[dont_unroll]] for (int t = 0; t < BK / 8; t++) {
+                int q = t * 2;
+                vec4 aw0[TM], aw1[TM], bx0[TN], bx1[TN];
+                [[unroll]] for (int i = 0; i < TM; i++) {
+                    aw0[i] = wsh[(tm + i * NTM) * KQ + q];
+                    aw1[i] = wsh[(tm + i * NTM) * KQ + q + 1];
+                }
+                [[unroll]] for (int j = 0; j < TN; j++) {
+                    bx0[j] = xsh[(tn + j * NTN) * KQ + q];
+                    bx1[j] = xsh[(tn + j * NTN) * KQ + q + 1];
+                }
+                [[unroll]] for (int i = 0; i < TM; i++)
+                    [[unroll]] for (int j = 0; j < TN; j++) {
+                        acc0[i][j] = fma(aw0[i], bx0[j], acc0[i][j]);
+                        acc1[i][j] = fma(aw1[i], bx1[j], acc1[i][j]);
+                    }
+            }
+        } else {
+            // The step's BK products sum into a fresh partial that then joins acc: blocked
+            // summation keeps the rounding error near (BK + I/BK) ulps instead of I, the
+            // same order as the GEMV's per-lane sums plus subgroup tree.
+            float part[TM][TN];
             [[unroll]] for (int i = 0; i < TM; i++)
-                [[unroll]] for (int j = 0; j < TN; j++)
-                    part[i][j] = fma(a[i].w, b[j].w, fma(a[i].z, b[j].z,
-                                 fma(a[i].y, b[j].y, fma(a[i].x, b[j].x, part[i][j]))));
+                [[unroll]] for (int j = 0; j < TN; j++) part[i][j] = 0.0;
+            [[unroll]] for (int q = 0; q < BK / 4; q++) {
+                vec4 a[TM], b[TN];
+                [[unroll]] for (int i = 0; i < TM; i++) a[i] = wsh[(tm + i * NTM) * KQ + q];
+                [[unroll]] for (int j = 0; j < TN; j++) b[j] = xsh[(tn + j * NTN) * KQ + q];
+                [[unroll]] for (int i = 0; i < TM; i++)
+                    [[unroll]] for (int j = 0; j < TN; j++)
+                        part[i][j] = fma(a[i].w, b[j].w, fma(a[i].z, b[j].z,
+                                     fma(a[i].y, b[j].y, fma(a[i].x, b[j].x, part[i][j]))));
+            }
+            [[unroll]] for (int i = 0; i < TM; i++)
+                [[unroll]] for (int j = 0; j < TN; j++) acc[i][j] += part[i][j];
         }
-        [[unroll]] for (int i = 0; i < TM; i++)
-            [[unroll]] for (int j = 0; j < TN; j++) acc[i][j] += part[i][j];
         barrier();
     }
 
@@ -237,7 +272,10 @@ void main() {
         float sc = perrow ? scale[o] : 1.0;
         [[unroll]] for (int j = 0; j < TN; j++) {
             int s = s0 + tn + j * NTN;
-            if (s < p.S) y[uint(s) * uint(p.O) + uint(o)] = acc[i][j] * sc;
+            if (s < p.S) {
+                float v = p.fmt == 1 ? hsum8(acc0[i][j], acc1[i][j]) : acc[i][j];
+                y[uint(s) * uint(p.O) + uint(o)] = v * sc;
+            }
         }
     }
 }

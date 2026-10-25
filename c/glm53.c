@@ -1161,6 +1161,20 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
     }
 }
 
+/* CPU kernels only (matmul_q / matmul_i4_grouped / matmul): the chain's last-layer
+ * FFN so br matches the no-Vulkan engine. mm() on a VK process would take the
+ * device for resident fmt 1 shared experts. */
+static void mm_cpu(float *out, const Mat *w, const float *x, int S) {
+#ifdef COLI_VULKAN
+    if (g53_dho_gone(w)) g53_dho_reload((Mat *)w);
+#endif
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, S, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, S, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, S, w->columns, w->rows); break;
+    }
+}
+
 /* mv_rows for S rows: out[S, rows] from x[S, columns] and W's rows
  * [row0, row0 + rows). */
 static void mm_rows(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
@@ -1234,6 +1248,21 @@ static void mlp3_rows(float *out, const float *x, int S, const Mat *g, const Mat
     for (int t = 0; t < S; t++)
         swiglu_clamped(sg + (size_t)t * g->rows, su + (size_t)t * g->rows, g->rows, limit);
     mm(out, d, sg, S);
+}
+
+static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, const Mat *d,
+                     float limit, float *sg, float *su) {
+    mm_cpu(sg, g, x, 1); mm_cpu(su, u, x, 1);
+    swiglu_clamped(sg, su, g->rows, limit);
+    mm_cpu(out, d, sg, 1);
+}
+
+static void mlp3_rows_cpu(float *out, const float *x, int S, const Mat *g, const Mat *u,
+                          const Mat *d, float limit, float *sg, float *su) {
+    mm_cpu(sg, g, x, S); mm_cpu(su, u, x, S);
+    for (int t = 0; t < S; t++)
+        swiglu_clamped(sg + (size_t)t * g->rows, su + (size_t)t * g->rows, g->rows, limit);
+    mm_cpu(out, d, sg, S);
 }
 
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
@@ -2182,9 +2211,10 @@ static void ffn_layer_vk(GModel *m, int index, const float *x, int tokens, const
  * Fare l'unione paga due volte: le letture vanno insieme, e un esperto che
  * serve a piu' token del blocco si legge una volta sola. */
 /* with_shared 0 (the dense chain, glm53_chain.h): the routed experts only, from out = 0;
- * the device runs the shared expert. */
+ * the device runs the shared expert. host 1: CPU kernels only (matmul_q / matmul_i4),
+ * no expert tier, so last-layer br can match the no-Vulkan engine. */
 static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
-                         int tokens, float *out, int with_shared) {
+                         int tokens, float *out, int with_shared, int host) {
     const Cfg *c = &m->c;
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
 
@@ -2192,7 +2222,8 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
         float *sg = malloc((size_t)tokens * wide * sizeof(float));
         float *su = malloc((size_t)tokens * wide * sizeof(float));
         if (!sg || !su) { fprintf(stderr, "OOM in dense FFN\n"); exit(1); }
-        mlp3_rows(out, x, tokens, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        if (host) mlp3_rows_cpu(out, x, tokens, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        else mlp3_rows(out, x, tokens, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
         free(su); free(sg);
         return;
     }
@@ -2262,15 +2293,19 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp || !xg || !row_t || !row_w) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
-    if (with_shared) mlp3_rows(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
-    else memset(out, 0, (size_t)tokens * c->hidden * sizeof(float));
+    if (with_shared) {
+        if (host) mlp3_rows_cpu(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+        else mlp3_rows(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    } else memset(out, 0, (size_t)tokens * c->hidden * sizeof(float));
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
             for (int k = 0; k < topk; k++) {
                 const int eid = chosen[(size_t)t * topk + k];
-                mlp3(tmp, x + (size_t)t * c->hidden, &l->eg[eid], &l->eu[eid], &l->ed[eid],
-                     c->swiglu_limit, sg, su);
+                if (host) mlp3_cpu(tmp, x + (size_t)t * c->hidden, &l->eg[eid], &l->eu[eid], &l->ed[eid],
+                                   c->swiglu_limit, sg, su);
+                else mlp3(tmp, x + (size_t)t * c->hidden, &l->eg[eid], &l->eu[eid], &l->ed[eid],
+                          c->swiglu_limit, sg, su);
                 const float scale = weight[(size_t)t * topk + k];
                 float *dst = out + (size_t)t * c->hidden;
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
@@ -2280,7 +2315,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
     }
 
 #ifdef COLI_VULKAN
-    if (vkt_ready()) {          /* the expert tier: routed experts in rank order after the shared */
+    if (vkt_ready() && !host) {          /* the expert tier: routed experts in rank order after the shared */
         ffn_layer_vk(m, index, x, tokens, chosen, weight, out, sg, su, tmp, xg);
         free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
         return;
@@ -2311,7 +2346,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
          * On any backend refusal/fault, run the original CPU loop unchanged. */
         int metal_done = 0;
 #ifdef COLI_METAL
-        if (g_metal_ready) {
+        if (g_metal_ready && !host) {
             g_metal_moe_attempt++;
             const int max_rows = tokens * topk;
             const void **mg = malloc((size_t)here * sizeof(*mg));
@@ -2387,7 +2422,8 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
                     row_t[R] = t; row_w[R] = scale; R++;
                 }
                 if (!R) continue;
-                mlp3_rows(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
+                if (host) mlp3_rows_cpu(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
+                else mlp3_rows(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
                 for (int r = 0; r < R; r++) {
                     const float *src = tmp + (size_t)r * c->hidden;
                     float *dst = out + (size_t)row_t[r] * c->hidden;
@@ -2403,7 +2439,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
 
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
-    ffn_layer_ex(m, l, index, x, tokens, out, 1);
+    ffn_layer_ex(m, l, index, x, tokens, out, 1, 0);
 }
 
 /* ---------- caricamento ---------- */
@@ -3125,9 +3161,103 @@ static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     double t_head0 = now_s();
     if (need < 1 || need > n) need = n;
+#ifdef COLI_VULKAN
+    unsigned long long nvk0 = coli_vk_matmul_calls();
+#endif
     mm(logits + (size_t)(n - need) * c->vocab, &m->head, normed + (size_t)(n - need) * D, need);
     m->t_head += now_s() - t_head0;
 #ifdef COLI_VULKAN
+    {   /* COLI_VK_DUMP_FMT1: lm_head GPU y vs CPU matmul_q of the same x (backend coli_vk_matmul).
+         * Head under 1e-4: also GPU col vs CPU col before the head (composed x). */
+        static int head_dumped;
+        FILE *df = g53c_dump_fp();
+        unsigned long long nvk1 = coli_vk_matmul_calls();
+        if (df && !head_dumped && need > 1) {
+            head_dumped = 1;
+            int gpu_run = getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"));
+            {
+                const char *de = getenv("COLI_VK_DUMP_FMT1");
+                char pth[512];
+                if (de && *de == '/') {
+                    const char *slash = strrchr(de, '/');
+                    int dirlen = slash ? (int)(slash - de) : 0;
+                    snprintf(pth, sizeof pth, "%.*s/glm53-col-%s.f32", dirlen, de, gpu_run ? "gpu" : "cpu");
+                } else snprintf(pth, sizeof pth, "glm53-col-%s.f32", gpu_run ? "gpu" : "cpu");
+                FILE *cf = fopen(pth, "wb");
+                if (cf) {
+                    fwrite(collapsed + (size_t)(n - need) * D, sizeof(float), (size_t)need * D, cf);
+                    fwrite(normed + (size_t)(n - need) * D, sizeof(float), (size_t)need * D, cf);
+                    fclose(cf);
+                }
+                if (gpu_run) {
+                    char pc[512];
+                    if (de && *de == '/') {
+                        const char *slash = strrchr(de, '/');
+                        int dirlen = slash ? (int)(slash - de) : 0;
+                        snprintf(pc, sizeof pc, "%.*s/glm53-col-cpu.f32", dirlen, de);
+                    } else snprintf(pc, sizeof pc, "glm53-col-cpu.f32");
+                    FILE *fc = fopen(pc, "rb");
+                    size_t nd = (size_t)need * (size_t)D;
+                    float *cc = malloc(nd * 2 * sizeof(float));
+                    int rd = fc && cc && fread(cc, sizeof(float), nd * 2, fc) == nd * 2;
+                    if (fc) fclose(fc);
+                    if (!rd) fprintf(df, "[dump] composed x into head (GPU col vs CPU col): CPU col not sampled\n");
+                    else {
+                        double dc = 0, mc = 0, dn = 0, mn = 0;
+                        for (size_t k = 0; k < nd; k++) {
+                            double a = fabs((double)collapsed[(size_t)(n - need) * D + k] - (double)cc[k]); if (a > dc) dc = a;
+                            double b = fabs((double)cc[k]); if (b > mc) mc = b;
+                            double an = fabs((double)normed[(size_t)(n - need) * D + k] - (double)cc[nd + k]); if (an > dn) dn = an;
+                            double bn = fabs((double)cc[nd + k]); if (bn > mn) mn = bn;
+                        }
+                        fprintf(df, "[dump] composed x into head GPU col vs CPU col: S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                                need, D, dc, mc, mc > 0 ? dc / mc : 0, 1e-4 * mc);
+                        fprintf(df, "[dump] composed x into head GPU nrm vs CPU nrm: S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                                need, D, dn, mn, mn > 0 ? dn / mn : 0, 1e-4 * mn);
+                    }
+                    free(cc);
+                }
+            }
+            Mat *w = &m->head;
+            const float *gx = normed + (size_t)(n - need) * D;
+            const float *gy = logits + (size_t)(n - need) * c->vocab;
+            int I = w->columns, O = w->rows;
+            fprintf(df, "[dump] lm_head: S=%d I=%d O=%d fmt=%d vk_gone=%d coli_vk_matmul_calls %llu -> %llu\n",
+                    need, I, O, w->fmt, g53_dho_gone(w), nvk0, nvk1);
+            if (w->fmt != 1)
+                fprintf(df, "[dump] lm_head fmt 1: skip fmt=%d\n", w->fmt);
+            else {
+                if (g53_dho_gone(w)) g53_dho_reload(w);
+                if (!w->q8 || !w->s)
+                    fprintf(df, "[dump] lm_head fmt 1: skip q8=%d s=%d\n", w->q8 ? 1 : 0, w->s ? 1 : 0);
+                else {
+                    size_t nx = (size_t)need * (size_t)I, ny = (size_t)need * (size_t)O;
+                    float *yc = malloc(ny * sizeof(float));
+                    if (!yc) fprintf(df, "[dump] lm_head fmt 1: not sampled (OOM)\n");
+                    else {
+                        matmul_q(yc, gx, w->q8, w->s, need, I, O);
+                        double d = 0, my = 0, mx = 0, mc = 0; int x_not_f16 = 0;
+                        for (size_t k = 0; k < nx; k++) {
+                            double ax = fabs((double)gx[k]); if (ax > mx) mx = ax;
+                            uint32_t u; memcpy(&u, &gx[k], 4);
+                            if ((u & 0x1fffu) && (u & 0x7fffffff)) x_not_f16++;
+                        }
+                        for (size_t k = 0; k < ny; k++) {
+                            double a = fabs((double)gy[k] - (double)yc[k]); if (a > d) d = a;
+                            double b = fabs((double)yc[k]); if (b > mc) mc = b;
+                            double gyv = fabs((double)gy[k]); if (gyv > my) my = gyv;
+                        }
+                        fprintf(df, "[dump] lm_head fmt 1: S=%d I=%d O=%d x_bytes=4 x_not_f16=%d max|x|=%.2e\n",
+                                need, I, O, x_not_f16, mx);
+                        fprintf(df, "[dump] lm_head fmt 1 CPU matmul_q vs device y: max |diff| %.2e of %.2e (cpu max) gpu_max=%.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                                d, mc, my, mc > 0 ? d / mc : 0, 1e-4 * mc);
+                        free(yc);
+                    }
+                }
+            }
+            fflush(df);
+        }
+    }
     {   /* DUMP=<path> (VK=1 builds): every logits row computed, raw f32, for the Vulkan gates */
         static FILE *dump; static int said;
         if (!said) { said = 1; const char *p = getenv("DUMP"); if (p && *p) dump = fopen(p, "wb"); }

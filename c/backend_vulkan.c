@@ -1788,9 +1788,10 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         pthread_mutex_lock(&u->mx);
         /* rows without padding: straight from the weights when their pages import */
         size_t z = 0;
+        const void *sc_src = fmt == 10 || fmt == 11 || fmt == 14 ? (const void *)&one : scales;
         int ok = ((rows.cpu_rb == rows.stride && up_add_host(u, weights, t->wbytes, 1, &t->wbuf, &z, &z, &t->wbytes)) ||
                   up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows)) &&
-                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 ? (const void *)&one : scales);
+                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, sc_src);
         ok = up_finish(u, P->dev) && ok;
         pthread_mutex_unlock(&u->mx);
         if (!ok) {   /* the matrix stays on the CPU (with the device, if it was lost) */
@@ -2028,7 +2029,9 @@ static void vk_prof_paths(void) {
  * boundaries on its staged steps (one group scale per step). */
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
-    return t->fmt == 1 || t->fmt == 2 ||
+    /* fmt 1 (int8) stays on qmatmul_gemm.comp: the cooperative-matrix GEMM
+     * stages x as f16, and that error missed logits_close on glm53's 8-bit trunk. */
+    return t->fmt == 2 ||
            ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0);
 }
 /* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
@@ -2141,6 +2144,12 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     }
     if (G.eg_prof) { tA = vk_now(); p_wait += tA - t0; g_vwait_ms += tA - t0; t0 = tA; vkprof_tick(); }
     memcpy(y, G.y.ptr, yb);
+    {
+        const char *de = getenv("COLI_VK_DUMP_FMT1");
+        if (de && *de && *de != '0' && fmt == 1)
+            fprintf(stderr, "[dump] coli_vk_matmul fmt 1: S=%d I=%d O=%d path=%d (0=GEMV,1=fp32 GEMM,2=coop) call=%llu\n",
+                    S, I, O, path, g_vk_matmul_calls + 1);
+    }
     if (G.eg_prof) {
         p_y += vk_now() - t0;
         if ((++p_n & 8191) == 0)

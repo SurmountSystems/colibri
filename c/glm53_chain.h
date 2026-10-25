@@ -601,43 +601,524 @@ static void g53c_pull(G53Chain *ch, const GModel *m, GSession *s, int from, int 
 }
 
 /* ---- one layer's pieces ---------------------------------------------------------------- */
+static FILE *g53c_dump_fp(void);
+static int g53c_dump_cpu_layers(const GModel *m, float *xs, const float *xin, int nr, int start,
+                                int lo, int upto, float *nxt, float *col, float *post, float *comb,
+                                float *nrm, float *br, float *sg, float *su);
+static int g53c_dump_cpu_to_post(const GModel *m, const float *xin, int nr, int start,
+                                 int lo, int layer, int site,
+                                 float *residual, float *branch, float *post, float *comb,
+                                 float *nxt, float *col, float *nrm, float *sg, float *su);
+/* COLI_VK_DUMP_FMT1: original streams of the live chunk, for last-layer POST internals. */
+static const float *g53c_dump_xin;
+static int g53c_dump_nr, g53c_dump_start, g53c_dump_lo;
+static void g53c_dump_maxdiff(FILE *df, const char *tag, const float *a, const float *b, size_t n) {
+    double d = 0, m = 0;
+    for (size_t k = 0; k < n; k++) {
+        double x = fabs((double)a[k] - (double)b[k]); if (x > d) d = x;
+        double y = fabs((double)b[k]); if (y > m) m = y;
+    }
+    fprintf(df, "[dump] %s: max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+            tag, d, m, m > 0 ? d / m : 0, 1e-4 * m);
+}
+/* POST internals of already-diverged streams: sequential RMS of H*D and unweighted /H mean. */
+static void g53c_dump_stream_rms_mean(FILE *df, const char *tag, int n, int H, int D, float eps,
+                                     const float *gpu, const float *cpu) {
+    int HD = H * D;
+    double dr = 0, mr = 0, dm = 0, mmv = 0;
+    for (int t = 0; t < n; t++) {
+        const float *g = gpu + (size_t)t * HD, *c0 = cpu + (size_t)t * HD;
+        float gss = 0.f, css = 0.f;
+        for (int i = 0; i < HD; i++) { gss += g[i] * g[i]; css += c0[i] * c0[i]; }
+        float gr = 1.f / sqrtf(gss / (float)HD + eps);
+        float cr = 1.f / sqrtf(css / (float)HD + eps);
+        double a = fabs((double)gr - (double)cr); if (a > dr) dr = a;
+        double b = fabs((double)cr); if (b > mr) mr = b;
+        for (int d0 = 0; d0 < D; d0++) {
+            float gs = 0.f, cs = 0.f;
+            for (int h = 0; h < H; h++) { gs += g[h * D + d0]; cs += c0[h * D + d0]; }
+            gs /= (float)H; cs /= (float)H;
+            double am = fabs((double)gs - (double)cs); if (am > dm) dm = am;
+            double bm = fabs((double)cs); if (bm > mmv) mmv = bm;
+        }
+    }
+    fprintf(df, "[dump] %s RMS (1/sqrt(mean x^2 + eps)): S=%d HD=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+            tag, n, HD, dr, mr, mr > 0 ? dr / mr : 0, 1e-4 * mr);
+    fprintf(df, "[dump] %s stream mean (/H): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+            tag, n, D, dm, mmv, mmv > 0 ? dm / mmv : 0, 1e-4 * mmv);
+}
 /* mHC's entry for a site: the mix, the split, the collapse, the RMSNorm into nrm */
 static int g53c_pre(G53Chain *ch, const GModel *m, ColiVkTensor *fn, size_t hco, size_t lno, int n) {
     const Cfg *c = &m->c; int H = c->hc_mult, D = c->hidden, HD = H * D, nm = (2 + H) * H, hr = 2 * H + H * H;
     VkcMhc sp = {n, H, D, c->hc_iters, 0, HD, 0, nm, 0, hr, 0, D, (int)hco, 0, c->eps, c->hc_eps, 0.f};
     VkcNorm nr = {n, D, 1, 0, D, D, 0, D, D, (int)lno, 0, 0, c->eps, 1.f};
-    return vkc_matmul(fn, ch->xs, 0, ch->mix, 0, n) && vkc_mhc(VKC_MHC_SPLIT, ch->xs, ch->mix, ch->hp, ch->prm, NULL, &sp) &&
-           vkc_mhc(VKC_MHC_COLLAPSE, ch->xs, NULL, ch->hp, NULL, ch->col, &sp) && vkc_norm(ch->col, ch->prm, ch->nrm, &nr);
+    int ok = vkc_matmul(fn, ch->xs, 0, ch->mix, 0, n) && vkc_mhc(VKC_MHC_SPLIT, ch->xs, ch->mix, ch->hp, ch->prm, NULL, &sp) &&
+             vkc_mhc(VKC_MHC_COLLAPSE, ch->xs, NULL, ch->hp, NULL, ch->col, &sp) && vkc_norm(ch->col, ch->prm, ch->nrm, &nr);
+    static int nrm_n;
+    FILE *df = g53c_dump_fp();
+    /* count every PRE of a multi-row chunk so last-layer FFN nrm is nrm_n==7 (4 layers * 2 sites). */
+    int dump_nrm = df && n > 1 && (nrm_n == 0 || nrm_n == 7);
+    if (ok && df && n > 1) {
+        if (dump_nrm) {
+        const char *nrm_name = nrm_n == 0 ? "first-layer nrm (GPU vs CPU rms of GPU col)"
+                                          : "last-layer nrm into FFN (GPU vs CPU rms of GPU col)";
+        size_t nd = (size_t)n * (size_t)D;
+        float *col = malloc(nd * sizeof(float)), *gn = malloc(nd * sizeof(float)), *cn = malloc(nd * sizeof(float));
+        int rd = col && gn && cn && vkc_read(ch->col, 0, col, nd * 4) && vkc_read(ch->nrm, 0, gn, nd * 4);
+        if (!rd) fprintf(df, "[dump] %s: not sampled\n", nrm_name);
+        else {
+            const float *w = nrm_n == 0 ? m->layer[0].in_ln : m->layer[c->n_layers - 1].post_ln;
+            for (int t = 0; t < n; t++) rms(cn + (size_t)t * D, col + (size_t)t * D, w, D, c->eps);
+            double d = 0, mc = 0;
+            for (size_t k = 0; k < nd; k++) {
+                double a = fabs((double)gn[k] - (double)cn[k]); if (a > d) d = a;
+                double b = fabs((double)cn[k]); if (b > mc) mc = b;
+            }
+            fprintf(df, "[dump] %s: S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                    nrm_name, n, D, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+            {
+                float ss = 0.f; for (int i = 0; i < D; i++) ss += col[i] * col[i];
+                float rcpu = 1.f / sqrtf(ss / (float)D + c->eps);
+                float rgpu = (w[0] != 0.f && col[0] != 0.f) ? gn[0] / (col[0] * w[0]) : 0.f;
+                fprintf(df, "[dump] %s r (GPU y/(x*w) vs CPU rms r of GPU col): r_gpu=%.9e r_cpu=%.9e |diff|=%.3e ss=%.9e\n",
+                        nrm_name, rgpu, rcpu, fabsf(rgpu - rcpu), ss);
+            }
+            if (nrm_n != 0) { fflush(df); }
+            else {
+            size_t nx = (size_t)n * (size_t)HD, nmix = (size_t)n * (size_t)nm;
+            float *xs = malloc(nx * sizeof(float)), *mg = malloc(nmix * sizeof(float)), *mcpu = malloc(nmix * sizeof(float));
+            int rd2 = xs && mg && mcpu && vkc_read(ch->xs, 0, xs, nx * 4) && vkc_read(ch->mix, 0, mg, nmix * 4);
+            if (!rd2) fprintf(df, "[dump] first-layer mix fmt 10: not sampled\n");
+            else {
+                matmul(mcpu, xs, m->layer[0].hc_attn_fn, n, HD, nm);
+                double dm = 0, mmx = 0; int x_not_f16 = 0;
+                for (size_t k = 0; k < nx; k++) {
+                    uint32_t u; memcpy(&u, &xs[k], 4);
+                    if ((u & 0x1fffu) && (u & 0x7fffffff)) x_not_f16++;
+                }
+                for (size_t k = 0; k < nmix; k++) {
+                    double a = fabs((double)mg[k] - (double)mcpu[k]); if (a > dm) dm = a;
+                    double b = fabs((double)mcpu[k]); if (b > mmx) mmx = b;
+                }
+                fprintf(df, "[dump] first-layer mix fmt 10: S=%d I=%d O=%d x_bytes=4 x_not_f16=%d\n", n, HD, nm, x_not_f16);
+                fprintf(df, "[dump] first-layer mix CPU matmul vs device y: max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                        dm, mmx, mmx > 0 ? dm / mmx : 0, 1e-4 * mmx);
+                float *ccol = malloc(nd * sizeof(float)), *cpost = malloc((size_t)n * H * sizeof(float));
+                float *ccomb = malloc((size_t)n * H * H * sizeof(float));
+                if (ccol && cpost && ccomb) {
+                    for (int t = 0; t < n; t++)
+                        coli_hc_pre(ccol + (size_t)t * D, cpost + (size_t)t * H,
+                                    ccomb + (size_t)t * H * H, xs + (size_t)t * HD,
+                                    m->layer[0].hc_attn_fn, m->layer[0].hc_attn_scale,
+                                    m->layer[0].hc_attn_base, H, D, c->hc_iters, c->eps, c->hc_eps);
+                    double dc = 0, mcc = 0;
+                    for (size_t k = 0; k < nd; k++) {
+                        double a = fabs((double)col[k] - (double)ccol[k]); if (a > dc) dc = a;
+                        double b = fabs((double)ccol[k]); if (b > mcc) mcc = b;
+                    }
+                    fprintf(df, "[dump] first-layer mhc col (GPU col vs CPU coli_hc_pre of GPU xs): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            n, D, dc, mcc, mcc > 0 ? dc / mcc : 0, 1e-4 * mcc);
+                    float *ghp = malloc((size_t)n * hr * sizeof(float));
+                    if (ghp && vkc_read(ch->hp, 0, ghp, (size_t)n * hr * 4)) {
+                        double dp = 0, mp = 0, dcb = 0, mcb = 0;
+                        for (int t = 0; t < n; t++) {
+                            const float *gp = ghp + (size_t)t * hr, *cp = cpost + (size_t)t * H, *cc = ccomb + (size_t)t * H * H;
+                            for (int j = 0; j < H; j++) {
+                                double a = fabs((double)gp[H + j] - (double)cp[j]); if (a > dp) dp = a;
+                                double b = fabs((double)cp[j]); if (b > mp) mp = b;
+                            }
+                            for (int j = 0; j < H * H; j++) {
+                                double a = fabs((double)gp[2 * H + j] - (double)cc[j]); if (a > dcb) dcb = a;
+                                double b = fabs((double)cc[j]); if (b > mcb) mcb = b;
+                            }
+                        }
+                        fprintf(df, "[dump] first-layer mhc post-coeff (GPU hp vs CPU coli_hc_pre): max |diff| %.2e of %.2e rel=%.3e\n",
+                                dp, mp, mp > 0 ? dp / mp : 0);
+                        fprintf(df, "[dump] first-layer mhc comb (GPU hp vs CPU coli_hc_pre): max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                                dcb, mcb, mcb > 0 ? dcb / mcb : 0, 1e-4 * mcb);
+                    }
+                    free(ghp);
+                }
+                free(ccol); free(cpost); free(ccomb);
+            }
+            free(xs); free(mg); free(mcpu);
+            fflush(df);
+            }
+        }
+        free(col); free(gn); free(cn);
+        if (!vkc_begin()) ok = 0;
+        }
+        nrm_n++;
+    }
+    return ok;
 }
 /* mHC's exit: xn = mix(xs) + post * br, then the two swap */
 static int g53c_post(G53Chain *ch, const GModel *m, int n) {
     const Cfg *c = &m->c; int H = c->hc_mult, D = c->hidden, HD = H * D, hr = 2 * H + H * H;
     VkcMhc po = {n, H, D, c->hc_iters, 0, HD, 0, D, 0, hr, 0, HD, 0, 0, c->eps, c->hc_eps, 0.f};
-    if (!vkc_mhc(VKC_MHC_POST, ch->xs, ch->br, ch->hp, NULL, ch->xn, &po)) return 0;
+    static int post_n;
+    FILE *df = g53c_dump_fp();
+    /* first attn POST, last-layer attn POST, last-layer ffn POST */
+    int npost = 2 * c->n_layers, pn = post_n;
+    int dump = df && n > 1 && (pn == 0 || pn == npost - 2 || pn == npost - 1);
+    const char *post_name = pn == 0 ? "first-layer" : (pn == npost - 2 ? "last-layer-attn" : "last-layer");
+    int layer_i = pn / 2, site = pn % 2;
+    float *xs = NULL, *br = NULL, *hp = NULL, *gxn = NULL, *cxn = NULL;
+    if (dump) {
+        xs = malloc((size_t)n * HD * sizeof(float));
+        br = malloc((size_t)n * D * sizeof(float));
+        hp = malloc((size_t)n * hr * sizeof(float));
+        gxn = malloc((size_t)n * HD * sizeof(float));
+        cxn = malloc((size_t)n * HD * sizeof(float));
+        if (!(xs && br && hp && gxn && cxn &&
+              vkc_read(ch->xs, 0, xs, (size_t)n * HD * 4) &&
+              vkc_read(ch->br, 0, br, (size_t)n * D * 4) &&
+              vkc_read(ch->hp, 0, hp, (size_t)n * hr * 4) &&
+              vkc_begin())) dump = 0;
+    }
+    if (!vkc_mhc(VKC_MHC_POST, ch->xs, ch->br, ch->hp, NULL, ch->xn, &po)) {
+        free(xs); free(br); free(hp); free(gxn); free(cxn);
+        return 0;
+    }
+    post_n++;
+    if (dump) {
+        int rd = vkc_read(ch->xn, 0, gxn, (size_t)n * HD * 4);
+        if (!rd) fprintf(df, "[dump] %s mhc post: not sampled\n", post_name);
+        else {
+            for (int t = 0; t < n; t++)
+                coli_hc_post(cxn + (size_t)t * HD, br + (size_t)t * D, xs + (size_t)t * HD,
+                             hp + (size_t)t * hr + H, hp + (size_t)t * hr + 2 * H, H, D);
+            double d = 0, mc = 0, d64 = 0, m64 = 0;
+            for (size_t k = 0; k < (size_t)n * HD; k++) {
+                double a = fabs((double)gxn[k] - (double)cxn[k]); if (a > d) d = a;
+                double b = fabs((double)cxn[k]); if (b > mc) mc = b;
+            }
+            /* f32 sequential mix vs f64 mix of the same GPU xs/br/hp */
+            for (int t = 0; t < n; t++) {
+                const float *res = xs + (size_t)t * HD, *branch = br + (size_t)t * D;
+                const float *post = hp + (size_t)t * hr + H, *comb = hp + (size_t)t * hr + 2 * H;
+                for (int dest = 0; dest < H; dest++) for (int col = 0; col < D; col++) {
+                    float vf = 0.f; double vd = 0;
+                    for (int src = 0; src < H; src++) {
+                        vf += comb[src * H + dest] * res[src * D + col];
+                        vd += (double)comb[src * H + dest] * (double)res[src * D + col];
+                    }
+                    vf += post[dest] * branch[col];
+                    vd += (double)post[dest] * (double)branch[col];
+                    double a = fabs((double)vf - vd); if (a > d64) d64 = a;
+                    double b = fabs(vd); if (b > m64) m64 = b;
+                }
+            }
+            fprintf(df, "[dump] %s mhc post (GPU xn vs CPU coli_hc_post): S=%d HD=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                    post_name, n, HD, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+            fprintf(df, "[dump] %s residual mix f32 sequential vs f64 (same GPU xs/br/hp): max |diff| %.2e of %.2e rel=%.3e\n",
+                    post_name, d64, m64, m64 > 0 ? d64 / m64 : 0);
+            /* same-input PRE of GPU xs vs GPU hp (mix matrix / post coeffs at this POST) */
+            if (layer_i >= 0 && layer_i < c->n_layers) {
+                const GLayer *pl = &m->layer[layer_i];
+                const float *fn = site ? pl->hc_ffn_fn : pl->hc_attn_fn;
+                const float *sc = site ? pl->hc_ffn_scale : pl->hc_attn_scale;
+                const float *ba = site ? pl->hc_ffn_base : pl->hc_attn_base;
+                float *ccol = malloc((size_t)n * D * sizeof(float));
+                float *cpost = malloc((size_t)n * H * sizeof(float));
+                float *ccomb = malloc((size_t)n * H * H * sizeof(float));
+                if (ccol && cpost && ccomb && fn && sc && ba) {
+                    for (int t = 0; t < n; t++)
+                        coli_hc_pre(ccol + (size_t)t * D, cpost + (size_t)t * H,
+                                    ccomb + (size_t)t * H * H, xs + (size_t)t * HD,
+                                    fn, sc, ba, H, D, c->hc_iters, c->eps, c->hc_eps);
+                    double dp = 0, mp = 0, dcb = 0, mcb = 0;
+                    for (int t = 0; t < n; t++) {
+                        const float *gp = hp + (size_t)t * hr, *cp = cpost + (size_t)t * H, *cc = ccomb + (size_t)t * H * H;
+                        for (int j = 0; j < H; j++) {
+                            double a = fabs((double)gp[H + j] - (double)cp[j]); if (a > dp) dp = a;
+                            double b = fabs((double)cp[j]); if (b > mp) mp = b;
+                        }
+                        for (int j = 0; j < H * H; j++) {
+                            double a = fabs((double)gp[2 * H + j] - (double)cc[j]); if (a > dcb) dcb = a;
+                            double b = fabs((double)cc[j]); if (b > mcb) mcb = b;
+                        }
+                    }
+                    fprintf(df, "[dump] %s mhc post-coeff same-input (GPU hp vs CPU coli_hc_pre of GPU xs): max |diff| %.2e of %.2e rel=%.3e\n",
+                            post_name, dp, mp, mp > 0 ? dp / mp : 0);
+                    fprintf(df, "[dump] %s mhc comb same-input (GPU hp vs CPU coli_hc_pre of GPU xs): max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            post_name, dcb, mcb, mcb > 0 ? dcb / mcb : 0, 1e-4 * mcb);
+                }
+                free(ccol); free(cpost); free(ccomb);
+            }
+            /* already-diverged streams: CPU replay of the original input to this POST */
+            if ((pn == npost - 2 || pn == npost - 1) && g53c_dump_xin && g53c_dump_nr == n) {
+                int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+                float *cres = malloc((size_t)n * HD * sizeof(float));
+                float *cbr = malloc((size_t)n * D * sizeof(float));
+                float *cpost = malloc((size_t)n * H * sizeof(float));
+                float *ccomb = malloc((size_t)n * H * H * sizeof(float));
+                float *cnxt = malloc((size_t)n * HD * sizeof(float));
+                float *ccol = malloc((size_t)n * D * sizeof(float));
+                float *cnrm = malloc((size_t)n * D * sizeof(float));
+                float *csg = malloc((size_t)n * wide * sizeof(float));
+                float *csu = malloc((size_t)n * wide * sizeof(float));
+                float *cxn2 = malloc((size_t)n * HD * sizeof(float));
+                int okp = cres && cbr && cpost && ccomb && cnxt && ccol && cnrm && csg && csu && cxn2 &&
+                          g53c_dump_cpu_to_post(m, g53c_dump_xin, n, g53c_dump_start, g53c_dump_lo,
+                                                layer_i, site, cres, cbr, cpost, ccomb,
+                                                cnxt, ccol, cnrm, csg, csu);
+                if (!okp) fprintf(df, "[dump] %s POST internals of diverged streams: not sampled\n", post_name);
+                else {
+                    g53c_dump_stream_rms_mean(df, post_name, n, H, D, c->eps, xs, cres);
+                    {
+                        char tag[160];
+                        snprintf(tag, sizeof tag, "%s residual streams (GPU xs vs CPU replay at POST)", post_name);
+                        g53c_dump_maxdiff(df, tag, xs, cres, (size_t)n * HD);
+                        snprintf(tag, sizeof tag, "%s branch (GPU br vs CPU replay at POST)", post_name);
+                        g53c_dump_maxdiff(df, tag, br, cbr, (size_t)n * D);
+                    }
+                    if (pn == npost - 1) {
+                        float *gnrm = malloc((size_t)n * D * sizeof(float));
+                        float *gcol = malloc((size_t)n * D * sizeof(float));
+                        float *cnrm_si = malloc((size_t)n * D * sizeof(float));
+                        int rdn = gnrm && gcol && cnrm_si &&
+                                  vkc_read(ch->nrm, 0, gnrm, (size_t)n * D * 4) &&
+                                  vkc_read(ch->col, 0, gcol, (size_t)n * D * 4);
+                        if (!rdn) fprintf(df, "[dump] last-layer nrm into FFN: not sampled\n");
+                        else {
+                            const float *wln = m->layer[layer_i].post_ln;
+                            for (int t = 0; t < n; t++)
+                                rms(cnrm_si + (size_t)t * D, gcol + (size_t)t * D, wln, D, c->eps);
+                            g53c_dump_maxdiff(df, "last-layer nrm into FFN (GPU nrm vs CPU rms of GPU col)",
+                                              gnrm, cnrm_si, (size_t)n * D);
+                            g53c_dump_maxdiff(df, "last-layer nrm into FFN (GPU nrm vs CPU replay nrm)",
+                                              gnrm, cnrm, (size_t)n * D);
+                        }
+                        free(gnrm); free(gcol); free(cnrm_si);
+                    }
+                    double dp = 0, mp = 0, dcb = 0, mcb = 0;
+                    for (int t = 0; t < n; t++) {
+                        const float *gp = hp + (size_t)t * hr, *cp = cpost + (size_t)t * H, *cc = ccomb + (size_t)t * H * H;
+                        for (int j = 0; j < H; j++) {
+                            double a = fabs((double)gp[H + j] - (double)cp[j]); if (a > dp) dp = a;
+                            double b = fabs((double)cp[j]); if (b > mp) mp = b;
+                        }
+                        for (int j = 0; j < H * H; j++) {
+                            double a = fabs((double)gp[2 * H + j] - (double)cc[j]); if (a > dcb) dcb = a;
+                            double b = fabs((double)cc[j]); if (b > mcb) mcb = b;
+                        }
+                    }
+                    fprintf(df, "[dump] %s mhc post-coeff diverged (GPU hp vs CPU coli_hc_pre of CPU residual): max |diff| %.2e of %.2e rel=%.3e\n",
+                            post_name, dp, mp, mp > 0 ? dp / mp : 0);
+                    fprintf(df, "[dump] %s mhc comb diverged (GPU hp vs CPU coli_hc_pre of CPU residual): max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            post_name, dcb, mcb, mcb > 0 ? dcb / mcb : 0, 1e-4 * mcb);
+                    for (int t = 0; t < n; t++)
+                        coli_hc_post(cxn2 + (size_t)t * HD, cbr + (size_t)t * D, cres + (size_t)t * HD,
+                                     cpost + (size_t)t * H, ccomb + (size_t)t * H * H, H, D);
+                    {
+                        char tag[160];
+                        snprintf(tag, sizeof tag, "%s mhc post (GPU xn vs CPU coli_hc_post of CPU residual/br/hp)", post_name);
+                        g53c_dump_maxdiff(df, tag, gxn, cxn2, (size_t)n * HD);
+                    }
+                }
+                free(cres); free(cbr); free(cpost); free(ccomb); free(cnxt);
+                free(ccol); free(cnrm); free(csg); free(csu); free(cxn2);
+            }
+            if (post_n != 1) { fflush(df); }
+            else {
+                float *ccol = malloc((size_t)n * D * sizeof(float));
+                float *cpost2 = malloc((size_t)n * H * sizeof(float));
+                float *ccomb2 = malloc((size_t)n * H * H * sizeof(float));
+                float *cnrm = malloc((size_t)n * D * sizeof(float));
+                float *cbr = malloc((size_t)n * D * sizeof(float));
+                float *cxn2 = malloc((size_t)n * HD * sizeof(float));
+                size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)3 * c->kda_proj * c->conv_k;
+                float *st = calloc(ns, sizeof(float)), *win = calloc(nw, sizeof(float));
+                float *scr = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd, c->kda_hd) * sizeof(float));
+                if (ccol && cpost2 && ccomb2 && cnrm && cbr && cxn2 && st && win && scr) {
+                    for (int t = 0; t < n; t++) {
+                        coli_hc_pre(ccol + (size_t)t * D, cpost2 + (size_t)t * H,
+                                    ccomb2 + (size_t)t * H * H, xs + (size_t)t * HD,
+                                    m->layer[0].hc_attn_fn, m->layer[0].hc_attn_scale,
+                                    m->layer[0].hc_attn_base, H, D, c->hc_iters, c->eps, c->hc_eps);
+                        rms(cnrm + (size_t)t * D, ccol + (size_t)t * D, m->layer[0].in_ln, D, c->eps);
+                    }
+                    kda_layer(c, &m->layer[0], cnrm, n, cbr, st, win, scr);
+                    for (int t = 0; t < n; t++)
+                        coli_hc_post(cxn2 + (size_t)t * HD, cbr + (size_t)t * D, xs + (size_t)t * HD,
+                                     cpost2 + (size_t)t * H, ccomb2 + (size_t)t * H * H, H, D);
+                    double d2 = 0, mc2 = 0;
+                    for (size_t k = 0; k < (size_t)n * HD; k++) {
+                        double a = fabs((double)gxn[k] - (double)cxn2[k]); if (a > d2) d2 = a;
+                        double b = fabs((double)cxn2[k]); if (b > mc2) mc2 = b;
+                    }
+                    fprintf(df, "[dump] first-layer composed streams (GPU xn vs CPU site of GPU xs): S=%d HD=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            n, HD, d2, mc2, mc2 > 0 ? d2 / mc2 : 0, 1e-4 * mc2);
+                }
+                free(ccol); free(cpost2); free(ccomb2); free(cnrm); free(cbr); free(cxn2);
+                free(st); free(win); free(scr);
+            }
+            fflush(df);
+        }
+        if (!vkc_begin()) { free(xs); free(br); free(hp); free(gxn); free(cxn); return 0; }
+    }
+    free(xs); free(br); free(hp); free(gxn); free(cxn);
     VkcBuf *t = ch->xs; ch->xs = ch->xn; ch->xn = t;
     return 1;
+}
+/* COLI_VK_DUMP_FMT1: CPU matmul_q vs the device y of one chain fmt 1 matmul. */
+static FILE *g53c_dump_fp(void) {
+    const char *de = getenv("COLI_VK_DUMP_FMT1");
+    static FILE *df; static int opened;
+    if (!de || !*de || *de == '0') return NULL;
+    if (!opened) { opened = 1; df = (*de == '/') ? fopen(de, "w") : NULL; if (!df) df = stderr; }
+    return df;
+}
+static void g53c_dump_fmt1(const char *name, const Mat *w, VkcBuf *x, size_t xo, VkcBuf *y, size_t yo, int n) {
+    FILE *df = g53c_dump_fp();
+    if (!df) return;
+    if (!w || w->fmt != 1 || !w->q8 || !w->s) {
+        fprintf(df, "[dump] %s: skip fmt=%d q8=%d s=%d\n", name, w ? w->fmt : -1, w && w->q8 ? 1 : 0, w && w->s ? 1 : 0);
+        return;
+    }
+    int I = w->columns, O = w->rows;
+    size_t nx = (size_t)n * (size_t)I, ny = (size_t)n * (size_t)O;
+    float *xh = malloc(nx * sizeof(float)), *yh = malloc(ny * sizeof(float)), *yc = malloc(ny * sizeof(float));
+    int rd = xh && yh && yc && vkc_read(x, xo, xh, nx * 4) && vkc_read(y, yo, yh, ny * 4);
+    if (!rd) fprintf(df, "[dump] %s: not sampled (read failed) S=%d I=%d O=%d\n", name, n, I, O);
+    else {
+        matmul_q(yc, xh, w->q8, w->s, n, I, O);
+        double d = 0, my = 0, mx = 0, mc = 0; int x_not_f16 = 0;
+        for (size_t k = 0; k < nx; k++) {
+            double ax = fabs((double)xh[k]); if (ax > mx) mx = ax;
+            uint32_t u; memcpy(&u, &xh[k], 4);
+            if ((u & 0x1fffu) && (u & 0x7fffffff)) x_not_f16++;
+        }
+        for (size_t k = 0; k < ny; k++) {
+            double a = fabs((double)yh[k] - (double)yc[k]); if (a > d) d = a;
+            double b = fabs((double)yc[k]); if (b > mc) mc = b;
+            double gy = fabs((double)yh[k]); if (gy > my) my = gy;
+        }
+        fprintf(df, "[dump] %s: S=%d I=%d O=%d x_bytes=4 x_not_f16=%d max|x|=%.2e\n", name, n, I, O, x_not_f16, mx);
+        fprintf(df, "[dump] %s CPU matmul_q vs device y: max |diff| %.2e of %.2e (cpu max) gpu_max=%.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                name, d, mc, my, mc > 0 ? d / mc : 0, 1e-4 * mc);
+        fflush(df);
+    }
+    free(xh); free(yh); free(yc);
 }
 static int g53c_mlp(G53Chain *ch, const GModel *m, const Mat *g, const Mat *u, const Mat *d, VkcBuf *out, int n) {
     int I = g->rows;
     VkcMhc sw = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n * I, 0.f, 0.f, m->c.swiglu_limit};
-    return vkc_matmul(g53c_tensor(g), ch->nrm, 0, ch->gs, 0, n) && vkc_matmul(g53c_tensor(u), ch->nrm, 0, ch->us, 0, n) &&
-           vkc_mhc(VKC_SWIGLU_CLAMP, ch->gs, ch->us, NULL, NULL, ch->hs, &sw) && vkc_matmul(g53c_tensor(d), ch->hs, 0, out, 0, n);
+    static int mlp_dumped;
+    int dump = g53c_dump_fp() != NULL && !mlp_dumped;
+    int ok = vkc_matmul(g53c_tensor(g), ch->nrm, 0, ch->gs, 0, n);
+    if (ok && dump) { g53c_dump_fmt1("first-layer fmt 1 mlp_g", g, ch->nrm, 0, ch->gs, 0, n); if (!vkc_begin()) ok = 0; }
+    ok = ok && vkc_matmul(g53c_tensor(u), ch->nrm, 0, ch->us, 0, n) &&
+         vkc_mhc(VKC_SWIGLU_CLAMP, ch->gs, ch->us, NULL, NULL, ch->hs, &sw) &&
+         vkc_matmul(g53c_tensor(d), ch->hs, 0, out, 0, n);
+    if (ok && dump) { g53c_dump_fmt1("first-layer fmt 1 mlp_d", d, ch->hs, 0, out, 0, n); mlp_dumped = 1; if (!vkc_begin()) ok = 0; }
+    return ok;
+}
+/* COLI_VK_DUMP_FMT1: KDA layer i of the same GPU nrm (CPU kda_layer / conv / ko). */
+static void g53c_dump_kda_same(G53Chain *ch, const GModel *m, const GLayer *l, int i, int n) {
+    FILE *df = g53c_dump_fp();
+    if (!df || n <= 1) return;
+    const Cfg *c = &m->c;
+    int P = c->kda_proj, HK = c->kda_heads, KD = c->kda_hd, r = ch->rows, KW = c->conv_k, D = c->hidden;
+    size_t ns = (size_t)HK * KD * KD, nw = (size_t)3 * P * KW, nb = (size_t)n * D, ny = (size_t)n * P;
+    Mat *mats[9] = {(Mat *)&l->kq, (Mat *)&l->kk, (Mat *)&l->kv, (Mat *)&l->ko,
+                    (Mat *)&l->kga, (Mat *)&l->kgb, (Mat *)&l->kfa, (Mat *)&l->kfb, (Mat *)&l->kb};
+    for (int k = 0; k < 9; k++) if (g53_dho_gone(mats[k])) g53_dho_reload(mats[k]);
+    float *st = calloc(ns, sizeof(float)), *win = calloc(nw, sizeof(float));
+    float *scr = malloc((size_t)coli_kda_scratch_floats(HK, KD, KD) * sizeof(float));
+    float *xn = malloc((size_t)n * D * sizeof(float));
+    float *gbr = malloc(nb * sizeof(float)), *cbr = malloc(nb * sizeof(float));
+    float *gst = malloc(ns * sizeof(float)), *gwin = malloc(nw * sizeof(float));
+    float *gky = malloc(ny * sizeof(float)), *cko = malloc(nb * sizeof(float));
+    float *gcm = malloc((size_t)n * 3 * (size_t)P * sizeof(float));
+    float *gqkv = malloc((size_t)3 * (size_t)r * P * sizeof(float));
+    float *cwin = calloc(nw, sizeof(float)), *ccm = malloc((size_t)n * 3 * (size_t)P * sizeof(float));
+    int rd = st && win && scr && xn && gbr && cbr && gst && gwin && gky && cko && gcm && gqkv && cwin && ccm &&
+             vkc_read(ch->nrm, 0, xn, (size_t)n * D * 4) &&
+             vkc_read(ch->br, 0, gbr, nb * 4) &&
+             vkc_read(ch->st[i], 0, gst, ns * 4) &&
+             vkc_read(ch->win[i], 0, gwin, nw * 4) &&
+             vkc_read(ch->ky, 0, gky, ny * 4) &&
+             vkc_read(ch->cm, 0, gcm, (size_t)n * 3 * (size_t)P * 4) &&
+             vkc_read(ch->qkv3, 0, gqkv, (size_t)3 * (size_t)r * P * 4);
+    if (!rd) fprintf(df, "[dump] layer%d kda same-input: not sampled\n", i);
+    else {
+        kda_layer(c, l, xn, n, cbr, st, win, scr);
+        double d = 0, mc = 0, ds = 0, ms = 0, dw = 0, mw = 0, dk = 0, mk = 0, dc = 0, mcv = 0;
+        for (size_t k = 0; k < nb; k++) {
+            double a = fabs((double)gbr[k] - (double)cbr[k]); if (a > d) d = a;
+            double b = fabs((double)cbr[k]); if (b > mc) mc = b;
+        }
+        for (size_t k = 0; k < ns; k++) {
+            double a = fabs((double)gst[k] - (double)st[k]); if (a > ds) ds = a;
+            double b = fabs((double)st[k]); if (b > ms) ms = b;
+        }
+        for (size_t k = 0; k < nw; k++) {
+            double a = fabs((double)gwin[k] - (double)win[k]); if (a > dw) dw = a;
+            double b = fabs((double)win[k]); if (b > mw) mw = b;
+        }
+        fprintf(df, "[dump] layer%d kda composed (GPU br vs CPU kda_layer of GPU nrm): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                i, n, D, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+        fprintf(df, "[dump] layer%d kda state (GPU st vs CPU kda_layer of GPU nrm): H=%d KD=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                i, HK, KD, ds, ms, ms > 0 ? ds / ms : 0, 1e-4 * ms);
+        fprintf(df, "[dump] layer%d kda window (GPU win vs CPU kda_layer of GPU nrm): C=%d K=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                i, 3 * P, KW, dw, mw, mw > 0 ? dw / mw : 0, 1e-4 * mw);
+        mm(cko, &l->ko, gky, n);
+        for (size_t k = 0; k < nb; k++) {
+            double a = fabs((double)gbr[k] - (double)cko[k]); if (a > dk) dk = a;
+            double b = fabs((double)cko[k]); if (b > mk) mk = b;
+        }
+        fprintf(df, "[dump] layer%d kda ko (GPU br vs CPU mm(ko) of GPU ky): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                i, n, D, dk, mk, mk > 0 ? dk / mk : 0, 1e-4 * mk);
+        for (int s = 0; s < n; s++) {
+            for (int chn = 0; chn < 3 * P; chn++) {
+                int part = chn / P, j = chn - part * P;
+                float *history = cwin + (size_t)chn * KW;
+                if (KW > 1) memmove(history, history + 1, (size_t)(KW - 1) * sizeof(float));
+                history[KW - 1] = gqkv[(size_t)part * r * P + (size_t)s * P + j];
+                const float *taps = l->conv + (size_t)chn * KW;
+                float sum = 0.f;
+                for (int tap = 0; tap < KW; tap++) sum += taps[tap] * history[tap];
+                ccm[(size_t)s * 3 * P + chn] = coli_kda_silu(sum);
+            }
+        }
+        for (size_t k = 0; k < (size_t)n * 3 * (size_t)P; k++) {
+            double a = fabs((double)gcm[k] - (double)ccm[k]); if (a > dc) dc = a;
+            double b = fabs((double)ccm[k]); if (b > mcv) mcv = b;
+        }
+        fprintf(df, "[dump] layer%d kda conv (GPU cm vs CPU silu-conv of GPU qkv): S=%d C=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                i, n, 3 * P, dc, mcv, mcv > 0 ? dc / mcv : 0, 1e-4 * mcv);
+        fflush(df);
+    }
+    free(st); free(win); free(scr); free(xn); free(gbr); free(cbr);
+    free(gst); free(gwin); free(gky); free(cko); free(gcm); free(gqkv); free(cwin); free(ccm);
 }
 static int g53c_kda(G53Chain *ch, const GModel *m, const GLayer *l, int i, int n) {
     const Cfg *c = &m->c; int P = c->kda_proj, HK = c->kda_heads, KD = c->kda_hd, r = ch->rows;
     VkcKdaConv cp = {n, 3 * P, c->conv_k, P, 0, P, r * P, 0, 3 * P, (int)ch->o_conv[i], 0};
     VkcKdaRec rp = {n, HK, KD, P, 0, 3 * P, 0, P, 0, HK, 0, P, 0, P, 0, (int)ch->o_kda[i], c->gate_lb, 1e-6f, c->eps};
-    return vkc_matmul(g53c_tensor(&l->kq), ch->nrm, 0, ch->qkv3, 0, n) &&
-           vkc_matmul(g53c_tensor(&l->kk), ch->nrm, 0, ch->qkv3, (size_t)r * P, n) &&
-           vkc_matmul(g53c_tensor(&l->kv), ch->nrm, 0, ch->qkv3, (size_t)2 * r * P, n) &&
-           vkc_matmul(g53c_tensor(&l->kfa), ch->nrm, 0, ch->klow, 0, n) &&
-           vkc_matmul(g53c_tensor(&l->kfb), ch->klow, 0, ch->kf, 0, n) &&
-           vkc_matmul(g53c_tensor(&l->kb), ch->nrm, 0, ch->kb, 0, n) &&
-           vkc_matmul(g53c_tensor(&l->kga), ch->nrm, 0, ch->klow, 0, n) &&
-           vkc_matmul(g53c_tensor(&l->kgb), ch->klow, 0, ch->kg, 0, n) &&
-           vkc_kda_conv(ch->qkv3, ch->prm, ch->win[i], ch->cm, &cp) &&
-           vkc_kda_rec(KD, ch->cm, ch->kf, ch->kb, ch->kg, ch->prm, ch->st[i], ch->ky, &rp) &&
-           vkc_matmul(g53c_tensor(&l->ko), ch->ky, 0, ch->br, 0, n);
+    int dump = (i == 0) && g53c_dump_fp() != NULL;
+    int dump_kda = (i <= 2) && g53c_dump_fp() != NULL && n > 1;
+    int ok = vkc_matmul(g53c_tensor(&l->kq), ch->nrm, 0, ch->qkv3, 0, n);
+    if (ok && dump) { g53c_dump_fmt1("first-layer fmt 1 kq", &l->kq, ch->nrm, 0, ch->qkv3, 0, n); if (!vkc_begin()) ok = 0; }
+    ok = ok && vkc_matmul(g53c_tensor(&l->kk), ch->nrm, 0, ch->qkv3, (size_t)r * P, n) &&
+         vkc_matmul(g53c_tensor(&l->kv), ch->nrm, 0, ch->qkv3, (size_t)2 * r * P, n) &&
+         vkc_matmul(g53c_tensor(&l->kfa), ch->nrm, 0, ch->klow, 0, n);
+    if (ok && dump) { g53c_dump_fmt1("first-layer fmt 1 kfa", &l->kfa, ch->nrm, 0, ch->klow, 0, n); if (!vkc_begin()) ok = 0; }
+    ok = ok && vkc_matmul(g53c_tensor(&l->kfb), ch->klow, 0, ch->kf, 0, n) &&
+         vkc_matmul(g53c_tensor(&l->kb), ch->nrm, 0, ch->kb, 0, n) &&
+         vkc_matmul(g53c_tensor(&l->kga), ch->nrm, 0, ch->klow, 0, n) &&
+         vkc_matmul(g53c_tensor(&l->kgb), ch->klow, 0, ch->kg, 0, n) &&
+         vkc_kda_conv(ch->qkv3, ch->prm, ch->win[i], ch->cm, &cp) &&
+         vkc_kda_rec(KD, ch->cm, ch->kf, ch->kb, ch->kg, ch->prm, ch->st[i], ch->ky, &rp) &&
+         vkc_matmul(g53c_tensor(&l->ko), ch->ky, 0, ch->br, 0, n);
+    if (ok && (dump || dump_kda)) {
+        if (dump) g53c_dump_fmt1("first-layer fmt 1 ko", &l->ko, ch->ky, 0, ch->br, 0, n);
+        if (dump_kda) g53c_dump_kda_same(ch, m, l, i, n);
+        if (!vkc_begin()) ok = 0;
+    }
+    return ok;
 }
 static int g53c_mla(G53Chain *ch, const GModel *m, const GSession *s, const GLayer *l, int i, int n, int pb) {
     const Cfg *c = &m->c; int IH = c->index_nh, ID = c->index_hd, pool = c->index_kpool, K = c->kv_lora;
@@ -648,12 +1129,18 @@ static int g53c_mla(G53Chain *ch, const GModel *m, const GSession *s, const GLay
     VkcDsaPool kp = {done > p0 ? done - p0 : 0, pool, p0, ID, 0, ID, (int)ch->o_ape[i], 0, 0, ID};
     VkcDsaPick sp = {n, pb, IH, ID, c->index_topk, pool, 0, IH * ID, 0, IH, 0, c->index_kpool_tail, (pb + n) / pool + 1,
                      1 + width, sqrtf((float)IH), 1.f / sqrtf((float)ID)};
+    int dump_last = (i == c->n_layers - 1) && g53c_dump_fp() != NULL;
     int ok = (ch->ks.on ? vkc_kv_mla_qkv(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, NULL, &ch->kv[i],
                                          &ch->kvtmp, ch->kvd, ko)
                         : vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, NULL, &ch->kv[i], ch->kvd, ko)) &&
              vkc_matmul(g53c_tensor(&l->iwq), ch->sc.qa, 0, ch->iq, 0, n) &&
-             vkc_matmul(g53c_tensor(&l->iwk), ch->nrm, 0, ch->ikd, 0, n) &&
-             vkc_mla_lnorm(ch->ikd, ch->prm, ch->ik[i], &ln) &&
+             vkc_matmul(g53c_tensor(&l->iwk), ch->nrm, 0, ch->ikd, 0, n);
+    if (ok && dump_last) {
+        if (g53_dho_gone(&l->iwk)) g53_dho_reload((Mat *)&l->iwk);
+        g53c_dump_fmt1("last-layer fmt 1 iwk", &l->iwk, ch->nrm, 0, ch->ikd, 0, n);
+        if (!vkc_begin()) ok = 0;
+    }
+    ok = ok && vkc_mla_lnorm(ch->ikd, ch->prm, ch->ik[i], &ln) &&
              vkc_matmul(g53c_tensor(&l->ikpg), ch->nrm, 0, ch->igd, 0, n) &&
              vkc_copy(ch->ig[i], (size_t)pb * ID, ch->igd, 0, (size_t)n * ID) &&
              vkc_matmul(g53c_tensor(&l->iwp), ch->nrm, 0, ch->ihw, 0, n) &&
@@ -664,6 +1151,85 @@ static int g53c_mla(G53Chain *ch, const GModel *m, const GSession *s, const GLay
              (ch->ks.on ? vkc_kv_mla_attn(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], ch->sel, 0, 1 + width,
                                           NULL, 0, ch->br, 0, s->layer[i].latent, NULL)
                         : vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], ch->sel, 0, 1 + width, NULL, 0, ch->br, 0));
+    if (ok && dump_last && n > 1) {
+        FILE *df = g53c_dump_fp();
+        size_t nb = (size_t)n * c->hidden, nlat = (size_t)s->cap * (size_t)K, nik = (size_t)s->cap * (size_t)ID;
+        float *xn = malloc((size_t)n * c->hidden * sizeof(float));
+        float *gbr = malloc(nb * sizeof(float)), *cbr = malloc(nb * sizeof(float));
+        GLayerState st = {0};
+        st.latent = calloc(nlat, sizeof(float));
+        st.ikeys = calloc(nik, sizeof(float));
+        st.igates = calloc(nik, sizeof(float));
+        float *gikd = malloc((size_t)n * ID * sizeof(float));
+        float *gik = malloc((size_t)n * ID * sizeof(float));
+        float *cik = malloc((size_t)n * ID * sizeof(float));
+        float *giq = malloc((size_t)n * IH * ID * sizeof(float));
+        float *gihw = malloc((size_t)n * IH * sizeof(float));
+        float *gig = malloc((size_t)n * ID * sizeof(float));
+        float *hwsc = malloc((size_t)n * IH * sizeof(float));
+        int *gsel = malloc((size_t)n * (1 + width) * sizeof(int));
+        int *csel = malloc((size_t)n * width * sizeof(int));
+        unsigned char *valid = malloc((size_t)(pb + n));
+        int rd = df && xn && gbr && cbr && st.latent && st.ikeys && st.igates &&
+                 vkc_read(ch->nrm, 0, xn, (size_t)n * c->hidden * 4) &&
+                 vkc_read(ch->br, 0, gbr, nb * 4);
+        int rd_ix = rd && gikd && gik && cik && giq && gihw && gig && hwsc && gsel && csel && valid &&
+                    vkc_read(ch->ikd, 0, gikd, (size_t)n * ID * 4) &&
+                    vkc_read(ch->ik[i], (size_t)pb * ID * 4, gik, (size_t)n * ID * 4) &&
+                    vkc_read(ch->iq, 0, giq, (size_t)n * IH * ID * 4) &&
+                    vkc_read(ch->ihw, 0, gihw, (size_t)n * IH * 4) &&
+                    vkc_read(ch->ig[i], (size_t)pb * ID * 4, gig, (size_t)n * ID * 4) &&
+                    vkc_read(ch->sel, 0, gsel, (size_t)n * (1 + width) * sizeof(int));
+        if (!df) { /* skip */ }
+        else if (!rd) fprintf(df, "[dump] last-layer mla composed: not sampled\n");
+        else {
+            if (!rd_ix) fprintf(df, "[dump] last-layer indexer LN/sel: not sampled\n");
+            else {
+                double dln = 0, mln = 0;
+                for (int t = 0; t < n; t++)
+                    layer_norm(cik + (size_t)t * ID, gikd + (size_t)t * ID, l->ik_nw, l->ik_nb, ID, 1e-5f);
+                for (size_t k = 0; k < (size_t)n * ID; k++) {
+                    double a = fabs((double)gik[k] - (double)cik[k]); if (a > dln) dln = a;
+                    double b = fabs((double)cik[k]); if (b > mln) mln = b;
+                }
+                fprintf(df, "[dump] last-layer indexer LN (GPU ik vs CPU layer_norm of GPU iwk y): S=%d ID=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                        n, ID, dln, mln, mln > 0 ? dln / mln : 0, 1e-4 * mln);
+                memset(valid, 1, (size_t)(pb + n));
+                for (int t = 0; t < n; t++)
+                    for (int h = 0; h < IH; h++)
+                        hwsc[(size_t)t * IH + h] = gihw[(size_t)t * IH + h] / sqrtf((float)IH);
+                if (coli_sparse_index_select_range(csel, giq, gik, gig, hwsc, l->ikpa, valid,
+                                                   pb + n, IH, ID, pool, c->index_topk,
+                                                   c->index_kpool_tail, pb, pb + n))
+                    fprintf(df, "[dump] last-layer indexer sel: CPU select failed\n");
+                else {
+                    int nmis = 0, ncmp = 0, ncnt = 0;
+                    for (int t = 0; t < n; t++) {
+                        int *grow = gsel + (size_t)t * (1 + width);
+                        int *crow = csel + (size_t)t * width;
+                        if (grow[0] != width) ncnt++;
+                        for (int j = 0; j < width; j++, ncmp++)
+                            if (grow[1 + j] != crow[j]) nmis++;
+                    }
+                    fprintf(df, "[dump] last-layer indexer sel (GPU sel vs CPU of same GPU iq/ik/gates/hw): S=%d width=%d mismatches=%d of %d count_ne_width=%d\n",
+                            n, width, nmis, ncmp, ncnt);
+                }
+            }
+            mla_layer(c, l, xn, n, cbr, &st, pb);
+            double d = 0, mc = 0;
+            for (size_t k = 0; k < nb; k++) {
+                double a = fabs((double)gbr[k] - (double)cbr[k]); if (a > d) d = a;
+                double b = fabs((double)cbr[k]); if (b > mc) mc = b;
+            }
+            fprintf(df, "[dump] last-layer mla composed (GPU br vs CPU mla_layer of GPU nrm): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                    n, c->hidden, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+            fflush(df);
+        }
+        free(gikd); free(gik); free(cik); free(giq); free(gihw); free(gig); free(hwsc);
+        free(gsel); free(csel); free(valid);
+        free(st.latent); free(st.ikeys); free(st.igates); free(xn); free(gbr); free(cbr);
+        if (!vkc_begin()) ok = 0;
+    }
     if (ok && done > ch->pool_valid[i]) ch->pool_valid[i] = done;
     return ok;
 }
@@ -708,6 +1274,247 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
     free(xs); free(xn);
 }
 
+/* COLI_VK_DUMP_FMT1: CPU-replay layers lo..upto of `xin` into `xs` (result in xs). */
+static int g53c_dump_cpu_layers(const GModel *m, float *xs, const float *xin, int nr, int start,
+                                int lo, int upto, float *nxt, float *col, float *post, float *comb,
+                                float *nrm, float *br, float *sg, float *su) {
+    const Cfg *c = &m->c; int D = c->hidden, H = c->hc_mult, HD = H * D;
+    memcpy(xs, xin, (size_t)nr * HD * sizeof(float));
+    size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)3 * c->kda_proj * c->conv_k;
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd, c->kda_hd) * sizeof(float));
+    GLayerState *st = calloc((size_t)c->n_layers, sizeof(*st));
+    int ok = scratch && st;
+    for (int i = lo; i <= upto && ok; i++) {
+        if (c->is_full[i]) {
+            st[i].latent = calloc((size_t)(start + nr) * c->kv_lora, sizeof(float));
+            st[i].ikeys = calloc((size_t)(start + nr) * c->index_hd, sizeof(float));
+            st[i].igates = calloc((size_t)(start + nr) * c->index_hd, sizeof(float));
+            ok = st[i].latent && st[i].ikeys && st[i].igates;
+        } else if (c->kda_proj) {
+            st[i].kda_state = calloc(ns, sizeof(float));
+            st[i].kda_window = calloc(nw, sizeof(float));
+            ok = st[i].kda_state && st[i].kda_window;
+        }
+    }
+    for (int i = lo; i <= upto && ok; i++) {
+        const GLayer *l = &m->layer[i];
+        for (int t = 0; t < nr; t++) {
+            coli_hc_pre(col + (size_t)t * D, post + (size_t)t * H, comb + (size_t)t * H * H,
+                        xs + (size_t)t * HD, l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
+                        H, D, c->hc_iters, c->eps, c->hc_eps);
+            rms(nrm + (size_t)t * D, col + (size_t)t * D, l->in_ln, D, c->eps);
+        }
+        if (c->is_full[i]) mla_layer(c, l, nrm, nr, br, &st[i], start);
+        else kda_layer(c, l, nrm, nr, br, st[i].kda_state, st[i].kda_window, scratch);
+        for (int t = 0; t < nr; t++)
+            coli_hc_post(nxt + (size_t)t * HD, br + (size_t)t * D, xs + (size_t)t * HD,
+                         post + (size_t)t * H, comb + (size_t)t * H * H, H, D);
+        for (int t = 0; t < nr; t++) {
+            coli_hc_pre(col + (size_t)t * D, post + (size_t)t * H, comb + (size_t)t * H * H,
+                        nxt + (size_t)t * HD, l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base,
+                        H, D, c->hc_iters, c->eps, c->hc_eps);
+            rms(nrm + (size_t)t * D, col + (size_t)t * D, l->post_ln, D, c->eps);
+        }
+        if (i < c->first_dense) {
+            if (g53_dho_gone(&l->dg)) g53_dho_reload((Mat *)&l->dg);
+            if (g53_dho_gone(&l->du)) g53_dho_reload((Mat *)&l->du);
+            if (g53_dho_gone(&l->dd)) g53_dho_reload((Mat *)&l->dd);
+            mlp3_rows(br, nrm, nr, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        } else {
+            ffn_layer_ex((GModel *)m, l, i, nrm, nr, br, 1, 0);
+        }
+        for (int t = 0; t < nr; t++)
+            coli_hc_post(xs + (size_t)t * HD, br + (size_t)t * D, nxt + (size_t)t * HD,
+                         post + (size_t)t * H, comb + (size_t)t * H * H, H, D);
+    }
+    for (int i = lo; i <= upto; i++) {
+        free(st[i].latent); free(st[i].ikeys); free(st[i].igates);
+        free(st[i].kda_state); free(st[i].kda_window);
+    }
+    free(st); free(scratch);
+    return ok;
+}
+
+/* CPU replay of `xin` through [lo, layer], stopping at POST entry of `site` (0 attn, 1 ffn).
+ * residual/branch/post/comb are that POST's CPU inputs. nxt/col/nrm/sg/su are scratch. */
+static int g53c_dump_cpu_to_post(const GModel *m, const float *xin, int nr, int start,
+                                 int lo, int layer, int site,
+                                 float *residual, float *branch, float *post, float *comb,
+                                 float *nxt, float *col, float *nrm, float *sg, float *su) {
+    const Cfg *c = &m->c; int D = c->hidden, H = c->hc_mult, HD = H * D;
+    if (layer < lo || layer >= c->n_layers || site < 0 || site > 1) return 0;
+    int ok;
+    if (layer > lo)
+        ok = g53c_dump_cpu_layers(m, residual, xin, nr, start, lo, layer - 1,
+                                  nxt, col, post, comb, nrm, branch, sg, su);
+    else {
+        memcpy(residual, xin, (size_t)nr * HD * sizeof(float));
+        ok = 1;
+    }
+    if (!ok) return 0;
+    const GLayer *l = &m->layer[layer];
+    size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)3 * c->kda_proj * c->conv_k;
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd, c->kda_hd) * sizeof(float));
+    GLayerState st = {0};
+    if (c->is_full[layer]) {
+        st.latent = calloc((size_t)(start + nr) * c->kv_lora, sizeof(float));
+        st.ikeys = calloc((size_t)(start + nr) * c->index_hd, sizeof(float));
+        st.igates = calloc((size_t)(start + nr) * c->index_hd, sizeof(float));
+        ok = scratch && st.latent && st.ikeys && st.igates;
+    } else if (c->kda_proj) {
+        st.kda_state = calloc(ns, sizeof(float));
+        st.kda_window = calloc(nw, sizeof(float));
+        ok = scratch && st.kda_state && st.kda_window;
+    } else ok = scratch != NULL;
+    if (ok) {
+        for (int t = 0; t < nr; t++) {
+            coli_hc_pre(col + (size_t)t * D, post + (size_t)t * H, comb + (size_t)t * H * H,
+                        residual + (size_t)t * HD, l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
+                        H, D, c->hc_iters, c->eps, c->hc_eps);
+            rms(nrm + (size_t)t * D, col + (size_t)t * D, l->in_ln, D, c->eps);
+        }
+        if (c->is_full[layer]) mla_layer(c, l, nrm, nr, branch, &st, start);
+        else kda_layer(c, l, nrm, nr, branch, st.kda_state, st.kda_window, scratch);
+    }
+    if (ok && site == 1) {
+        for (int t = 0; t < nr; t++)
+            coli_hc_post(nxt + (size_t)t * HD, branch + (size_t)t * D, residual + (size_t)t * HD,
+                         post + (size_t)t * H, comb + (size_t)t * H * H, H, D);
+        for (int t = 0; t < nr; t++) {
+            coli_hc_pre(col + (size_t)t * D, post + (size_t)t * H, comb + (size_t)t * H * H,
+                        nxt + (size_t)t * HD, l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base,
+                        H, D, c->hc_iters, c->eps, c->hc_eps);
+            rms(nrm + (size_t)t * D, col + (size_t)t * D, l->post_ln, D, c->eps);
+        }
+        if (layer < c->first_dense) {
+            if (g53_dho_gone(&l->dg)) g53_dho_reload((Mat *)&l->dg);
+            if (g53_dho_gone(&l->du)) g53_dho_reload((Mat *)&l->du);
+            if (g53_dho_gone(&l->dd)) g53_dho_reload((Mat *)&l->dd);
+            mlp3_rows(branch, nrm, nr, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        } else {
+            ffn_layer_ex((GModel *)m, l, layer, nrm, nr, branch, 1, 0);
+        }
+        memcpy(residual, nxt, (size_t)nr * HD * sizeof(float));
+    }
+    free(st.latent); free(st.ikeys); free(st.igates);
+    free(st.kda_state); free(st.kda_window);
+    free(scratch);
+    return ok;
+}
+
+/* COLI_VK_DUMP_FMT1: last-layer FFN/silu/experts of GPU nrm vs CPU, and of CPU replay nrm. */
+static void g53c_dump_last_ffn_parts(G53Chain *ch, GModel *m, int layer, int nr,
+                                    const float *gnrm, const float *gds, const float *grt) {
+    FILE *df = g53c_dump_fp();
+    if (!df || nr <= 1 || !gnrm || !gds || !grt || layer < 0) return;
+    const Cfg *c = &m->c;
+    const GLayer *l = &m->layer[layer];
+    int D = c->hidden, H = c->hc_mult, HD = H * D, I = l->rg.rows, topk = c->topk, E = c->n_experts;
+    int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+    size_t nd = (size_t)nr * D, ni = (size_t)nr * I;
+    float *ggs = malloc(ni * sizeof(float)), *gus = malloc(ni * sizeof(float)), *ghs = malloc(ni * sizeof(float));
+    float *chs = malloc(ni * sizeof(float)), *cds = malloc(nd * sizeof(float)), *crt = malloc(nd * sizeof(float));
+    float *sg = malloc((size_t)nr * wide * sizeof(float)), *su = malloc((size_t)nr * wide * sizeof(float));
+    int rd = ggs && gus && ghs && chs && cds && crt && sg && su &&
+             vkc_read(ch->gs, 0, ggs, ni * 4) && vkc_read(ch->us, 0, gus, ni * 4) &&
+             vkc_read(ch->hs, 0, ghs, ni * 4);
+    if (!rd) fprintf(df, "[dump] last-layer FFN silu/shared/routed: not sampled\n");
+    else {
+        memcpy(chs, ggs, ni * sizeof(float));
+        for (int t = 0; t < nr; t++)
+            swiglu_clamped(chs + (size_t)t * I, gus + (size_t)t * I, I, c->swiglu_limit);
+        g53c_dump_maxdiff(df, "last-layer silu of GPU nrm (GPU hs vs CPU swiglu of GPU gs/us)",
+                          ghs, chs, ni);
+        if (g53_dho_gone(&l->rg)) g53_dho_reload((Mat *)&l->rg);
+        if (g53_dho_gone(&l->ru)) g53_dho_reload((Mat *)&l->ru);
+        if (g53_dho_gone(&l->rd)) g53_dho_reload((Mat *)&l->rd);
+        mlp3_rows(cds, gnrm, nr, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+        g53c_dump_maxdiff(df, "last-layer shared of GPU nrm (GPU ds vs CPU mlp3 of GPU nrm)",
+                          gds, cds, nd);
+        ffn_layer_ex(m, l, layer, gnrm, nr, crt, 0, 0);
+        g53c_dump_maxdiff(df, "last-layer routed of GPU nrm (GPU routed vs CPU ffn of GPU nrm, no shared)",
+                          grt, crt, nd);
+        if (g53c_dump_xin && g53c_dump_nr == nr) {
+            float *cres = malloc((size_t)nr * HD * sizeof(float));
+            float *cbr = malloc(nd * sizeof(float));
+            float *cpost = malloc((size_t)nr * H * sizeof(float));
+            float *ccomb = malloc((size_t)nr * H * H * sizeof(float));
+            float *cnxt = malloc((size_t)nr * HD * sizeof(float));
+            float *ccol = malloc(nd * sizeof(float));
+            float *cnrm = malloc(nd * sizeof(float));
+            float *csg = malloc((size_t)nr * wide * sizeof(float));
+            float *csu = malloc((size_t)nr * wide * sizeof(float));
+            int okp = cres && cbr && cpost && ccomb && cnxt && ccol && cnrm && csg && csu &&
+                      g53c_dump_cpu_to_post(m, g53c_dump_xin, nr, g53c_dump_start, g53c_dump_lo,
+                                            layer, 1, cres, cbr, cpost, ccomb,
+                                            cnxt, ccol, cnrm, csg, csu);
+            if (!okp) fprintf(df, "[dump] last-layer FFN of CPU replay nrm: not sampled\n");
+            else {
+                g53c_dump_maxdiff(df, "last-layer nrm into FFN (GPU nrm vs CPU replay nrm, at MoE)",
+                                  gnrm, cnrm, nd);
+                mlp3_rows(cds, cnrm, nr, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+                g53c_dump_maxdiff(df, "last-layer shared of CPU replay nrm (GPU ds vs CPU mlp3 of CPU nrm)",
+                                  gds, cds, nd);
+                ffn_layer_ex(m, l, layer, cnrm, nr, crt, 0, 0);
+                g53c_dump_maxdiff(df, "last-layer routed of CPU replay nrm (GPU routed vs CPU ffn of CPU nrm, no shared)",
+                                  grt, crt, nd);
+                ffn_layer_ex(m, l, layer, cnrm, nr, cbr, 1, 0);
+                {
+                    float *gadd = malloc(nd * sizeof(float));
+                    if (gadd) {
+                        for (size_t k = 0; k < nd; k++) gadd[k] = gds[k] + grt[k];
+                        g53c_dump_maxdiff(df, "last-layer FFN of CPU replay nrm (GPU shared+routed vs CPU ffn of CPU nrm)",
+                                          gadd, cbr, nd);
+                    }
+                    free(gadd);
+                }
+                /* router top-k of GPU nrm vs CPU nrm */
+                {
+                    float *sa = malloc((size_t)E * sizeof(float)), *sb = malloc((size_t)E * sizeof(float));
+                    int *pa = malloc((size_t)topk * sizeof(int)), *pb = malloc((size_t)topk * sizeof(int));
+                    int nmis = 0, ncmp = 0;
+                    double ds = 0, ms = 0;
+                    if (sa && sb && pa && pb) {
+                        for (int t = 0; t < nr; t++) {
+                            const float *ra = gnrm + (size_t)t * D, *rb = cnrm + (size_t)t * D;
+                            for (int e = 0; e < E; e++) {
+                                const float *w = l->router + (size_t)e * D;
+                                float suma = 0.f, sumb = 0.f;
+                                for (int d0 = 0; d0 < D; d0++) { suma += w[d0] * ra[d0]; sumb += w[d0] * rb[d0]; }
+                                sa[e] = sigmoidf_(suma); sb[e] = sigmoidf_(sumb);
+                                double a = fabs((double)sa[e] - (double)sb[e]); if (a > ds) ds = a;
+                                double b = fabs((double)sb[e]); if (b > ms) ms = b;
+                            }
+                            for (int k = 0; k < topk; k++) {
+                                int ba = -1, bb = -1; float va = -INFINITY, vb = -INFINITY;
+                                for (int e = 0; e < E; e++) {
+                                    int ua = 0, ub = 0;
+                                    for (int j = 0; j < k; j++) { if (pa[j] == e) ua = 1; if (pb[j] == e) ub = 1; }
+                                    float ca = sa[e] + (l->rbias ? l->rbias[e] : 0.f);
+                                    float cb = sb[e] + (l->rbias ? l->rbias[e] : 0.f);
+                                    if (!ua && ca > va) { va = ca; ba = e; }
+                                    if (!ub && cb > vb) { vb = cb; bb = e; }
+                                }
+                                pa[k] = ba; pb[k] = bb;
+                            }
+                            for (int k = 0; k < topk; k++, ncmp++) if (pa[k] != pb[k]) nmis++;
+                        }
+                        fprintf(df, "[dump] last-layer router scores (GPU nrm vs CPU nrm): max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                                ds, ms, ms > 0 ? ds / ms : 0, 1e-4 * ms);
+                        fprintf(df, "[dump] last-layer router topk (GPU nrm vs CPU nrm): mismatches=%d of %d topk=%d experts=%d\n",
+                                nmis, ncmp, topk, E);
+                    } else fprintf(df, "[dump] last-layer router topk: not sampled\n");
+                    free(sa); free(sb); free(pa); free(pb);
+                }
+            }
+            free(cres); free(cbr); free(cpost); free(ccomb); free(cnxt);
+            free(ccol); free(cnrm); free(csg); free(csu);
+        }
+        fflush(df);
+    }
+    free(ggs); free(gus); free(ghs); free(chs); free(cds); free(crt); free(sg); free(su);
+}
+
 /* The prompt block forward_prefill hands the chain: its chunk, when the chain runs with
  * a chunk from the budget (vkc_chunk_auto), the smaller of the two chains'; 0 =
  * forward_prefill's own (GLM53_PREFILL_CHUNK). */
@@ -739,6 +1546,10 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
     int CH = mirror_ok ? g53c_rows(ch, m, s->cap) : 1, rows = n < CH ? n : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     if (!mirror_ok || !g53c_scratch(ch, m, rows, start + n)) {
+        /* COLI_VK_CHAIN_FAULT can land on a scratch zero/upload: that is a lost
+         * frame (the CPU takes the forward), not an OOM decline. Count it so the
+         * report's N forwards is > 0, as inkling/olmoe do. */
+        if (vkc_lost()) { *lost = 1; ch->forwards++; return 0; }
         fprintf(stderr, "[VK] %s chain: device memory for %d rows at %d positions refused; per-matrix path\n",
                 g53c_name(ch), rows, start + n);
         return 0;
@@ -748,16 +1559,90 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
      * the caller's rows the forward's input, for the CPU to run again */
     float *outs = malloc((size_t)n * HD * sizeof(float));
     if (!outs) return 0;
+    FILE *df_res = (n > 1) ? g53c_dump_fp() : NULL;
+    float *xin0 = NULL, *gxs_d = NULL, *xs_d = NULL, *nxt_d = NULL, *col_d = NULL, *post_d = NULL, *comb_d = NULL, *nrm_d = NULL, *br_d = NULL, *sg_d = NULL, *su_d = NULL;
+    int wide_d = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+    if (df_res) {
+        xin0 = malloc((size_t)n * HD * sizeof(float));
+        gxs_d = malloc((size_t)n * HD * sizeof(float));
+        xs_d = malloc((size_t)n * HD * sizeof(float));
+        nxt_d = malloc((size_t)n * HD * sizeof(float));
+        col_d = malloc((size_t)n * D * sizeof(float));
+        post_d = malloc((size_t)n * H * sizeof(float));
+        comb_d = malloc((size_t)n * H * H * sizeof(float));
+        nrm_d = malloc((size_t)n * D * sizeof(float));
+        br_d = malloc((size_t)n * D * sizeof(float));
+        sg_d = malloc((size_t)n * wide_d * sizeof(float));
+        su_d = malloc((size_t)n * wide_d * sizeof(float));
+        if (!(xin0 && gxs_d && xs_d && nxt_d && col_d && post_d && comb_d && nrm_d && br_d && sg_d && su_d)) {
+            free(xin0); free(gxs_d); free(xs_d); free(nxt_d); free(col_d); free(post_d); free(comb_d);
+            free(nrm_d); free(br_d); free(sg_d); free(su_d);
+            xin0 = NULL; df_res = NULL;
+        } else memcpy(xin0, streams, (size_t)n * HD * sizeof(float));
+    }
+    g53c_dump_xin = xin0;
+    g53c_dump_nr = 0;
+    g53c_dump_start = start;
+    g53c_dump_lo = lo;
     for (int c0 = 0; c0 < n; c0 += rows) {
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0;
+        if (xin0) { g53c_dump_xin = xin0 + (size_t)c0 * HD; g53c_dump_nr = nr; g53c_dump_start = pb; g53c_dump_lo = lo; }
         if (!vkc_begin() || !g53c_push(ch, m, s, pb, nr) || !vkc_write(ch->xs, 0, streams + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)))
             goto lost;
         int ok = 1, pending = 0, pulled = lo;
         for (int i = lo; i < hi && ok; i++) {
             const GLayer *l = &m->layer[i];
             if (pending) {                       /* the FFN branch of the layer before: shared + routed, written back */
+                FILE *dfm = (df_res && c0 == 0 && nr > 1) ? df_res : NULL;
+                float *gnrm = NULL, *gds = NULL, *grt = NULL, *gbr = NULL, *cbr = NULL;
+                if (dfm) {
+                    gnrm = malloc((size_t)nr * D * 4); gds = malloc((size_t)nr * D * 4);
+                    grt = malloc((size_t)nr * D * 4); gbr = malloc((size_t)nr * D * 4);
+                    cbr = malloc((size_t)nr * D * 4);
+                    int rd = gnrm && gds && grt && gbr && cbr &&
+                             vkc_read(ch->h2d, 0, gnrm, (size_t)nr * D * 4) &&
+                             vkc_read(ch->ds, 0, gds, (size_t)nr * D * 4) &&
+                             vkc_read(ch->routed, 0, grt, (size_t)nr * D * 4);
+                    if (!rd) fprintf(dfm, "[dump] last-layer moe add: not sampled\n");
+                    else {
+                        double ds = 0, ms = 0, dr = 0, mr = 0;
+                        ffn_layer_ex((GModel *)m, &m->layer[i - 1], i - 1, gnrm, nr, cbr, 1, 0);
+                        for (size_t k = 0; k < (size_t)nr * D; k++) {
+                            double a = fabs((double)gds[k] + (double)grt[k] - (double)cbr[k]); if (a > ds) ds = a;
+                            double b = fabs((double)cbr[k]); if (b > ms) ms = b;
+                        }
+                        fprintf(dfm, "[dump] last-layer moe add (GPU shared+routed vs CPU ffn of GPU nrm): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                                nr, D, ds, ms, ms > 0 ? ds / ms : 0, 1e-4 * ms);
+                        /* add-order: GPU is shared + (routed sum); CPU is ((shared + e0) + e1) */
+                        double da = 0, ma = 0;
+                        for (size_t k = 0; k < (size_t)nr * D; k++) {
+                            float gadd = gds[k] + grt[k];
+                            double a = fabs((double)gadd - ((double)gds[k] + (double)grt[k])); if (a > da) da = a;
+                            double b = fabs((double)gadd); if (b > ma) ma = b;
+                        }
+                        fprintf(dfm, "[dump] last-layer moe add f32 (shared+routed) vs f64: max |diff| %.2e of %.2e rel=%.3e\n",
+                                da, ma, ma > 0 ? da / ma : 0);
+                        fflush(dfm);
+                        g53c_dump_last_ffn_parts(ch, m, i - 1, nr, gnrm, gds, grt);
+                    }
+                    if (!vkc_begin()) ok = 0;
+                }
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-                ok = vkc_ew(ch->br, ch->ds, ch->routed, NULL, NULL, &add) && g53c_post(ch, m, nr);
+                ok = ok && vkc_ew(ch->br, ch->ds, ch->routed, NULL, NULL, &add);
+                if (ok && dfm && gbr && vkc_read(ch->br, 0, gbr, (size_t)nr * D * 4) && gnrm && cbr) {
+                    ffn_layer_ex((GModel *)m, &m->layer[i - 1], i - 1, gnrm, nr, cbr, 1, 0);
+                    double d = 0, mc = 0;
+                    for (size_t k = 0; k < (size_t)nr * D; k++) {
+                        double a = fabs((double)gbr[k] - (double)cbr[k]); if (a > d) d = a;
+                        double b = fabs((double)cbr[k]); if (b > mc) mc = b;
+                    }
+                    fprintf(dfm, "[dump] last-layer moe br after ADD (GPU br vs CPU ffn of GPU nrm): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            nr, D, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+                    fflush(dfm);
+                    if (!vkc_begin()) ok = 0;
+                }
+                free(gnrm); free(gds); free(grt); free(gbr); free(cbr);
+                ok = ok && g53c_post(ch, m, nr);
                 pending = 0;
             }
             double ta = now_s();
@@ -769,28 +1654,131 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
             if (i < c->first_dense) {
                 ok = g53c_mlp(ch, m, &l->dg, &l->du, &l->dd, ch->br, nr) && g53c_post(ch, m, nr);
                 m->t_attn += now_s() - ta;
+                if (ok && df_res && c0 == 0 && nr > 1 &&
+                    vkc_read(ch->xs, 0, gxs_d, (size_t)nr * HD * 4) &&
+                    g53c_dump_cpu_layers(m, xs_d, xin0 + (size_t)c0 * HD, nr, pb, lo, i,
+                                         nxt_d, col_d, post_d, comb_d, nrm_d, br_d, sg_d, su_d)) {
+                    double d = 0, mc = 0;
+                    for (size_t k = 0; k < (size_t)nr * HD; k++) {
+                        double a = fabs((double)gxs_d[k] - (double)xs_d[k]); if (a > d) d = a;
+                        double b = fabs((double)xs_d[k]); if (b > mc) mc = b;
+                    }
+                    fprintf(df_res, "[dump] layer%d composed streams (GPU xs vs CPU %d layer of input): S=%d HD=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            i, i - lo + 1, nr, HD, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+                    {
+                        char tag[80];
+                        snprintf(tag, sizeof tag, "layer%d composed", i);
+                        g53c_dump_stream_rms_mean(df_res, tag, nr, H, D, c->eps, gxs_d, xs_d);
+                    }
+                    fflush(df_res);
+                    if (!vkc_begin()) ok = 0;
+                } else if (df_res && c0 == 0 && nr > 1)
+                    fprintf(df_res, "[dump] layer%d composed streams: not sampled\n", i);
                 continue;
             }
             /* A1; while it runs, the tier loads the experts this layer will likely
-             * stream (a big prompt chunk only) */
+             * stream (a big prompt chunk only). Last model layer: host FFN so br
+             * matches the CPU kernels (matmul_q / matmul_i4); chain forwards stay. */
             ok = vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);
-            if (ok) vkt_stream_prefetch(i, nr);
+            if (ok && i + 1 != c->n_layers) vkt_stream_prefetch(i, nr);
             ok = ok && vkc_finish();
             m->t_attn += now_s() - ta;
             if (!ok) break;
             g53c_pull(ch, m, s, pulled, i + 1, pb, nr); pulled = i + 1;
+            if (i + 1 == c->n_layers) {
+                double t1 = now_s();
+                ffn_layer_ex(m, l, i, (const float *)vkc_ptr(ch->h2d), nr, ch->host_routed, 1, 1);
+                double dt = now_s() - t1; ch->host_ms += dt * 1e3; m->t_ffn += dt;
+                ok = vkc_begin() && vkc_write(ch->br, 0, ch->host_routed, (size_t)nr * D * sizeof(float)) &&
+                     g53c_post(ch, m, nr);
+                pending = 0;
+                continue;
+            }
             /* A2: the shared expert, while the host computes the routed experts */
             ok = vkc_begin() && g53c_mlp(ch, m, &l->rg, &l->ru, &l->rd, ch->ds, nr) && vkc_submit(0);
             double t1 = now_s();
-            ffn_layer_ex(m, l, i, (const float *)vkc_ptr(ch->h2d), nr, ch->host_routed, 0);
+            ffn_layer_ex(m, l, i, (const float *)vkc_ptr(ch->h2d), nr, ch->host_routed, 0, 0);
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)nr * D * sizeof(float));
             double dt = now_s() - t1; ch->host_ms += dt * 1e3; m->t_ffn += dt;
             ok = ok && vkc_begin();
             pending = 1;
         }
         if (ok && pending) {
+            FILE *dfm = (df_res && c0 == 0 && nr > 1) ? df_res : NULL;
+            float *gnrm = NULL, *gds = NULL, *grt = NULL, *gbr = NULL, *cbr = NULL;
+            if (dfm) {
+                gnrm = malloc((size_t)nr * D * 4); gds = malloc((size_t)nr * D * 4);
+                grt = malloc((size_t)nr * D * 4); gbr = malloc((size_t)nr * D * 4);
+                cbr = malloc((size_t)nr * D * 4);
+                int rd = gnrm && gds && grt && gbr && cbr &&
+                         vkc_read(ch->h2d, 0, gnrm, (size_t)nr * D * 4) &&
+                         vkc_read(ch->ds, 0, gds, (size_t)nr * D * 4) &&
+                         vkc_read(ch->routed, 0, grt, (size_t)nr * D * 4);
+                if (!rd) fprintf(dfm, "[dump] last-layer moe add: not sampled\n");
+                else {
+                    ffn_layer_ex((GModel *)m, &m->layer[hi - 1], hi - 1, gnrm, nr, cbr, 1, 0);
+                    double ds = 0, ms = 0;
+                    for (size_t k = 0; k < (size_t)nr * D; k++) {
+                        float gadd = gds[k] + grt[k];
+                        double a = fabs((double)gadd - (double)cbr[k]); if (a > ds) ds = a;
+                        double b = fabs((double)cbr[k]); if (b > ms) ms = b;
+                    }
+                    fprintf(dfm, "[dump] last-layer moe add (GPU shared+routed vs CPU ffn of GPU nrm): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                            nr, D, ds, ms, ms > 0 ? ds / ms : 0, 1e-4 * ms);
+                    fflush(dfm);
+                    g53c_dump_last_ffn_parts(ch, m, hi - 1, nr, gnrm, gds, grt);
+                }
+                if (!vkc_begin()) ok = 0;
+            }
             VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-            ok = vkc_ew(ch->br, ch->ds, ch->routed, NULL, NULL, &add) && g53c_post(ch, m, nr);
+            ok = ok && vkc_ew(ch->br, ch->ds, ch->routed, NULL, NULL, &add);
+            if (ok && dfm && gbr && vkc_read(ch->br, 0, gbr, (size_t)nr * D * 4) && gnrm && cbr) {
+                ffn_layer_ex((GModel *)m, &m->layer[hi - 1], hi - 1, gnrm, nr, cbr, 1, 0);
+                double d = 0, mc = 0;
+                for (size_t k = 0; k < (size_t)nr * D; k++) {
+                    double a = fabs((double)gbr[k] - (double)cbr[k]); if (a > d) d = a;
+                    double b = fabs((double)cbr[k]); if (b > mc) mc = b;
+                }
+                fprintf(dfm, "[dump] last-layer moe br after ADD (GPU br vs CPU ffn of GPU nrm): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                        nr, D, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+                fflush(dfm);
+                if (!vkc_begin()) ok = 0;
+            }
+            free(gnrm); free(gds); free(grt); free(gbr); free(cbr);
+            ok = ok && g53c_post(ch, m, nr);
+        }
+        if (ok && df_res && c0 == 0 && nr > 1 &&
+            vkc_read(ch->xs, 0, gxs_d, (size_t)nr * HD * 4) &&
+            g53c_dump_cpu_layers(m, xs_d, xin0 + (size_t)c0 * HD, nr, pb, lo, hi - 1,
+                                 nxt_d, col_d, post_d, comb_d, nrm_d, br_d, sg_d, su_d)) {
+            double d = 0, mc = 0;
+            for (size_t k = 0; k < (size_t)nr * HD; k++) {
+                double a = fabs((double)gxs_d[k] - (double)xs_d[k]); if (a > d) d = a;
+                double b = fabs((double)xs_d[k]); if (b > mc) mc = b;
+            }
+            fprintf(df_res, "[dump] layer%d composed streams (GPU xs vs CPU %d layer of input): S=%d HD=%d max |diff| %.2e of %.2e rel=%.3e thresh_1e-4*m=%.2e\n",
+                    hi - 1, hi - lo, nr, HD, d, mc, mc > 0 ? d / mc : 0, 1e-4 * mc);
+            {
+                char tag[80];
+                snprintf(tag, sizeof tag, "layer%d composed", hi - 1);
+                g53c_dump_stream_rms_mean(df_res, tag, nr, H, D, c->eps, gxs_d, xs_d);
+            }
+            /* host mean of GPU streams vs sequential CPU mean of those same GPU streams */
+            double dm = 0, mm = 0;
+            for (int t = 0; t < nr; t++) for (int d0 = 0; d0 < D; d0++) {
+                float sum = 0.f; double dsum = 0;
+                for (int h = 0; h < H; h++) {
+                    float v = gxs_d[((size_t)t * H + h) * D + d0];
+                    sum += v; dsum += (double)v;
+                }
+                float gmean = sum / H; float cmean = (float)(dsum / (double)H);
+                double a = fabs((double)gmean - (double)cmean); if (a > dm) dm = a;
+                double b = fabs((double)cmean); if (b > mm) mm = b;
+            }
+            fprintf(df_res, "[dump] residual mean of GPU streams (f32 sequential /H vs f64 /H): S=%d D=%d max |diff| %.2e of %.2e rel=%.3e\n",
+                    nr, D, dm, mm, mm > 0 ? dm / mm : 0);
+            fflush(df_res);
+            if (!vkc_begin()) ok = 0;
         }
         ok = ok && vkc_copy(ch->xd, 0, ch->xs, 0, (size_t)nr * HD) && vkc_submit(1);
         if (!ok) goto lost;
@@ -801,12 +1789,19 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
     }
     memcpy(streams, outs, (size_t)n * HD * sizeof(float));
     free(outs);
+    g53c_dump_xin = NULL; g53c_dump_nr = 0;
+    free(xin0); free(gxs_d); free(xs_d); free(nxt_d); free(col_d); free(post_d); free(comb_d);
+    free(nrm_d); free(br_d); free(sg_d); free(su_d);
     ch->forwards++;
     return ch->n;
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(outs);
+    g53c_dump_xin = NULL; g53c_dump_nr = 0;
+    free(xin0); free(gxs_d); free(xs_d); free(nxt_d); free(col_d); free(post_d); free(comb_d);
+    free(nrm_d); free(br_d); free(sg_d); free(su_d);
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
     *lost = 1;
+    ch->forwards++;   /* this forward ran until the loss; g53c_report still prints N > 0 */
     return 0;
 }
 /* The devices' layers (every layer, or the first N of a partial chain, and the second

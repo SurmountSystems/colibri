@@ -103,7 +103,7 @@ typedef struct {
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
-    /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
+    /* chain_gemm.comp is not recorded: it rounds x to f16, past logits_close (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
@@ -403,8 +403,10 @@ int vkc_init(void) {
      * cooperative matrices, the shader's tiling assumes four of them */
     if (KC.core.coop_sg == 64) KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv");
     dsv4_init();
-    /* the int8/int4 prompt GEMM on the matrix units (chain_gemm.comp, subgroups of 64);
-     * COLI_VK_CHAIN_GEMM=0 leaves those formats to the GEMMs below */
+    /* chain_gemm.comp rounds x to f16. That error is larger than logits_close
+     * (1e-4 of the CPU's largest logit) for int8 (fmt 1) and for int4 (fmt 2 and
+     * grouped fmt 4): colibri i4 container prefill was 4.55e-01 of 2.30e+00.
+     * Those formats stay on the fp32 GEMM below. COLI_VK_CHAIN_GEMM=0 is the same. */
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMM");
         if (KC.core.coop_sg == 64 && !(e && *e == '0') && (KC.mod_tg = load_module(KC.core.spv_path, "chain_gemm.spv"))) {
@@ -823,11 +825,10 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
         ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
     }
-    else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
-             ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
-        ok = record(KC.tg, bd, 4, &pc, sizeof pc, (uint32_t)((S + 63) / 64), (uint32_t)(ti->O / 128), 1);
-        KC.st.tile_gemms += ok;
-    }
+    /* Quantized tiled GEMM is qmatmul_gemm.comp (KC.gemm). chain_gemm.comp (KC.tg)
+     * rounds x to f16 and is never recorded: that error is larger than logits_close
+     * for int8 (fmt 1) and int4 (fmt 2 and grouped fmt 4). COLI_VK_CHAIN_GEMM=0 is
+     * the same. glm53 8-bit trunk prefill stays on this path (fmt 1). */
     else if (path >= 0)
         ok = record(KC.gemm[path], bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + KC.gemm_bm[path] - 1) / KC.gemm_bm[path]),
                     (uint32_t)((S + KC.gemm_bn[path] - 1) / KC.gemm_bn[path]), 1);

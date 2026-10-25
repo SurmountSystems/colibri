@@ -88,14 +88,29 @@ void main() {
         uint rowBase = uint(o) * uint(p.rowWords);
         float sum = 0.0;
         if (p.fmt == 1) {
-            int words = (p.I + 3) / 4;
-            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
-                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
-                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += xsh[i] * i8(pk, k); }
-            } else for (int wi = lane; wi < words; wi += sgsize) {
-                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
-                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i8(pk, k); }
+            // quant.h matmul_q: 8-wide FMA, hsum256, tail, then *scale[o]
+            if (lane == 0) {
+                precise vec4 a0 = vec4(0.0), a1 = vec4(0.0);
+                int i = 0;
+                for (; i + 8 <= p.I; i += 8) {
+                    uint w0 = w[rowBase + uint(i >> 2)], w1 = w[rowBase + uint(i >> 2) + 1u];
+                    vec4 xv0, xv1;
+                    if (staged) {
+                        xv0 = vec4(xsh[i], xsh[i + 1], xsh[i + 2], xsh[i + 3]);
+                        xv1 = vec4(xsh[i + 4], xsh[i + 5], xsh[i + 6], xsh[i + 7]);
+                    } else {
+                        xv0 = vec4(x[xoff + i], x[xoff + i + 1], x[xoff + i + 2], x[xoff + i + 3]);
+                        xv1 = vec4(x[xoff + i + 4], x[xoff + i + 5], x[xoff + i + 6], x[xoff + i + 7]);
+                    }
+                    a0 = fma(xv0, vec4(i8(w0, 0), i8(w0, 1), i8(w0, 2), i8(w0, 3)), a0);
+                    a1 = fma(xv1, vec4(i8(w1, 0), i8(w1, 1), i8(w1, 2), i8(w1, 3)), a1);
+                }
+                vec4 t = a0 + a1;
+                precise float tot = (t.x + t.z) + (t.y + t.w);
+                for (; i < p.I; i++) tot += (staged ? xsh[i] : x[xoff + i]) * i8(w[rowBase + uint(i >> 2)], i & 3);
+                y[s * p.O + o] = tot * scale[o];
             }
+            continue;
         } else if (p.fmt == 10) { // f32 weights, one per word: no dequant, no scale
             for (int i = lane; i < p.I; i += sgsize)
                 sum += (staged ? xsh[i] : x[xoff + i]) * uintBitsToFloat(w[rowBase + uint(i)]);

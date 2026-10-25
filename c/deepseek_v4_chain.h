@@ -476,7 +476,9 @@ static int v4c_layer_up(V4Chain *ch, int i, const char **why) {
              (ly->wkv = v4c_fp8(w, "attn.wkv", 0, 0)) && (ly->wo_b = v4c_fp8(w, "attn.wo_b", 0, 0)) &&
              (ly->sh1 = v4c_fp8(w, "ffn.shared_experts.w1", 0, 0)) && (ly->sh2 = v4c_fp8(w, "ffn.shared_experts.w2", 0, 0)) &&
              (ly->sh3 = v4c_fp8(w, "ffn.shared_experts.w3", 0, 0));
-    for (int g = 0; ok && g < ch->og; g++) ok = (ly->wo_a[g] = v4c_fp8(w, "attn.wo_a", g, ch->ol)) != NULL;
+    /* whole wo_a (og * o_lora rows): hgemv walks the groups. A per-group view mixed
+     * decode GEMV bind offsets with the teacher-forced row at the same position. */
+    ok = ok && (ly->wo_a[0] = v4c_fp8(w, "attn.wo_a", 0, 0)) != NULL;
     if (ok && ly->ratio > 0)
         ok = (ly->cwkv = v4c_plain(w, "attn.compressor.wkv.weight", 11)) && (ly->cwg = v4c_plain(w, "attn.compressor.wgate.weight", 11));
     if (ok && ly->idx)
@@ -923,16 +925,23 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
                      ch->Wd, 0, 0, qrow, (int)ly->o_sink, 1, 0, qrow, (pb + nr) / ly->ratio, a.scale, ok ? v.compressed : NULL};
         ok = ok && vkc_kv_ds(&d);
     } else ok = ok && vkc_dsv4_attn(ch->q, ly->win, ly->ratio > 0 ? ly->ckv : NULL, ch->list, ch->prm, ch->heads, &a);
-    ok = ok && v4c_rope(ch, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
-         v4c_round(ch->heads, ch->heads, VKC_DS_E4M3, nr, 1, qrow, 128, 0, 0, qrow, 0, 0, qrow, 0);
+    ok = ok && v4c_rope(ch, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1);
     int og = ch->og, ol = ch->ol, gw = ch->gw;
+    /* each group's heads to E4M3, then wo_a. One group: GEMV over nr. Several: hgemv
+     * one session row (S=nr mixed a decode row with the teacher-forced row). */
+    if (ok)
+        ok = v4c_round(ch->heads, ch->heads, VKC_DS_E4M3, nr * og, og, gw, 128, 0,
+                       0, qrow, gw, 0, qrow, gw);
     if (ok && og == 1) ok = vkc_matmul(ly->wo_a[0], ch->heads, 0, ch->grp, 0, nr);
-    for (int g = 0; ok && og > 1 && g < og; g++) {
-        VkcHgemv h = {0, nr, 1, ol, ol, 0, g * gw, qrow, 0, g * ol, og * ol, 0, 0, 0, 0};
-        ok = vkc_mla_hgemv(ly->wo_a[g], ch->heads, ch->grp, NULL, &h);
+    for (int s = 0; ok && og > 1 && s < nr; s++) {
+        VkcHgemv g = {0, 1, og, ol, ol, 0, s * qrow, qrow, gw, s * og * ol, og * ol, ol, 0, 0, 0};
+        ok = vkc_mla_hgemv(ly->wo_a[0], ch->heads, ch->grp, NULL, &g);
     }
-    return ok && v4c_bf16(ch->grp, nr, og * ol, 0, og * ol) && v4c_e4m3(ch->grp, ch->grp, nr, og * ol) &&
-           vkc_matmul(ly->wo_b, ch->grp, 0, ch->br, 0, nr) && v4c_bf16(ch->br, nr, D, 0, D);
+    ok = ok && v4c_bf16(ch->grp, nr, og * ol, 0, og * ol) && v4c_e4m3(ch->grp, ch->grp, nr, og * ol);
+    if (ok && og == 1) ok = vkc_matmul(ly->wo_b, ch->grp, 0, ch->br, 0, nr);
+    for (int s = 0; ok && og > 1 && s < nr; s++)
+        ok = vkc_matmul(ly->wo_b, ch->grp, (size_t)s * og * ol, ch->br, (size_t)s * D, 1);
+    return ok && v4c_bf16(ch->br, nr, D, 0, D);
 }
 
 /* the shared expert: E4M3 input, w1 and w3, V4's SwiGLU, E4M3, w2, bf16 into ds */

@@ -74,7 +74,10 @@ static ColiVkTensor *qic_tensor(Lin *l) {
 }
 
 static void qic_off(const char *why) {
-    if (!g_qic.failed) fprintf(stderr, "[VK] qwenimage chain: %s; the matrices run on the device one by one\n", why);
+    /* COLI_VK_CHAIN_FAULT can land on a scratch zero in qic_buffers: that is a lost
+     * frame (the CPU takes the step), not an OOM decline. The harness greps this. */
+    if (!g_qic.failed) fprintf(stderr, "[VK] qwenimage chain: %s; the matrices run on the device one by one\n",
+            vkc_lost() ? "a frame failed (the device was lost); this step runs again on the CPU" : why);
     g_qic.failed = 1;
 }
 

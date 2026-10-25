@@ -12,7 +12,8 @@
 //   flags 4: L2 norm: r = 1 / sqrt(sum(x^2) + eps) (no mean)
 // x and y may be the same buffer and the same places (in place): every element is read
 // for the sum before the barrier and written after it by the thread that reads it.
-// The sum is a float tree; the CPU sums in double. The two differ by rounding only.
+// The sum is one thread in order, as glm53.c rms (float square += x[i]*x[i]) and
+// chain_kda.comp. A 256-wide float tree differed from that sequential sum.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer X { float x[]; };
@@ -37,18 +38,19 @@ void main() {
     int yb = p.y_off + row * p.y_row + j * p.y_seg;
     int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
     int tid = int(gl_LocalInvocationID.x);
-    float acc = 0.0;
-    for (int i = tid; i < p.D; i += 256) { float v = x[xb + i]; acc += v * v; }
-    red[tid] = acc;
-    barrier();
-    for (int off = 128; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        barrier();
+    if (tid == 0) {
+        float acc = 0.0;
+        for (int i = 0; i < p.D; i++) { float v = x[xb + i]; acc += v * v; }
+        red[0] = acc;
     }
+    barrier();
     float r = (p.flags & 4) != 0 ? 1.0 / sqrt(red[0] + p.eps)
                                  : 1.0 / sqrt(red[0] / float(p.D) + p.eps);
     for (int i = tid; i < p.D; i += 256) {
         float wv = (p.flags & 2) != 0 ? 1.0 : ((p.flags & 1) != 0 ? 1.0 + w[wb + i] : w[wb + i]);
-        y[yb + i] = x[xb + i] * r * wv * p.post;
+        /* glm53.c rms is (x * inverse) * w. A fused * post (even post==1) is a
+         * third multiply and was a 2-ulp seed that the residual mix grows. */
+        float s = (x[xb + i] * r) * wv;
+        y[yb + i] = p.post == 1.0 ? s : s * p.post;
     }
 }

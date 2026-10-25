@@ -359,6 +359,13 @@ rust-clippy:
 # GPU extras match rust-clippy on this machine: hipcc → ffi-hip, else nvcc →
 # ffi-cuda, else install,ffi only. Never both vendors. Same warn-and-skip as
 # clippy (missing toolkit does not fail the gate).
+#
+# glm_tiny_process_ffi_token_parity execs c/colibri. vulkan-engines
+# family_glm_chain_sanitize builds that binary with
+# -fsanitize=address,undefined and only `make clean`s at the end. A killed
+# exclusive check leaves libasan.so.8 linked; LeakSanitizer then exits 1
+# because rust-nextest does not set detect_leaks=0 (and must not). Rebuild
+# CPU without sanitizers so nextest does not exec that leftover.
 rust-nextest:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -368,6 +375,10 @@ rust-nextest:
       features="install,ffi,ffi-hip"
     elif [[ ${CUDA} -eq 1 ]]; then
       features="install,ffi,ffi-cuda"
+    fi
+    if [[ -e c/colibri ]] && ldd c/colibri 2>/dev/null | grep -q libasan; then
+      echo "==> leftover ASan c/colibri; rebuilding CPU without sanitizers"
+      make -C c {{ make_j }} colibri EXTRA_CFLAGS= EXTRA_LDFLAGS=
     fi
     echo "==> nextest --workspace --all-targets --features ${features}"
     cargo nextest run --workspace --all-targets --features "${features}"

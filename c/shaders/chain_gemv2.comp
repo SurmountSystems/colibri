@@ -45,12 +45,36 @@ float red(float v, uint lpr) {
     return v;
 }
 
+float hsum8(vec4 a0, vec4 a1) {
+    vec4 t = a0 + a1;
+    return (t.x + t.z) + (t.y + t.w);
+}
+
 void main() {
     uint nr = uint(max(p.nr, 1)), s0 = gl_WorkGroupID.y * nr, I = uint(p.I), I4 = I / 4u, O = uint(p.O);
     for (uint r = 0u; r < nr; r++)
         for (uint i = gl_LocalInvocationID.x; i < I4; i += 256u) xsh[r * I4 + i] = s0 + r < uint(p.S) ? x4[(s0 + r) * I4 + i] : vec4(0.0);
     barrier();
     int fmt = p.fmt;
+    if (fmt == 1) {
+        uint RW = uint(p.rpw), o0 = gl_WorkGroupID.x * RW, rowWords = uint(p.rowWords);
+        uint o = o0 + gl_LocalInvocationID.x;
+        if (gl_LocalInvocationID.x < RW && o < O) {
+            [[unroll]] for (uint r = 0u; r < NRMAX; r++) if (r < nr && s0 + r < uint(p.S)) {
+                uint xb = r * I4;
+                precise vec4 a0 = vec4(0.0), a1 = vec4(0.0);
+                for (uint i = 0u; i + 8u <= I; i += 8u) {
+                    uvec4 v = wv[o * (rowWords / 4u) + i / 16u];
+                    uint u0 = (i & 8u) == 0u ? v.x : v.z;
+                    uint u1 = (i & 8u) == 0u ? v.y : v.w;
+                    a0 = fma(xsh[xb + i / 4u], vec4(i8(u0, 0u), i8(u0, 1u), i8(u0, 2u), i8(u0, 3u)), a0);
+                    a1 = fma(xsh[xb + i / 4u + 1u], vec4(i8(u1, 0u), i8(u1, 1u), i8(u1, 2u), i8(u1, 3u)), a1);
+                }
+                y[(s0 + r) * O + o] = hsum8(a0, a1) * sc[o];
+            }
+        }
+        return;
+    }
     uint rowWords = uint(p.rowWords), gs = uint(max(p.gs, 1)), ng = (I + gs - 1u) / gs;
     uint W4 = fmt == 1 ? I / 16u : I / 32u;
     uint cap = min(min(gl_SubgroupSize, W4), 64u), lpr = 1u;

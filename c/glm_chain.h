@@ -608,7 +608,11 @@ static int glmc_forward_seg(Model *m, GlmChain *ch, float *xh, int S, int pos_ba
         free(m->dsa_sel); free(m->dsa_nsel);
         m->dsa_sel = sl; m->dsa_nsel = ns; m->dsa_scap = (int)((int64_t)S * TK);
     }
+    float *outs = NULL, *inv = NULL;
     if (!glmc_scratch(ch, m, rows, pos_base + S)) {
+        /* COLI_VK_CHAIN_FAULT can land on a scratch zero/upload: that is a lost
+         * frame (the CPU takes the forward), not an OOM decline. */
+        if (vkc_lost()) goto lost;
         fprintf(stderr, "[VK] colibri chain: device memory for %d rows at %d positions refused; per-matrix path\n",
                 rows, pos_base + S);
         ch->failed = 1;
@@ -617,9 +621,9 @@ static int glmc_forward_seg(Model *m, GlmChain *ch, float *xh, int S, int pos_ba
     vkc_gemm_rows(-1);
     /* the final rows wait here until every chunk is through: a lost device leaves xh the
      * forward's input, for the CPU to run again */
-    float *outs = malloc((size_t)S * D * sizeof(float));
+    outs = malloc((size_t)S * D * sizeof(float));
     if (!outs) return 0;
-    float *inv = R ? malloc((size_t)(R / 2) * sizeof(float)) : NULL;
+    inv = R ? malloc((size_t)(R / 2) * sizeof(float)) : NULL;
     for (int j = 0; j < R / 2; j++) inv[j] = powf(c->theta, -2.0f * j / R);   /* rope_interleave's frequencies */
     for (int c0 = 0, ci = 0; c0 < S; c0 += rows, ci++) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
@@ -705,9 +709,14 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
     g_vk_chain = 0; ch->failed = 1;
     { GlmChain *o = glmc_of(m, !ch->d); if (o) o->failed = 1; }
-    fprintf(stderr, "[VK] %s chain: the device was lost; the CPU runs this forward again and from here on "
-                    "(the KV cache is the host's: there is no state to rebuild)\n", glmc_name(ch));
+    if (ch->mux_fw || ch->mux_steps)
+        fprintf(stderr, "[VK] %s chain: the device was lost in a multiplexed step; the CPU runs it again and from here on "
+                        "(the KV caches are the host's: there is no state to rebuild)\n", glmc_name(ch));
+    else
+        fprintf(stderr, "[VK] %s chain: the device was lost; the CPU runs this forward again and from here on "
+                        "(the KV cache is the host's: there is no state to rebuild)\n", glmc_name(ch));
     *lost = 1;
+    ch->forwards++;   /* this forward ran until the loss; glmc_report still prints N > 0 */
     return 0;
 }
 
@@ -937,6 +946,9 @@ static int glmc_mux_seg(Model *m, GlmChain *ch, float *xh, int S, KVState *const
          (R == 0 || glmc_res(&ch->mtmp.rope, (size_t)S * R, VKC_DEV)) &&
          (!m->has_dsa || (glmc_res(&ch->mik, (size_t)S * ID, VKC_DEV) && glmc_res(&ch->msel, SR, VKC_DEV)));
     if (!ok) {
+        /* COLI_VK_CHAIN_FAULT can land on a scratch zero/upload: that is a lost
+         * multiplexed step (the CPU takes it), not an OOM decline. */
+        if (vkc_lost()) goto lost;
         if (!ch->mux_noted++)
             fprintf(stderr, "[VK] %s chain: no device room for the KV of %d conversations at once; such steps run on the CPU\n",
                     glmc_name(ch), S);
@@ -1026,6 +1038,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     fprintf(stderr, "[VK] %s chain: the device was lost in a multiplexed step; the CPU runs it again and from here on "
                     "(the KV caches are the host's: there is no state to rebuild)\n", glmc_name(ch));
     *lost = 1;
+    ch->forwards++; ch->mux_fw++; ch->mux_rows += (unsigned long long)S;   /* this step ran until the loss; glmc_report still prints N > 0 */
     return 0;
 }
 /* The devices' layers for a multiplexed decode step (glmc_forward's contract: how many

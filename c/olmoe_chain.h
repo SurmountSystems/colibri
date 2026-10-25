@@ -475,6 +475,15 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
     if (!mirror_ok || pos_base + S > m->max_t || !olc_scratch(ch, m, rows) ||
         (want_x && !olc_res(&ch->xd, (size_t)rows * D, VKC_DOWN)) ||
         (pilot && !olc_res(&ch->xpd, (size_t)rows * D, VKC_DOWN))) {
+        if (vkc_lost()) {
+            /* COLI_VK_CHAIN_FAULT can land on a scratch zero/upload: the chain started this
+             * forward, then the device was lost. Count it so the report's N forwards is > 0. */
+            vkc_device(0);
+            olc_lost(m, pos_base);
+            *lost = 1;
+            ch->forwards++;
+            return 0;
+        }
         fprintf(stderr, "[VK] olmoe chain: device memory for %d rows refused; per-matrix path\n", rows);
         ch->failed = 1;
         return 0;
@@ -559,6 +568,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     vkc_device(0);
     olc_lost(m, pos_base);
     *lost = 1;
+    ch->forwards++;   /* this forward ran until the loss; olc_report still prints N > 0 */
     return 0;
 }
 
